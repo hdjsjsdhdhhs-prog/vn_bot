@@ -3,22 +3,33 @@ package poc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/subserver"
 	"github.com/kereal/rs8kvn_bot/internal/utils"
 )
 
 var ErrNotFound = errors.New("poc subscription not found or expired")
 
-// LANBaseURL is the address advertised by the standalone POC for devices on
-// the user's home network.
-const LANBaseURL = "http://192.168.1.103:8890"
+var displayLocation = func() *time.Location {
+	location, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		return time.UTC
+	}
+	return location
+}()
+
+// PublicBaseURL is the HTTPS address advertised in subscription pages and QR
+// codes. The POC itself remains bound to loopback behind the reverse proxy.
+const PublicBaseURL = "https://sub.gigachad-vape.indevs.in"
 
 type Subscription struct {
 	ID        string
@@ -31,11 +42,21 @@ type Server struct {
 	now           func() time.Time
 	mu            sync.RWMutex
 	subs          map[string]Subscription
-	cache         map[string][]byte
-	upstreamBody  []byte
-	upstreamReady bool
-	fetch         func(context.Context, string) (*subserver.NodeResponse, error)
+	upstreamBody  map[string][]byte
+	upstreamReady map[string]bool
+	fetch         func(context.Context, string, http.Header) (*subserver.NodeResponse, error)
 }
+
+const (
+	deviceOS        = "iOS"
+	deviceOSVer     = "27.1"
+	deviceModel     = "iPhone 12"
+	clientName      = "INCY"
+	clientUserAgent = "INCY/1.0.0/iOS"
+	sharedTestHWID  = "device-vpswindows10890"
+)
+
+var pocHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 var pocPage = template.Must(template.New("subscription").Parse(`<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -55,7 +76,64 @@ type pageData struct {
 }
 
 func New(upstream string) *Server {
-	return &Server{upstream: upstream, now: time.Now, subs: make(map[string]Subscription), cache: make(map[string][]byte), fetch: subserver.FetchFromNode}
+	return &Server{
+		upstream:      upstream,
+		now:           time.Now,
+		subs:          make(map[string]Subscription),
+		upstreamBody:  make(map[string][]byte),
+		upstreamReady: make(map[string]bool),
+		fetch:         fetchUpstream,
+	}
+}
+
+func requestHeaders() http.Header {
+	headers := make(http.Header, 7)
+	headers.Set("x-device-os", deviceOS)
+	headers.Set("x-ver-os", deviceOSVer)
+	headers.Set("x-device-model", deviceModel)
+	headers.Set("x-client", clientName)
+	headers.Set("User-Agent", clientUserAgent)
+	headers.Set("x-hwid", sharedTestHWID)
+	headers.Set("X-Device-ID", sharedTestHWID)
+	return headers
+}
+
+func (s *Server) upstreamCacheKey() string {
+	return s.upstream + "\x00shared-hwid"
+}
+
+func fetchUpstream(ctx context.Context, url string, headers http.Header) (*subserver.NodeResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create POC upstream request: %w", err)
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+
+	resp, err := pocHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("execute POC upstream request: %w", err)
+	}
+	if resp == nil || resp.Body == nil {
+		return nil, errors.New("POC upstream returned no body")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("POC upstream returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read POC upstream response: %w", err)
+	}
+	if len(body) > config.MaxResponseSize {
+		return nil, fmt.Errorf("POC upstream response exceeds %d bytes", config.MaxResponseSize)
+	}
+
+	return &subserver.NodeResponse{Body: body}, nil
 }
 
 func (s *Server) Seed(id string, duration time.Duration) Subscription {
@@ -63,7 +141,6 @@ func (s *Server) Seed(id string, duration time.Duration) Subscription {
 	sub := Subscription{ID: id, StartedAt: now, ExpiresAt: now.Add(duration)}
 	s.mu.Lock()
 	s.subs[id] = sub
-	delete(s.cache, id)
 	s.mu.Unlock()
 	return sub
 }
@@ -77,9 +154,22 @@ func (s *Server) Renew(id string, duration time.Duration) (Subscription, error) 
 	}
 	sub.ExpiresAt = s.now().UTC().Add(duration)
 	s.subs[id] = sub
-	delete(s.cache, id)
 	s.mu.Unlock()
 	return sub, nil
+}
+
+// Expire is a local POC helper for manually exercising the expired feed.
+// Production subscription APIs do not expose this operation.
+func (s *Server) Expire(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	sub.ExpiresAt = s.now().UTC()
+	s.subs[id] = sub
+	return nil
 }
 
 func (s *Server) Get(id string) (Subscription, bool) {
@@ -114,6 +204,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.servePOCQR(w, r, id)
 			return
 		}
+		if strings.HasSuffix(r.URL.Path, "/expire") {
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/poc/"), "/expire")
+			if err := s.Expire(id); err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		s.servePOCPage(w, r)
 		return
 	}
@@ -122,54 +221,67 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	s.serveSubscription(w, r, id)
+}
+
+func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, id string) {
 	s.mu.RLock()
 	sub, ok := s.subs[id]
-	if ok && !s.now().UTC().Before(sub.ExpiresAt) {
-		ok = false
-	}
 	if !ok {
 		s.mu.RUnlock()
 		http.NotFound(w, r)
 		return
 	}
-	if body, hit := s.cache[id]; hit {
-		s.mu.RUnlock()
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
+	expired := !s.now().UTC().Before(sub.ExpiresAt)
+	s.mu.RUnlock()
+	if expired {
+		s.serveExpiredSubscription(w)
 		return
 	}
-	s.mu.RUnlock()
+
+	cacheKey := s.upstreamCacheKey()
 	s.mu.Lock()
-	body := append([]byte(nil), s.upstreamBody...)
-	ready := s.upstreamReady
+	body := append([]byte(nil), s.upstreamBody[cacheKey]...)
+	ready := s.upstreamReady[cacheKey]
 	s.mu.Unlock()
 	if !ready {
-		resp, err := s.fetch(r.Context(), s.upstream)
+		resp, err := s.fetch(r.Context(), s.upstream, requestHeaders())
 		if err != nil {
 			http.Error(w, "upstream unavailable", http.StatusBadGateway)
 			return
 		}
 		body = append([]byte(nil), resp.Body...)
 		s.mu.Lock()
-		s.upstreamBody = append([]byte(nil), body...)
-		s.upstreamReady = true
+		s.upstreamBody[cacheKey] = append([]byte(nil), body...)
+		s.upstreamReady[cacheKey] = true
 		s.mu.Unlock()
 	}
 	s.mu.Lock()
 	// Recheck expiry after the network call before publishing the response.
-	if current, exists := s.subs[id]; !exists || !s.now().UTC().Before(current.ExpiresAt) {
+	current, exists := s.subs[id]
+	if !exists {
 		s.mu.Unlock()
 		http.NotFound(w, r)
 		return
 	}
-	s.cache[id] = append([]byte(nil), body...)
+	expired = !s.now().UTC().Before(current.ExpiresAt)
 	s.mu.Unlock()
+	if expired {
+		s.serveExpiredSubscription(w)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }
 
+func (s *Server) serveExpiredSubscription(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(expiredSubscriptionBody())
+}
+
 func (s *Server) localURL(r *http.Request, id string) string {
-	return LANBaseURL + "/sub/" + id
+	return PublicBaseURL + "/sub/" + id
 }
 
 func (s *Server) servePOCPage(w http.ResponseWriter, r *http.Request) {
@@ -186,12 +298,12 @@ func (s *Server) servePOCPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	active := s.now().UTC().Before(sub.ExpiresAt)
-	status, class := "Истекла", "expired"
+	status, class := "Expired", "expired"
 	if active {
 		status, class = "Активна", "active"
 	}
 	localURL := s.localURL(r, id)
-	data := pageData{ID: id, Status: status, StatusClass: class, ExpiresAt: sub.ExpiresAt.UTC().Format("02.01.2006 15:04 UTC"), LocalURL: localURL, QRURL: "/poc/" + id + "/qr.png"}
+	data := pageData{ID: id, Status: status, StatusClass: class, ExpiresAt: sub.ExpiresAt.In(displayLocation).Format("02.01.2006 15:04 MST"), LocalURL: localURL, QRURL: "/poc/" + id + "/qr.png"}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := pocPage.Execute(w, data); err != nil {
 		return
