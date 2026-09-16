@@ -81,7 +81,7 @@ func (l *AccessLogger) Log(r *http.Request, statusCode int, clientIP string, suc
 	// Write standard HTTP request information
 	appendAccessLogPart(&b, time.Now().UTC().Format(accessLogTimeLayout))
 	appendAccessLogPart(&b, r.Method)
-	appendAccessLogPart(&b, r.URL.RequestURI())
+	appendAccessLogPart(&b, subscriptionAccessLogURI(r))
 	appendAccessLogPart(&b, strconv.Itoa(statusCode))
 
 	// Write upstream fetch statistics: total sources / successful fetches
@@ -102,6 +102,17 @@ func (l *AccessLogger) Log(r *http.Request, statusCode int, clientIP string, suc
 	b.WriteByte('\n')
 
 	_, _ = l.writer.Write([]byte(b.String()))
+}
+
+func subscriptionAccessLogURI(r *http.Request) string {
+	if r != nil && r.URL != nil && strings.HasPrefix(r.URL.Path, "/sub/") {
+		return "/sub/:token"
+	}
+	if r == nil || r.URL == nil {
+		return ""
+	}
+
+	return r.URL.RequestURI()
 }
 
 // appendAccessLogPart joins parts with a space, wrapping values containing spaces in quotes.

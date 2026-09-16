@@ -70,7 +70,7 @@ func (s *SubscriptionService) SendExpiryReminder(ctx context.Context, sub *datab
 	}
 
 	daysLeft, hoursLeft := ReminderWindowRemaining(time.Now().UTC(), *sub.ExpiresAt)
-	text := utils.EscapeMarkdownV2(reminderText(daysLeft, hoursLeft, s.cfg.SubURL(sub.SubscriptionID)))
+	text := utils.EscapeMarkdownV2(reminderText(daysLeft, hoursLeft, s.cfg.SubURL(sub.Token)))
 	msg := tgbotapi.NewMessage(sub.TelegramID, text)
 	renewalKeyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(

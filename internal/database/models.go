@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/kereal/rs8kvn_bot/internal/utils"
+	"gorm.io/gorm"
 )
 
 // Sentinel errors returned by Get* functions when a record is not found.
@@ -13,6 +16,7 @@ import (
 var (
 	ErrInviteNotFound             = errors.New("invite not found")
 	ErrSubscriptionNotFound       = errors.New("subscription not found")
+	ErrInvalidSubscriptionToken   = errors.New("invalid subscription token")
 	ErrPlanNotFound               = errors.New("plan not found")
 	ErrOrderNotFound              = errors.New("order not found")
 	ErrProductNotFound            = errors.New("product not found")
@@ -78,6 +82,7 @@ type Subscription struct {
 	Username       string `gorm:"size:255;index"`
 	ClientID       string `gorm:"size:255;not null;uniqueIndex"`
 	SubscriptionID string `gorm:"size:255;not null;uniqueIndex"`
+	Token          string `gorm:"size:64;not null;uniqueIndex"`
 	// ExpiresAt — срок действия подписки. NULL = бессрочная (free-план).
 	ExpiresAt        *time.Time `gorm:"index"`
 	Status           string     `gorm:"default:active;size:50;index"`
@@ -106,6 +111,27 @@ type Subscription struct {
 	ProviderSource *ProviderSource    `gorm:"foreignKey:ProviderSourceID;references:ID"`
 	Orders         []Order            `gorm:"foreignKey:SubscriptionID"`
 	Nodes          []SubscriptionNode `gorm:"foreignKey:SubscriptionID"`
+}
+
+// BeforeCreate ensures every GORM creation path receives a public token. The
+// repository creation path additionally retries the unique-constraint collision
+// case; this hook covers the few internal helpers that create rows directly.
+func (s *Subscription) BeforeCreate(_ *gorm.DB) error {
+	if s.Token == "" {
+		token, err := utils.GenerateSubscriptionToken()
+		if err != nil {
+			return err
+		}
+		s.Token = token
+
+		return nil
+	}
+
+	if !utils.IsValidSubscriptionToken(s.Token) {
+		return fmt.Errorf("validate subscription token: %w", ErrInvalidSubscriptionToken)
+	}
+
+	return nil
 }
 
 // Node represents a configured 3x-ui panel source.

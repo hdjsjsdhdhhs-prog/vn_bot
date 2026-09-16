@@ -52,10 +52,10 @@ func FormatSubscriptionMessage(heading, status string, traffic *TrafficInfo, sub
 
 // SubscriptionURL is kept as a tiny presentation seam for callers that already
 // carry Config and should not duplicate URL construction.
-func SubscriptionURL(cfg *config.Config, subID string) string {
+func SubscriptionURL(cfg *config.Config, token string) string {
 	if cfg == nil {
 		return ""
 	}
 
-	return cfg.SubURL(subID)
+	return cfg.SubURL(token)
 }

@@ -303,11 +303,11 @@ func (c *Config) String() string {
 	)
 }
 
-// SubURL builds a full subscription URL from a subscription ID.
-func (c *Config) SubURL(subID string) string {
-	u, err := url.JoinPath(c.GlobalSubURL, subID)
+// SubURL builds a full subscription URL from its public bearer token.
+func (c *Config) SubURL(token string) string {
+	u, err := url.JoinPath(c.GlobalSubURL, token)
 	if err != nil {
-		return c.GlobalSubURL + subID
+		return c.GlobalSubURL + token
 	}
 
 	return u

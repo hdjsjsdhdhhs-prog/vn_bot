@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/kereal/rs8kvn_bot/internal/utils"
+	"github.com/mattn/go-sqlite3"
 	"gorm.io/gorm"
 )
+
+const subscriptionTokenCreateAttempts = 5
 
 // GetByTelegramID retrieves an active subscription by Telegram ID.
 func (s *Service) GetByTelegramID(ctx context.Context, telegramID int64) (*Subscription, error) {
@@ -62,6 +67,22 @@ func (s *Service) GetByID(ctx context.Context, id uint) (*Subscription, error) {
 		}
 
 		return nil, fmt.Errorf("failed to get subscription: %w", result.Error)
+	}
+
+	return &sub, nil
+}
+
+// GetByToken resolves a subscription by its public bearer token.
+func (s *Service) GetByToken(ctx context.Context, token string) (*Subscription, error) {
+	var sub Subscription
+
+	result := s.db.WithContext(ctx).Where("token = ?", token).First(&sub)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionNotFound
+		}
+
+		return nil, fmt.Errorf("failed to get subscription by token: %w", result.Error)
 	}
 
 	return &sub, nil
@@ -143,13 +164,47 @@ func (s *Service) CreateSubscription(ctx context.Context, sub *Subscription, inv
 			}
 		}
 
-		err := tx.Create(sub).Error
+		err := createSubscriptionWithToken(tx, sub)
 		if err != nil {
 			return fmt.Errorf("failed to create new subscription: %w", err)
 		}
 
 		return nil
 	})
+}
+
+func createSubscriptionWithToken(db *gorm.DB, sub *Subscription) error {
+	providedToken := sub.Token != ""
+
+	for attempt := 0; attempt < subscriptionTokenCreateAttempts; attempt++ {
+		if !providedToken {
+			token, err := utils.GenerateSubscriptionToken()
+			if err != nil {
+				return err
+			}
+			sub.Token = token
+		}
+
+		err := db.Create(sub).Error
+		if err == nil {
+			return nil
+		}
+		if providedToken || !isSubscriptionTokenUniqueConstraint(err) {
+			return err
+		}
+
+		// The failed INSERT may have populated the in-memory primary key.
+		sub.ID = 0
+	}
+
+	return fmt.Errorf("generate unique subscription token: collision retry limit reached")
+}
+
+func isSubscriptionTokenUniqueConstraint(err error) bool {
+	var sqliteErr sqlite3.Error
+	return errors.As(err, &sqliteErr) &&
+		sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique &&
+		strings.Contains(sqliteErr.Error(), "subscriptions.token")
 }
 
 // UpdateSubscription updates an existing subscription.

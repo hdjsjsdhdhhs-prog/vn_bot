@@ -29,6 +29,7 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/service/payment/platega"
 	"github.com/kereal/rs8kvn_bot/internal/subserver"
+	"github.com/kereal/rs8kvn_bot/internal/utils"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -725,7 +726,7 @@ func (s *Server) HandleInvite(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 
-		subURL := s.cfg.GlobalSubURL + existingSub.SubscriptionID
+		subURL := s.cfg.SubURL(existingSub.Token)
 		s.renderTrialPage(w, existingSub.SubscriptionID, subURL, telegramLink, s.cfg.TrialDurationHours)
 
 		return
@@ -999,8 +1000,8 @@ func (s *Server) handleSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	subID := path[5:]
-	if subID == "" || strings.Contains(subID, "/") || !subserver.SubIDRegex().MatchString(subID) {
+	token := path[5:]
+	if strings.Contains(token, "/") || !utils.IsValidSubscriptionToken(token) {
 		writeSubscriptionText(response, http.StatusNotFound, "Subscription not found")
 		return
 	}
@@ -1011,12 +1012,23 @@ func (s *Server) handleSubscription(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
+	sub, err := s.db.GetByToken(ctx, token)
+	if err != nil {
+		if errors.Is(err, database.ErrSubscriptionNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+			writeSubscriptionText(response, http.StatusNotFound, "Subscription not found")
+			return
+		}
+
+		logger.Error("Failed to resolve subscription token", zap.String("client_ip", clientIP), zap.Error(err))
+		writeSubscriptionText(response, http.StatusInternalServerError, "Internal Server Error")
+		return
+	}
+
+	subID := sub.SubscriptionID
 	logger.Debug("subscription request received",
-		zap.String("sub_id", subID),
+		zap.Uint("subscription_id", sub.ID),
 		zap.String("client_ip", clientIP),
-		zap.String("method", r.Method),
-		zap.String("path", r.URL.Path),
-	)
+		zap.String("method", r.Method))
 
 	requestHeaders := subserver.FilterHeaders(r.Header)
 

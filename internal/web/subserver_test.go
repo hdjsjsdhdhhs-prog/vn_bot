@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,7 +29,17 @@ import (
 	"gorm.io/gorm"
 )
 
+const (
+	testSubscriptionToken = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testSubscriptionPath  = "/sub/" + testSubscriptionToken
+)
+
 func testServer(t *testing.T, db interfaces.DatabaseService, cfg *config.Config) *Server {
+	if fake, ok := db.(*testutil.DatabaseService); ok && fake.GetByTokenFunc == nil {
+		fake.GetByTokenFunc = func(context.Context, string) (*database.Subscription, error) {
+			return &database.Subscription{ID: 1, SubscriptionID: "test123", Token: testSubscriptionToken, Status: string(database.SubscriptionStatusActive)}, nil
+		}
+	}
 	subSvc := service.NewSubscriptionService(db, nil, nil, nil, cfg)
 	srv := NewServer(":0", db, cfg, "testbot", subSvc, subserver.NewService(config.SubServerCacheTTL))
 
@@ -41,7 +53,7 @@ func TestHandleSubscription_MethodNotAllowed(t *testing.T) {
 	srv := testServer(t, db, &config.Config{})
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/sub/test123", nil)
+	r := httptest.NewRequest(http.MethodPost, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
 	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
@@ -54,7 +66,7 @@ func TestHandleSubscription_SubServerNil(t *testing.T) {
 	srv := &Server{}
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/sub/test123", nil)
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
@@ -83,6 +95,115 @@ func TestHandleSubscription_InvalidCode(t *testing.T) {
 	}
 }
 
+func TestHandleSubscription_InvalidTokenDoesNotLookupSubscription(t *testing.T) {
+	t.Parallel()
+
+	db := testutil.NewDatabaseService()
+	var lookups atomic.Int32
+	db.GetByTokenFunc = func(context.Context, string) (*database.Subscription, error) {
+		lookups.Add(1)
+		return nil, errors.New("unexpected lookup")
+	}
+	srv := testServer(t, db, &config.Config{})
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/sub/not-a-valid-token", nil)
+	srv.handleSubscription(w, r)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Zero(t, lookups.Load())
+}
+
+func TestHandleSubscription_TokenRoutesToLegacySubscription(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("vless://legacy@legacy.example:443#Legacy"))
+	}))
+	defer upstream.Close()
+
+	db := testutil.NewDatabaseService()
+	db.GetByTokenFunc = func(_ context.Context, token string) (*database.Subscription, error) {
+		require.Equal(t, testSubscriptionToken, token)
+		return &database.Subscription{ID: 71, SubscriptionID: "internal-legacy-sub", Token: token, Status: string(database.SubscriptionStatusActive)}, nil
+	}
+	db.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
+		return &database.Subscription{ID: 71, SubscriptionID: "internal-legacy-sub", Status: string(database.SubscriptionStatusActive)}, nil
+	}
+	db.GetWithPlanAndNodesFunc = func(_ context.Context, subscriptionID string) (*database.SubscriptionFull, error) {
+		require.Equal(t, "internal-legacy-sub", subscriptionID)
+		return &database.SubscriptionFull{
+			Subscription: database.Subscription{ID: 71, SubscriptionID: subscriptionID, Status: string(database.SubscriptionStatusActive)},
+			Plan:         database.Plan{TrafficLimit: 1 << 30},
+			Nodes:        []database.Node{{ID: 1, Name: "legacy", SubscriptionURL: upstream.URL + "/"}},
+		}, nil
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
+	testServer(t, db, &config.Config{}).handleSubscription(w, r)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	decoded, err := base64.StdEncoding.DecodeString(w.Body.String())
+	require.NoError(t, err)
+	assert.Contains(t, string(decoded), "vless://legacy@legacy.example")
+}
+
+func TestHandleSubscription_TokenRoutesToProviderSource(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("vless://provider@provider.example:443#Provider"))
+	}))
+	defer upstream.Close()
+
+	source := &database.ProviderSource{ID: 72, SubscriptionURL: upstream.URL, Headers: `{}`, Enabled: true, UpdatedAt: time.Unix(1, 0)}
+	db := testutil.NewDatabaseService()
+	db.GetByTokenFunc = func(_ context.Context, token string) (*database.Subscription, error) {
+		return &database.Subscription{ID: 72, SubscriptionID: "internal-provider-sub", Token: token, Status: string(database.SubscriptionStatusActive)}, nil
+	}
+	db.GetSubscriptionWithProviderSourceFunc = func(_ context.Context, subscriptionID string) (*database.Subscription, error) {
+		require.Equal(t, "internal-provider-sub", subscriptionID)
+		return &database.Subscription{ID: 72, SubscriptionID: subscriptionID, Status: string(database.SubscriptionStatusActive), ProviderSourceID: &source.ID, ProviderSource: source}, nil
+	}
+	db.GetWithPlanAndNodesFunc = func(context.Context, string) (*database.SubscriptionFull, error) {
+		t.Fatal("provider token request must not enter legacy plan/nodes lookup")
+		return nil, errors.New("unexpected legacy lookup")
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
+	testServer(t, db, &config.Config{}).handleSubscription(w, r)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	decoded, err := base64.StdEncoding.DecodeString(w.Body.String())
+	require.NoError(t, err)
+	assert.Contains(t, string(decoded), "vless://provider@provider.example")
+}
+
+func TestHandleSubscription_TokenPreservesExpiredAndRevokedNotFound(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"expired", "revoked"} {
+		t.Run(name, func(t *testing.T) {
+			db := testutil.NewDatabaseService()
+			db.GetByTokenFunc = func(_ context.Context, token string) (*database.Subscription, error) {
+				return &database.Subscription{ID: 73, SubscriptionID: "internal-" + name, Token: token}, nil
+			}
+			db.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
+				return nil, database.ErrSubscriptionNotFound
+			}
+
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
+			testServer(t, db, &config.Config{}).handleSubscription(w, r)
+
+			assert.Equal(t, http.StatusNotFound, w.Code)
+			assert.Equal(t, "Subscription not found", w.Body.String())
+		})
+	}
+}
+
 func TestHandleSubscription_AccessLog(t *testing.T) {
 	t.Parallel()
 
@@ -93,7 +214,7 @@ func TestHandleSubscription_AccessLog(t *testing.T) {
 	srv := testServer(t, db, &config.Config{})
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/sub/unknown", nil)
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -114,7 +235,7 @@ func TestHandleSubscription_NoServersAvailable(t *testing.T) {
 	srv := testServer(t, db, &config.Config{})
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/sub/test123", nil)
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -288,7 +409,7 @@ func TestHandleSubscription_SourceVariants(t *testing.T) {
 			srv := testServer(t, db, &config.Config{})
 
 			w := httptest.NewRecorder()
-			r := httptest.NewRequest(http.MethodGet, "/sub/test123", nil)
+			r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 			srv.handleSubscription(w, r)
 			assert.Equal(t, http.StatusOK, w.Code)
 			tt.check(t, w, w.Body.String())
@@ -307,7 +428,7 @@ func TestHandleSubscription_AccessLogVariants(t *testing.T) {
 		{
 			name: "with headers",
 			setupReq: func() *http.Request {
-				r := httptest.NewRequest(http.MethodGet, "/sub/unknown?debug=1", nil)
+				r := httptest.NewRequest(http.MethodGet, testSubscriptionPath+"?debug=1", nil)
 				r.RemoteAddr = "203.0.113.10:1234"
 				r.Header.Set("X-Hwid", "hw-1")
 				r.Header.Set("X-Device-Os", "iOS")
@@ -317,17 +438,17 @@ func TestHandleSubscription_AccessLogVariants(t *testing.T) {
 
 				return r
 			},
-			wantFields: []string{"GET", "/sub/unknown?debug=1", "404", "-", "203.0.113.10", "hw-1", "iOS", "17.0", "iPhone 15", "V2Ray/1.0"},
+			wantFields: []string{"GET", "/sub/:token", "404", "-", "203.0.113.10", "hw-1", "iOS", "17.0", "iPhone 15", "V2Ray/1.0"},
 		},
 		{
 			name: "missing optional headers",
 			setupReq: func() *http.Request {
-				r := httptest.NewRequest(http.MethodGet, "/sub/unknown", nil)
+				r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 				r.RemoteAddr = "203.0.113.10:1234"
 
 				return r
 			},
-			wantFields: []string{"GET", "/sub/unknown", "404", "-", "203.0.113.10", "", "", "", "", ""},
+			wantFields: []string{"GET", "/sub/:token", "404", "-", "203.0.113.10", "", "", "", "", ""},
 		},
 	}
 
@@ -374,7 +495,7 @@ func TestHandleSubscription_AccessLogSuccessTotalOrder(t *testing.T) {
 	accessLogger, err := subserver.NewAccessLogger(logPath)
 	require.NoError(t, err)
 
-	r := httptest.NewRequest(http.MethodGet, "/sub/test", nil)
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	r.RemoteAddr = "203.0.113.10:1234"
 	// success=3, total=5 must be written as "3/5", not "5/3".
 	accessLogger.Log(r, 200, "203.0.113.10", 3, 5)
@@ -388,6 +509,8 @@ func TestHandleSubscription_AccessLogSuccessTotalOrder(t *testing.T) {
 	parts := splitAccessLogLine(line)
 	require.GreaterOrEqual(t, len(parts), 5)
 	// Field layout: timestamp method uri status success/total ...
+	assert.Equal(t, "/sub/:token", parts[2])
+	assert.NotContains(t, line, testSubscriptionToken)
 	assert.Equal(t, "3/5", parts[4])
 }
 
@@ -441,7 +564,7 @@ func TestHandleSubscription_SourceFetchError(t *testing.T) {
 	srv := testServer(t, db, &config.Config{})
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/sub/test123", nil)
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -461,7 +584,7 @@ func TestHandleSubscription_DatabaseError_Returns500GenericBody(t *testing.T) {
 	srv := testServer(t, db, &config.Config{})
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/sub/test123", nil)
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code, "infra error must be 500, not 404")
@@ -498,7 +621,7 @@ func TestHandleSubscription_ProviderSourceUnavailableReturnsSafe503(t *testing.T
 
 	srv := testServer(t, db, &config.Config{})
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/sub/provider-unavailable", nil)
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
@@ -538,12 +661,12 @@ func TestHandleSubscription_CacheSubscriptionResult(t *testing.T) {
 	srv := testServer(t, db, &config.Config{})
 
 	w1 := httptest.NewRecorder()
-	r1 := httptest.NewRequest(http.MethodGet, "/sub/test123", nil)
+	r1 := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w1, r1)
 	assert.Equal(t, http.StatusOK, w1.Code)
 
 	w2 := httptest.NewRecorder()
-	r2 := httptest.NewRequest(http.MethodGet, "/sub/test123", nil)
+	r2 := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w2, r2)
 	assert.Equal(t, http.StatusOK, w2.Code)
 
@@ -579,7 +702,7 @@ func TestHandleSubscription_DevicesTracking(t *testing.T) {
 	srv := testServer(t, db, &config.Config{})
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/sub/test123", nil)
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	r.Header.Set("X-Hwid", "device1")
 	r.Header.Set("User-Agent", "v2rayN/1.0")
 	srv.handleSubscription(w, r)
@@ -613,7 +736,7 @@ func TestHandleSubscription_SourceWithoutSubURL(t *testing.T) {
 	srv := testServer(t, db, &config.Config{})
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/sub/test123", nil)
+	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)

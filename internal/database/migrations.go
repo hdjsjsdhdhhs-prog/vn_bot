@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/kereal/rs8kvn_bot/internal/logger"
+	"github.com/kereal/rs8kvn_bot/internal/utils"
 
 	migrate "github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/sqlite"
@@ -117,6 +118,10 @@ func runMigrations(sqlDB *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	err = ensureSubscriptionTokens(sqlDB)
+	if err != nil {
+		return fmt.Errorf("failed to ensure subscription tokens: %w", err)
+	}
 	err = ensureBroadcastColumns(sqlDB)
 	if err != nil {
 		return fmt.Errorf("failed to ensure broadcast columns: %w", err)
@@ -133,6 +138,133 @@ func runMigrations(sqlDB *sql.DB) error {
 	} else {
 		logger.Info("Database migrations up to date",
 			zap.Uint("version", versionAfter))
+	}
+
+	return nil
+}
+
+// ensureSubscriptionTokens completes migration 041 using crypto/rand. The SQL
+// migration deliberately adds a nullable column first so existing rows never
+// encounter a premature NOT NULL/UNIQUE constraint.
+func ensureSubscriptionTokens(sqlDB *sql.DB) error {
+	var tokenColumnCount int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('subscriptions') WHERE name = 'token'`).Scan(&tokenColumnCount); err != nil {
+		return fmt.Errorf("inspect subscription token column: %w", err)
+	}
+	if tokenColumnCount == 0 {
+		return errors.New("subscriptions.token column is missing")
+	}
+
+	tx, err := sqlDB.Begin()
+	if err != nil {
+		return fmt.Errorf("begin subscription token backfill: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	existingTokens := make(map[string]struct{})
+	rows, err := tx.Query(`SELECT token FROM subscriptions WHERE token IS NOT NULL AND token <> ''`)
+	if err != nil {
+		return fmt.Errorf("read existing subscription tokens: %w", err)
+	}
+	for rows.Next() {
+		var token string
+		if scanErr := rows.Scan(&token); scanErr != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan existing subscription token: %w", scanErr)
+		}
+		existingTokens[token] = struct{}{}
+	}
+	if err = rows.Close(); err != nil {
+		return fmt.Errorf("close existing subscription token rows: %w", err)
+	}
+	if err = rows.Err(); err != nil {
+		return fmt.Errorf("iterate existing subscription tokens: %w", err)
+	}
+
+	rows, err = tx.Query(`SELECT id FROM subscriptions WHERE token IS NULL OR token = '' ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("read subscriptions without tokens: %w", err)
+	}
+	var subscriptionIDs []uint
+	for rows.Next() {
+		var id uint
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan subscription without token: %w", scanErr)
+		}
+		subscriptionIDs = append(subscriptionIDs, id)
+	}
+	if err = rows.Close(); err != nil {
+		return fmt.Errorf("close subscription backfill rows: %w", err)
+	}
+	if err = rows.Err(); err != nil {
+		return fmt.Errorf("iterate subscription backfill rows: %w", err)
+	}
+
+	for _, id := range subscriptionIDs {
+		var token string
+		for {
+			token, err = utils.GenerateSubscriptionToken()
+			if err != nil {
+				return err
+			}
+			if _, exists := existingTokens[token]; !exists {
+				break
+			}
+		}
+
+		if _, err = tx.Exec(`UPDATE subscriptions SET token = ? WHERE id = ?`, token, id); err != nil {
+			return fmt.Errorf("backfill subscription token: %w", err)
+		}
+		existingTokens[token] = struct{}{}
+	}
+
+	var invalidTokenCount int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM subscriptions
+		WHERE token IS NULL OR length(token) != ? OR token GLOB '*[^0-9a-f]*'`, utils.SubscriptionTokenLength).Scan(&invalidTokenCount); err != nil {
+		return fmt.Errorf("validate backfilled subscription tokens: %w", err)
+	}
+	if invalidTokenCount != 0 {
+		return fmt.Errorf("validate backfilled subscription tokens: found %d invalid tokens", invalidTokenCount)
+	}
+
+	var duplicateTokenCount int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM (
+		SELECT token FROM subscriptions GROUP BY token HAVING COUNT(*) > 1
+	)`).Scan(&duplicateTokenCount); err != nil {
+		return fmt.Errorf("validate unique subscription tokens: %w", err)
+	}
+	if duplicateTokenCount != 0 {
+		return fmt.Errorf("validate unique subscription tokens: found %d duplicate tokens", duplicateTokenCount)
+	}
+
+	statements := []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_token ON subscriptions(token)`,
+		`CREATE TRIGGER IF NOT EXISTS subscriptions_token_required_insert
+			BEFORE INSERT ON subscriptions
+			WHEN NEW.token IS NULL OR NEW.token = ''
+			BEGIN SELECT RAISE(ABORT, 'subscription token is required'); END`,
+		`CREATE TRIGGER IF NOT EXISTS subscriptions_token_required_update
+			BEFORE UPDATE OF token ON subscriptions
+			WHEN NEW.token IS NULL OR NEW.token = ''
+			BEGIN SELECT RAISE(ABORT, 'subscription token is required'); END`,
+		`CREATE TRIGGER IF NOT EXISTS subscriptions_token_format_insert
+			BEFORE INSERT ON subscriptions
+			WHEN length(NEW.token) != 64 OR NEW.token GLOB '*[^0-9a-f]*'
+			BEGIN SELECT RAISE(ABORT, 'subscription token must be 64 lowercase hexadecimal characters'); END`,
+		`CREATE TRIGGER IF NOT EXISTS subscriptions_token_format_update
+			BEFORE UPDATE OF token ON subscriptions
+			WHEN length(NEW.token) != 64 OR NEW.token GLOB '*[^0-9a-f]*'
+			BEGIN SELECT RAISE(ABORT, 'subscription token must be 64 lowercase hexadecimal characters'); END`,
+	}
+	for _, statement := range statements {
+		if _, err = tx.Exec(statement); err != nil {
+			return fmt.Errorf("create subscription token constraint: %w", err)
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit subscription token backfill: %w", err)
 	}
 
 	return nil

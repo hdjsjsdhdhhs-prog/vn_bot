@@ -60,6 +60,7 @@ type SubscriptionQueries interface {
 	GetByTelegramID(ctx context.Context, telegramID int64) (*database.Subscription, error)
 	GetAnyByTelegramID(ctx context.Context, telegramID int64) (*database.Subscription, error)
 	GetByID(ctx context.Context, id uint) (*database.Subscription, error)
+	GetByToken(ctx context.Context, token string) (*database.Subscription, error)
 	GetLatestSubscriptions(ctx context.Context, limit int) ([]database.Subscription, error)
 	GetAllSubscriptions(ctx context.Context) ([]database.Subscription, error)
 	GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*database.Subscription, error)

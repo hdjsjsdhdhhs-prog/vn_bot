@@ -81,7 +81,7 @@ func (sh *SubscriptionHandler) handleCreateSubscription(ctx context.Context, cha
 			trafficLimit = sh.h.subscriptionService.PlanTrafficLimitGB(ctx, chatID)
 		}
 
-		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, msg(MsgSubCreatedSuccess, trafficLimit, sh.h.cfg.SubURL(sub.SubscriptionID)))
+		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, msg(MsgSubCreatedSuccess, trafficLimit, sh.h.cfg.SubURL(sub.Token)))
 		editMsg.ParseMode = "Markdown"
 		editMsg.DisableWebPagePreview = true
 		kb := sh.h.getQRKeyboard()
@@ -137,7 +137,7 @@ func (sh *SubscriptionHandler) handleMySubscription(ctx context.Context, chatID 
 		"📋 *Ваша подписка*",
 		statusText,
 		traffic,
-		service.SubscriptionURL(sh.h.cfg, sub.SubscriptionID),
+		service.SubscriptionURL(sh.h.cfg, sub.Token),
 	)
 
 	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, messageText)
@@ -177,7 +177,7 @@ func (sh *SubscriptionHandler) handleQRCode(ctx context.Context, chatID int64, u
 		return nil
 	}
 
-	pngBytes, err := utils.GenerateQRCodePNG(sh.h.cfg.SubURL(sub.SubscriptionID))
+	pngBytes, err := utils.GenerateQRCodePNG(sh.h.cfg.SubURL(sub.Token))
 	if err != nil {
 		logger.Error("Failed to generate QR code", zap.Error(err))
 

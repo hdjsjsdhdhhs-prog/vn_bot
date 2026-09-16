@@ -283,7 +283,7 @@ func (s *SubscriptionService) reenableAndNotify(ctx context.Context, sub *databa
 		text := utils.EscapeMarkdownV2(
 			"✅ *Твой трафик сброшен — ты снова в сети!*\n\n" +
 				"Возвращайся и продолжай пользоваться.\n\n🔗 " +
-				s.cfg.SubURL(sub.SubscriptionID))
+				s.cfg.SubURL(sub.Token))
 		// Empty keyboard: the reset message is a simple "come back", not a sales CTA.
 		return text, tgbotapi.InlineKeyboardMarkup{}, nil
 	})

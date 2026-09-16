@@ -126,7 +126,7 @@ func (s *SubscriptionService) Create(ctx context.Context, telegramID int64, user
 
 		return &CreateResult{
 			Subscription:    existing,
-			SubscriptionURL: s.cfg.SubURL(existing.SubscriptionID),
+			SubscriptionURL: s.cfg.SubURL(existing.Token),
 			ReferrerTGID:    referrerID,
 		}, nil
 	}
@@ -152,7 +152,7 @@ func (s *SubscriptionService) Create(ctx context.Context, telegramID int64, user
 
 		return &CreateResult{
 			Subscription:    reanimated,
-			SubscriptionURL: s.cfg.SubURL(reanimated.SubscriptionID),
+			SubscriptionURL: s.cfg.SubURL(reanimated.Token),
 			ReferrerTGID:    referrerID,
 		}, nil
 	}
@@ -200,7 +200,7 @@ func (s *SubscriptionService) Create(ctx context.Context, telegramID int64, user
 		referrerID = *sub.ReferredBy
 	}
 
-	subscriptionURL := s.cfg.SubURL(subID)
+	subscriptionURL := s.cfg.SubURL(sub.Token)
 	result := &CreateResult{
 		Subscription:    sub,
 		SubscriptionURL: subscriptionURL,
@@ -654,7 +654,7 @@ func (s *SubscriptionService) CreateTrial(ctx context.Context, inviteCode string
 		return nil, fmt.Errorf("create trial subscription: %w", err)
 	}
 
-	subURL := s.cfg.SubURL(subID)
+	subURL := s.cfg.SubURL(sub.Token)
 	result := &TrialCreateResult{
 		Subscription:    sub,
 		SubscriptionURL: subURL,

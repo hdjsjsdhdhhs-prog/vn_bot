@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/kereal/rs8kvn_bot/internal/database"
 	"github.com/kereal/rs8kvn_bot/internal/logger"
+	"github.com/kereal/rs8kvn_bot/internal/utils"
 	"github.com/kereal/rs8kvn_bot/internal/xui"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -98,6 +99,7 @@ type DatabaseService struct {
 	CountFreeSubscriptionsFunc                  func(ctx context.Context) (int64, error)
 	CountTrialSubscriptionsFunc                 func(ctx context.Context) (int64, error)
 	GetByIDFunc                                 func(ctx context.Context, id uint) (*database.Subscription, error)
+	GetByTokenFunc                              func(ctx context.Context, token string) (*database.Subscription, error)
 	GetTelegramIDByUsernameFunc                 func(ctx context.Context, username string) (int64, error)
 	DeleteSubscriptionByIDFunc                  func(ctx context.Context, id uint) (*database.Subscription, error)
 	GetTelegramIDsBatchFunc                     func(ctx context.Context, offset, limit int) ([]int64, error)
@@ -251,6 +253,30 @@ func (m *DatabaseService) GetByID(ctx context.Context, id uint) (*database.Subsc
 	return nil, gorm.ErrRecordNotFound
 }
 
+func (m *DatabaseService) GetByToken(ctx context.Context, token string) (*database.Subscription, error) {
+	if m.GetByTokenFunc != nil {
+		return m.GetByTokenFunc(ctx, token)
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, sub := range m.Subscriptions {
+		if sub.Token == token {
+			copy := *sub
+			return &copy, nil
+		}
+	}
+	for _, sub := range m.SubscriptionsByID {
+		if sub.Token == token {
+			copy := *sub
+			return &copy, nil
+		}
+	}
+
+	return nil, gorm.ErrRecordNotFound
+}
+
 func (m *DatabaseService) CreateSubscription(ctx context.Context, sub *database.Subscription, inviteCode string) error {
 	if m.CreateSubscriptionFunc != nil {
 		return m.CreateSubscriptionFunc(ctx, sub, inviteCode)
@@ -258,6 +284,14 @@ func (m *DatabaseService) CreateSubscription(ctx context.Context, sub *database.
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if sub.Token == "" {
+		token, err := utils.GenerateSubscriptionToken()
+		if err != nil {
+			return err
+		}
+		sub.Token = token
+	}
 
 	if m.Subscriptions == nil {
 		m.Subscriptions = make(map[int64]*database.Subscription)

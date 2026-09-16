@@ -53,7 +53,7 @@ func (s *Service) CreateTrialSubscription(ctx context.Context, inviteCode, subsc
 
 	sub.ExpiresAt = &expiryTime
 
-	err = s.db.WithContext(ctx).Create(sub).Error
+	err = createSubscriptionWithToken(s.db.WithContext(ctx), sub)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create trial subscription: %w", err)
 	}

@@ -105,7 +105,7 @@ func TestE2E_MySubscription(t *testing.T) {
 
 	assert.True(t, env.botAPI.SendCalledSafe(), "Subscription info should be sent")
 	assert.Contains(t, env.botAPI.LastSentText, "подписк", "Should mention subscription")
-	assert.Contains(t, env.botAPI.LastSentText, "https://example.com/sub/test-sub-id", "Should contain subscription URL")
+	assert.Contains(t, env.botAPI.LastSentText, env.cfg.SubURL(sub.Token), "Should contain subscription URL")
 }
 
 func TestE2E_HelpCommand(t *testing.T) {
