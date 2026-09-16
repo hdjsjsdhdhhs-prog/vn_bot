@@ -19,6 +19,7 @@ var (
 	ErrProductImmutable           = errors.New("product immutable after order")
 	ErrSubscriptionNodeNotFound   = errors.New("subscription node not found")
 	ErrNodeNotFound               = errors.New("node not found")
+	ErrProviderSourceNotFound     = errors.New("provider source not found")
 	ErrTrialAlreadyActivated      = errors.New("trial already activated")
 	ErrBroadcastNotFound          = errors.New("broadcast not found")
 	ErrBroadcastRecipientStale    = errors.New("broadcast recipient claim is stale")
@@ -119,6 +120,22 @@ type Node struct {
 	UpdatedAt       time.Time `gorm:"autoUpdateTime;column:updated_at"`
 
 	PlanNodes []PlanNode `gorm:"foreignKey:NodeID"`
+}
+
+// ProviderSource represents an external VPN provider subscription feed.
+// It is intentionally independent from Node until the provider aggregation
+// lifecycle is integrated into the runtime.
+type ProviderSource struct {
+	ID              uint      `gorm:"primaryKey;column:id"`
+	Name            string    `gorm:"size:255;not null;column:name"`
+	Type            string    `gorm:"size:50;not null;index;column:type"`
+	SubscriptionURL string    `gorm:"size:2048;not null;column:subscription_url"`
+	HWID            string    `gorm:"size:255;not null;default:'';column:hwid"`
+	UserAgent       string    `gorm:"size:512;not null;default:'';column:user_agent"`
+	Headers         string    `gorm:"type:text;not null;default:'{}';column:headers"`
+	Enabled         bool      `gorm:"not null;index;column:enabled"`
+	CreatedAt       time.Time `gorm:"not null;autoCreateTime;column:created_at"`
+	UpdatedAt       time.Time `gorm:"not null;autoUpdateTime;column:updated_at"`
 }
 
 // Plan represents a subscription plan.
@@ -394,6 +411,10 @@ func (Order) TableName() string {
 
 func (Node) TableName() string {
 	return "nodes"
+}
+
+func (ProviderSource) TableName() string {
+	return "provider_sources"
 }
 
 func (Plan) TableName() string {
