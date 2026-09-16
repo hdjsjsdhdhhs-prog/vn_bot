@@ -67,6 +67,63 @@ func (s *Service) GetByID(ctx context.Context, id uint) (*Subscription, error) {
 	return &sub, nil
 }
 
+// GetSubscriptionWithProviderSource retrieves a currently servable subscription
+// by its public subscription ID and explicitly preloads its optional provider
+// source. A nil ProviderSourceID keeps the legacy plan-and-nodes routing path.
+func (s *Service) GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*Subscription, error) {
+	var sub Subscription
+
+	result := s.db.WithContext(ctx).
+		Preload("ProviderSource").
+		Where("subscription_id = ? AND status = ? AND (expires_at IS NULL OR expires_at > ?)",
+			subscriptionID, string(SubscriptionStatusActive), time.Now()).
+		First(&sub)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionNotFound
+		}
+
+		return nil, fmt.Errorf("failed to get subscription with provider source: %w", result.Error)
+	}
+
+	return &sub, nil
+}
+
+// BindProviderSource links a subscription to an existing provider source.
+func (s *Service) BindProviderSource(ctx context.Context, id, providerSourceID uint) error {
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Where("id = ?", id).
+		Update("provider_source_id", providerSourceID)
+	if result.Error != nil {
+		return fmt.Errorf("bind provider source to subscription: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		return ErrSubscriptionNotFound
+	}
+
+	return nil
+}
+
+// UnbindProviderSource removes the optional provider source link and restores
+// legacy plan-and-nodes routing for the subscription.
+func (s *Service) UnbindProviderSource(ctx context.Context, id uint) error {
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Where("id = ?", id).
+		Update("provider_source_id", nil)
+	if result.Error != nil {
+		return fmt.Errorf("unbind provider source from subscription: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		return ErrSubscriptionNotFound
+	}
+
+	return nil
+}
+
 // CreateSubscription creates a new subscription.
 // If inviteCode is non-empty and resolves to a valid Invite, sub.InviteCode and sub.ReferredBy
 // are populated atomically inside the same transaction.

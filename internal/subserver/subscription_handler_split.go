@@ -19,75 +19,17 @@ import (
 	"go.uber.org/zap"
 )
 
-// serveFromCache attempts to serve a subscription response from cache.
-// On a hit, it revalidates the subscription status in the DB and invalidates
-// stale entries. Returns (result, hit, err): when hit is false, the caller
-// should proceed to a cache-miss path.
-func serveFromCache(ctx context.Context, db interfaces.SubscriptionRepository, subSvc *Service, subID string) (*SubscriptionResult, bool, error) {
-	cacheKey := subID
-
-	cachedBody, cachedHeaders, ok := subSvc.GetCache(cacheKey)
-	if !ok {
-		return nil, false, nil
-	}
-
-	// On cache hit, revalidate the subscription status in the DB.
-	status, expiryTime, err := db.GetSubscriptionStatus(ctx, subID)
-	if err != nil {
-		if errors.Is(err, database.ErrSubscriptionNotFound) {
-			subSvc.InvalidateCache(cacheKey)
-			metrics.SubserverCacheInvalidationsTotal.WithLabelValues("not_found").Inc()
-
-			return nil, true, ErrSubscriptionNotFound
-		}
-		// Fail closed when status cannot be revalidated. Serving stale access
-		// after a revoke or chargeback is worse than a temporary 5xx.
-		logger.Error("Cache status revalidation failed, refusing stale entry",
-			zap.String("sub_id", subID),
-			zap.Error(err))
-
-		return nil, true, fmt.Errorf("revalidate subscription status: %w", err)
-	}
-
-	// If the subscription is no longer active or expired, invalidate the cache.
-	if status != string(database.SubscriptionStatusActive) || (!expiryTime.IsZero() && time.Now().After(expiryTime)) {
-		subSvc.InvalidateCache(cacheKey)
-
-		invalidReason := string(database.SubscriptionStatusRevoked)
-		if status == string(database.SubscriptionStatusActive) {
-			invalidReason = "expired"
-		}
-
-		metrics.SubserverCacheInvalidationsTotal.WithLabelValues(invalidReason).Inc()
-		logger.Warn("Cache invalidated: subscription no longer active",
-			zap.String("sub_id", subID),
-			zap.String("status", status),
-			zap.Time("expires_at", expiryTime),
-		)
-		// A revoked/expired subscription must read as not found to clients
-		// (matches the /sub/:id 404 contract), not as a server error.
-		return nil, true, ErrSubscriptionNotFound
-	}
-
-	logger.Debug("Cache hit", zap.String("sub_id", subID))
-	// best-effort: обновляем last_request, ошибки не блокируют выдачу.
-	err = db.UpdateLastRequest(ctx, subID)
-	if err != nil {
-		logger.Warn("Failed to update last_request",
-			zap.String("sub_id", subID),
-			zap.Error(err))
-	}
-
-	return &SubscriptionResult{
-		Body:    cachedBody,
-		Headers: cachedHeaders,
-	}, true, nil
+type loadedSubscription struct {
+	full           *database.SubscriptionFull
+	providerSource *database.ProviderSource
+	cacheKey       string
+	cachedResult   *SubscriptionResult
 }
 
-// loadSubscription fetches the subscription with plan and nodes from the DB,
-// records device/IP analytics, and updates last_request. Returns the full
-// subscription or an error.
-func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository, subSvc *Service, subID, clientIP string, requestHeaders map[string]string) (*database.SubscriptionFull, error) {
+// loadSubscription resolves the serving route under the per-subscription
+// analytics lock. ProviderSource-backed subscriptions never load plan nodes;
+// unlinked subscriptions continue through GetWithPlanAndNodes unchanged.
+func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository, subSvc *Service, subID, clientIP string, requestHeaders map[string]string) (*loadedSubscription, error) {
 	// The analytics update is a read-modify-write on the subscription row
 	// (devices/IPs JSON). The freshest row must be loaded AFTER taking the lock
 	// so concurrent cache misses for the SAME subID serialize the whole
@@ -96,42 +38,124 @@ func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository,
 	// it is guaranteed to be freed on error or panic.
 	unlock := subSvc.analyticsLocks.Lock(subID)
 	defer unlock()
-	subFull, err := db.GetWithPlanAndNodes(ctx, subID)
+
+	sub, err := db.GetSubscriptionWithProviderSource(ctx, subID)
 	if err != nil {
 		if errors.Is(err, database.ErrSubscriptionNotFound) {
+			subSvc.InvalidateCache(subID)
+			metrics.SubserverCacheInvalidationsTotal.WithLabelValues("not_found").Inc()
 			logger.Debug("Subscription not found in database",
 				zap.String("sub_id", subID))
 
 			return nil, ErrSubscriptionNotFound
 		}
 
-		logger.Error("Failed to get subscription with plan and sources",
+		logger.Error("Failed to resolve subscription serving route",
 			zap.String("sub_id", subID),
 			zap.Error(err))
 
 		return nil, fmt.Errorf("database error: %w", err)
 	}
 
+	if sub.Status != string(database.SubscriptionStatusActive) ||
+		(sub.ExpiresAt != nil && !sub.ExpiresAt.After(time.Now())) {
+		subSvc.InvalidateCache(subID)
+
+		invalidReason := string(database.SubscriptionStatusRevoked)
+		if sub.Status == string(database.SubscriptionStatusActive) {
+			invalidReason = "expired"
+		}
+
+		metrics.SubserverCacheInvalidationsTotal.WithLabelValues(invalidReason).Inc()
+		logger.Warn("Cache invalidated: subscription no longer active",
+			zap.String("sub_id", subID),
+			zap.String("status", sub.Status),
+			zap.Timep("expires_at", sub.ExpiresAt))
+
+		return nil, ErrSubscriptionNotFound
+	}
+
+	loaded := &loadedSubscription{cacheKey: subID}
+	if sub.ProviderSourceID != nil {
+		if sub.ProviderSource == nil {
+			subSvc.InvalidateCache(subID)
+			logger.Warn("Linked provider source is missing",
+				zap.String("sub_id", subID),
+				zap.Uint("provider_source_id", *sub.ProviderSourceID))
+
+			return nil, ErrProviderSourceUnavailable
+		}
+
+		if _, _, configErr := validateProviderSourceConfiguration(*sub.ProviderSource); configErr != nil {
+			subSvc.InvalidateCache(subID)
+			logger.Warn("Linked provider source is disabled or unusable",
+				zap.String("sub_id", subID),
+				zap.Uint("provider_source_id", *sub.ProviderSourceID))
+
+			return nil, ErrProviderSourceUnavailable
+		}
+
+		loaded.providerSource = sub.ProviderSource
+		loaded.cacheKey = providerSourceCacheKey(subID, *sub.ProviderSource)
+	}
+
+	if cachedBody, cachedHeaders, ok := subSvc.GetCache(loaded.cacheKey); ok {
+		logger.Debug("Cache hit", zap.String("sub_id", subID))
+		updateLastRequest(ctx, db, subID)
+		loaded.cachedResult = &SubscriptionResult{Body: cachedBody, Headers: cachedHeaders}
+
+		return loaded, nil
+	}
+
+	var subFull *database.SubscriptionFull
+	if loaded.providerSource == nil {
+		subFull, err = db.GetWithPlanAndNodes(ctx, subID)
+		if err != nil {
+			if errors.Is(err, database.ErrSubscriptionNotFound) {
+				logger.Debug("Subscription not found in database",
+					zap.String("sub_id", subID))
+
+				return nil, ErrSubscriptionNotFound
+			}
+
+			logger.Error("Failed to get subscription with plan and sources",
+				zap.String("sub_id", subID),
+				zap.Error(err))
+
+			return nil, fmt.Errorf("database error: %w", err)
+		}
+	} else {
+		subFull = &database.SubscriptionFull{Subscription: *sub}
+	}
+
+	loaded.full = subFull
+
 	logger.Debug("Subscription loaded from database",
 		zap.Uint("sub_pk", subFull.Subscription.ID),
 		zap.String("status", subFull.Subscription.Status),
 		zap.Timep("expires_at", subFull.Subscription.ExpiresAt),
-		zap.Int64("plan_traffic_limit", subFull.Plan.TrafficLimit),
-		zap.Int("nodes_count", len(subFull.Nodes)),
+		zap.Bool("provider_source", loaded.providerSource != nil),
 	)
 
 	UpdateDevices(ctx, db, subFull, requestHeaders)
 	UpdateIPs(ctx, db, subFull, clientIP)
 
-	// best-effort: обновляем last_request, ошибки не блокируют выдачу.
-	err = db.UpdateLastRequest(ctx, subID)
+	updateLastRequest(ctx, db, subID)
+
+	return loaded, nil
+}
+
+func updateLastRequest(ctx context.Context, db interfaces.SubscriptionRepository, subID string) {
+	err := db.UpdateLastRequest(ctx, subID)
 	if err != nil {
 		logger.Warn("Failed to update last_request",
 			zap.String("sub_id", subID),
 			zap.Error(err))
 	}
+}
 
-	return subFull, nil
+func providerSourceCacheKey(subID string, source database.ProviderSource) string {
+	return fmt.Sprintf("%s:provider:%d:%d", subID, source.ID, source.UpdatedAt.UnixNano())
 }
 
 // aggregatedSources holds the collected items and traffic data from all sources.
@@ -156,6 +180,47 @@ type sourceResult struct {
 	body    []byte
 	headers map[string]string
 	format  Format
+}
+
+// fetchAndAggregateProviderSource fetches exactly one linked ProviderSource and
+// feeds its payload through the same format detection and normalization used by
+// legacy nodes. Provider fetch failures are terminal and never fall back to
+// plan nodes.
+func fetchAndAggregateProviderSource(ctx context.Context, subID string, source database.ProviderSource) (aggregatedSources, int, int, error) {
+	fetchStart := time.Now()
+	response, err := FetchFromProviderSource(ctx, source)
+	fetchDuration := time.Since(fetchStart).Seconds()
+	if err != nil {
+		metrics.SubserverSourceFetchTotal.WithLabelValues("error", "unknown").Inc()
+		metrics.SubserverSourceFetchDuration.WithLabelValues("error").Observe(fetchDuration)
+
+		return aggregatedSources{}, 0, 1, ErrProviderSourceUnavailable
+	}
+
+	format := DetectFormat(response.Body)
+	metrics.SubserverSourceFetchTotal.WithLabelValues("success", format.String()).Inc()
+	metrics.SubserverSourceFetchDuration.WithLabelValues("success").Observe(fetchDuration)
+	logger.Debug("Provider source response received",
+		zap.String("sub_id", subID),
+		zap.Uint("provider_source_id", source.ID),
+		zap.String("format", format.String()),
+		zap.Int("body_size", len(response.Body)),
+		zap.Int("headers_count", len(response.Headers)))
+
+	agg := aggregatedSources{
+		allJSON:            true,
+		firstSourceHeaders: response.Headers,
+	}
+	updateMinExpire(&agg, response.Headers)
+	agg.totalUpload = ParseUserInfoValue(response.Headers, "upload")
+	agg.totalDownload = ParseUserInfoValue(response.Headers, "download")
+
+	aggregateFormat(&agg, format, response.Body, database.Node{
+		ID:   source.ID,
+		Name: source.Name,
+	}, subID)
+
+	return agg, 1, 1, nil
 }
 
 // fetchAndAggregateSources fetches all active source nodes concurrently (bounded

@@ -159,6 +159,7 @@ type DatabaseService struct {
 	ClaimExpiredTrialsFunc                      func(ctx context.Context, hours int) ([]database.Subscription, error)
 	DeleteClaimedTrialFunc                      func(ctx context.Context, id uint) error
 	GetPoolStatsFunc                            func() (*database.PoolStats, error)
+	GetSubscriptionWithProviderSourceFunc       func(ctx context.Context, subscriptionID string) (*database.Subscription, error)
 	GetWithPlanAndNodesFunc                     func(ctx context.Context, subscriptionID string) (*database.SubscriptionFull, error)
 	GetSubscriptionStatusFunc                   func(ctx context.Context, subscriptionID string) (string, time.Time, error)
 	UpdateDevicesFunc                           func(ctx context.Context, id uint, devicesJSON string) error
@@ -1301,6 +1302,33 @@ func (m *DatabaseService) GetPoolStats() (*database.PoolStats, error) {
 	}
 
 	return &database.PoolStats{}, nil
+}
+
+func (m *DatabaseService) GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*database.Subscription, error) {
+	if m.GetSubscriptionWithProviderSourceFunc != nil {
+		return m.GetSubscriptionWithProviderSourceFunc(ctx, subscriptionID)
+	}
+
+	if m.GetSubscriptionStatusFunc != nil {
+		status, expiresAt, err := m.GetSubscriptionStatusFunc(ctx, subscriptionID)
+		if err != nil {
+			return nil, err
+		}
+
+		sub := &database.Subscription{SubscriptionID: subscriptionID, Status: status}
+		if !expiresAt.IsZero() {
+			sub.ExpiresAt = &expiresAt
+		}
+
+		return sub, nil
+	}
+
+	full, err := m.GetWithPlanAndNodes(ctx, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &full.Subscription, nil
 }
 
 func (m *DatabaseService) GetWithPlanAndNodes(ctx context.Context, subscriptionID string) (*database.SubscriptionFull, error) {

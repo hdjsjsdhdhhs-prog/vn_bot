@@ -1036,6 +1036,15 @@ func (s *Server) handleSubscription(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if errors.Is(err, subserver.ErrProviderSourceUnavailable) {
+			logger.Warn("Subscription provider source is unavailable",
+				zap.String("sub_id", subID),
+				zap.String("client_ip", clientIP))
+			writeSubscriptionText(response, http.StatusServiceUnavailable, "Subscription source is unavailable")
+
+			return
+		}
+
 		logger.Error("Failed to process subscription",
 			zap.String("sub_id", subID),
 			zap.String("client_ip", clientIP),

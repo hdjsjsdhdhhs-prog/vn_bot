@@ -20,35 +20,42 @@ import (
 // cannot be served.
 //
 // The flow is:
-//  1. Check the cache for a fresh entry keyed by subID (serveFromCache).
-//  2. On cache miss, load the subscription with plan and sources from the database (loadSubscription).
-//  3. Track the requesting device and IP for analytics.
-//  4. For each active source, fetch the upstream response and detect its format (fetchAndAggregateSources).
-//  5. Aggregate subscription-userinfo headers and build the final response (buildResponse).
+//  1. Resolve and validate the subscription's optional ProviderSource.
+//  2. Check the route-specific response cache.
+//  3. On a cache miss, track device/IP analytics.
+//  4. Fetch either the single ProviderSource or the unchanged legacy plan nodes.
+//  5. Normalize through the existing aggregation pipeline and cache the result.
 func HandleSubscription(ctx context.Context, db interfaces.SubscriptionRepository, subSvc *Service, subID, clientIP string, requestHeaders map[string]string) (*SubscriptionResult, int, int, error) {
-	// 1. Try to serve from cache first.
-	if result, hit, err := serveFromCache(ctx, db, subSvc, subID); hit {
-		return result, 0, 0, err
-	}
-
-	// 2. Cache miss: load the subscription with plan and active sources.
-
-	subFull, err := loadSubscription(ctx, db, subSvc, subID, clientIP, requestHeaders)
+	loaded, err := loadSubscription(ctx, db, subSvc, subID, clientIP, requestHeaders)
 	if err != nil {
 		return nil, 0, 0, err
 	}
+	if loaded.cachedResult != nil {
+		return loaded.cachedResult, 0, 0, nil
+	}
 
-	// 3-4. Fetch from all active sources and aggregate items + traffic.
-	agg, success, total := fetchAndAggregateSources(ctx, subID, subFull.Nodes)
-
-	// 5. Build the final response and cache it. Paid (premium) subscriptions get
+	// Paid (premium) subscriptions get
 	// a " Premium" suffix appended to the upstream profile-title header.
 	profileTitleSuffix := ""
-	if subFull.Subscription.IsPaid() {
+	if loaded.full.Subscription.IsPaid() {
 		profileTitleSuffix = " Premium"
 	}
 
-	res, err := buildResponse(subSvc, subID, agg, subFull.Plan.TrafficLimit, profileTitleSuffix)
+	if loaded.providerSource != nil {
+		agg, success, total, fetchErr := fetchAndAggregateProviderSource(ctx, subID, *loaded.providerSource)
+		if fetchErr != nil {
+			return nil, success, total, fetchErr
+		}
+
+		upstreamTrafficLimit := ParseUserInfoValue(agg.firstSourceHeaders, "total")
+		res, buildErr := buildResponse(subSvc, loaded.cacheKey, agg, upstreamTrafficLimit, profileTitleSuffix)
+
+		return res, success, total, buildErr
+	}
+
+	// Legacy subscriptions retain the existing plan-node aggregation path.
+	agg, success, total := fetchAndAggregateSources(ctx, subID, loaded.full.Nodes)
+	res, err := buildResponse(subSvc, loaded.cacheKey, agg, loaded.full.Plan.TrafficLimit, profileTitleSuffix)
 
 	return res, success, total, err
 }

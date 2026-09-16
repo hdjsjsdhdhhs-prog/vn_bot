@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/kereal/rs8kvn_bot/internal/config"
+	"github.com/kereal/rs8kvn_bot/internal/database"
 	"github.com/kereal/rs8kvn_bot/internal/logger"
 
 	"go.uber.org/zap"
@@ -31,6 +33,8 @@ var fetchHTTPClient = &http.Client{
 		DisableCompression:  false,
 	},
 }
+
+const defaultSourceUserAgent = "RS8 KVN Subserver"
 
 // NodeResponse holds the body and headers returned by an upstream node's
 // subscription endpoint (3x-ui JSON, Clash YAML, base64, plain links).
@@ -54,7 +58,7 @@ func FetchFromNode(ctx context.Context, url string) (*NodeResponse, error) {
 		return nil, fmt.Errorf("create source fetch request: %w", err)
 	}
 
-	req.Header.Set("User-Agent", "RS8 KVN Subserver")
+	req.Header.Set("User-Agent", defaultSourceUserAgent)
 
 	resp, err := fetchHTTPClient.Do(req)
 	if err != nil {
@@ -119,6 +123,197 @@ func FetchFromNode(ctx context.Context, url string) (*NodeResponse, error) {
 		Body:    body,
 		Headers: headers,
 	}, nil
+}
+
+// FetchFromProviderSource fetches a read-only upstream subscription using only
+// server-side ProviderSource credentials. All failures collapse to a safe
+// sentinel so URLs and credential-bearing request details cannot escape into
+// client-visible errors or application logs.
+func FetchFromProviderSource(ctx context.Context, source database.ProviderSource) (*NodeResponse, error) {
+	requestHeaders, sensitiveValues, err := validateProviderSourceConfiguration(source)
+	if err != nil {
+		logger.Warn("Provider source configuration is unusable",
+			zap.Uint("provider_source_id", source.ID))
+
+		return nil, ErrProviderSourceUnavailable
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source.SubscriptionURL, nil)
+	if err != nil {
+		logger.Warn("Failed to create provider source request",
+			zap.Uint("provider_source_id", source.ID))
+
+		return nil, ErrProviderSourceUnavailable
+	}
+
+	for key, value := range requestHeaders {
+		req.Header.Set(key, value)
+	}
+
+	if source.UserAgent != "" {
+		req.Header.Set("User-Agent", source.UserAgent)
+	} else if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", defaultSourceUserAgent)
+	}
+
+	if source.HWID != "" {
+		req.Header.Set("X-HWID", source.HWID)
+	}
+
+	client := providerSourceHTTPClient(requestHeaders, source)
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Warn("Provider source request failed",
+			zap.Uint("provider_source_id", source.ID))
+
+		return nil, ErrProviderSourceUnavailable
+	}
+
+	if resp == nil || resp.Body == nil {
+		logger.Warn("Provider source returned no response body",
+			zap.Uint("provider_source_id", source.ID))
+
+		return nil, ErrProviderSourceUnavailable
+	}
+
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			logger.Warn("Failed to close provider source response body",
+				zap.Uint("provider_source_id", source.ID))
+		}
+	}()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		logger.Warn("Provider source returned non-2xx status",
+			zap.Uint("provider_source_id", source.ID),
+			zap.Int("status", resp.StatusCode))
+
+		return nil, ErrProviderSourceUnavailable
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseSize+1))
+	if err != nil {
+		logger.Warn("Failed to read provider source response",
+			zap.Uint("provider_source_id", source.ID))
+
+		return nil, ErrProviderSourceUnavailable
+	}
+
+	if len(body) > config.MaxResponseSize {
+		logger.Warn("Provider source response exceeds size limit",
+			zap.Uint("provider_source_id", source.ID),
+			zap.Int("limit", config.MaxResponseSize))
+
+		return nil, ErrProviderSourceUnavailable
+	}
+
+	if containsSensitiveProviderValue(string(body), sensitiveValues) {
+		logger.Warn("Provider source response contained server-side credentials",
+			zap.Uint("provider_source_id", source.ID))
+
+		return nil, ErrProviderSourceUnavailable
+	}
+
+	responseHeaders := make(map[string]string)
+	for key, values := range resp.Header {
+		if len(values) == 0 {
+			continue
+		}
+
+		lowerKey := strings.ToLower(key)
+		if _, configured := requestHeaders[lowerKey]; configured ||
+			lowerKey == "user-agent" || lowerKey == "x-hwid" ||
+			containsSensitiveProviderValue(values[0], sensitiveValues) {
+			continue
+		}
+
+		responseHeaders[lowerKey] = values[0]
+	}
+
+	return &NodeResponse{Body: body, Headers: responseHeaders}, nil
+}
+
+// validateProviderSourceConfiguration validates fields required by the runtime
+// fetch and returns lower-cased configured headers plus values that must never
+// appear in a downstream response.
+func validateProviderSourceConfiguration(source database.ProviderSource) (map[string]string, []string, error) {
+	if !source.Enabled || strings.TrimSpace(source.SubscriptionURL) == "" {
+		return nil, nil, ErrProviderSourceUnavailable
+	}
+
+	parsedURL, err := url.Parse(source.SubscriptionURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		return nil, nil, ErrProviderSourceUnavailable
+	}
+
+	headers := make(map[string]string)
+	rawHeaders := strings.TrimSpace(source.Headers)
+	if rawHeaders != "" {
+		if err := json.Unmarshal([]byte(rawHeaders), &headers); err != nil {
+			return nil, nil, ErrProviderSourceUnavailable
+		}
+	}
+
+	normalizedHeaders := make(map[string]string, len(headers))
+	sensitiveValues := nonEmptyStrings(source.SubscriptionURL, source.HWID, source.UserAgent)
+
+	for key, value := range headers {
+		lowerKey := strings.ToLower(strings.TrimSpace(key))
+		if lowerKey == "" {
+			return nil, nil, ErrProviderSourceUnavailable
+		}
+
+		normalizedHeaders[lowerKey] = value
+		// Every configured request-header value is server-side configuration.
+		// An upstream must not be able to reflect it into a customer response.
+		sensitiveValues = append(sensitiveValues, value)
+	}
+
+	return normalizedHeaders, sensitiveValues, nil
+}
+
+// providerSourceHTTPClient retains the shared transport, timeout, and response
+// limits used by node fetching. On a cross-host redirect it removes all
+// ProviderSource credentials before the redirected request is sent.
+func providerSourceHTTPClient(requestHeaders map[string]string, source database.ProviderSource) *http.Client {
+	client := *fetchHTTPClient
+	sourceURL, _ := url.Parse(source.SubscriptionURL)
+	client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+		if sourceURL != nil && req.URL.Host == sourceURL.Host {
+			return nil
+		}
+
+		for key := range requestHeaders {
+			req.Header.Del(key)
+		}
+		req.Header.Del("X-HWID")
+		req.Header.Del("User-Agent")
+
+		return nil
+	}
+
+	return &client
+}
+
+func containsSensitiveProviderValue(value string, sensitiveValues []string) bool {
+	for _, sensitive := range sensitiveValues {
+		if sensitive != "" && strings.Contains(value, sensitive) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func nonEmptyStrings(values ...string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != "" {
+			result = append(result, value)
+		}
+	}
+
+	return result
 }
 
 // Format represents the detected encoding format of a subscription response body.

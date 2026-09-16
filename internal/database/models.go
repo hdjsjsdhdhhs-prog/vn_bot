@@ -79,17 +79,18 @@ type Subscription struct {
 	ClientID       string `gorm:"size:255;not null;uniqueIndex"`
 	SubscriptionID string `gorm:"size:255;not null;uniqueIndex"`
 	// ExpiresAt — срок действия подписки. NULL = бессрочная (free-план).
-	ExpiresAt      *time.Time `gorm:"index"`
-	Status         string     `gorm:"default:active;size:50;index"`
-	InviteCode     *string    `gorm:"size:16;index"`
-	PlanID         uint       `gorm:"index"`
-	ReferredBy     *int64     `gorm:"index"`
-	ProductID      *uint      `gorm:"index"`
-	StartedAt      *time.Time
-	PricePaidCents int64   `gorm:"default:0"`
-	Currency       *string `gorm:"size:3"`
-	Devices        string  `gorm:"type:text;default:'[]'"` // JSON array of {header_key: value} device entries
-	Ips            string  `gorm:"type:text;default:'[]'"` // JSON array of {ip: timestamp} entries
+	ExpiresAt        *time.Time `gorm:"index"`
+	Status           string     `gorm:"default:active;size:50;index"`
+	InviteCode       *string    `gorm:"size:16;index"`
+	PlanID           uint       `gorm:"index"`
+	ReferredBy       *int64     `gorm:"index"`
+	ProductID        *uint      `gorm:"index"`
+	ProviderSourceID *uint      `gorm:"index"`
+	StartedAt        *time.Time
+	PricePaidCents   int64   `gorm:"default:0"`
+	Currency         *string `gorm:"size:3"`
+	Devices          string  `gorm:"type:text;default:'[]'"` // JSON array of {header_key: value} device entries
+	Ips              string  `gorm:"type:text;default:'[]'"` // JSON array of {ip: timestamp} entries
 	// LastRequest — дата/время последнего запроса подписки через субсервер (/sub/:id).
 	// Обновляется best-effort при каждом запросе клиента. NULL до первого запроса.
 	LastRequest   *time.Time `gorm:"index"`
@@ -100,10 +101,11 @@ type Subscription struct {
 	// 1<<0=90% израсходовано, 1<<1=превышен лимит/отключён, 1<<2=сброшен+включён.
 	TrafficRemindersSent int `gorm:"not null;default:0"`
 
-	Plan    *Plan              `gorm:"foreignKey:PlanID"`
-	Product *Product           `gorm:"foreignKey:ProductID"`
-	Orders  []Order            `gorm:"foreignKey:SubscriptionID"`
-	Nodes   []SubscriptionNode `gorm:"foreignKey:SubscriptionID"`
+	Plan           *Plan              `gorm:"foreignKey:PlanID"`
+	Product        *Product           `gorm:"foreignKey:ProductID"`
+	ProviderSource *ProviderSource    `gorm:"foreignKey:ProviderSourceID;references:ID"`
+	Orders         []Order            `gorm:"foreignKey:SubscriptionID"`
+	Nodes          []SubscriptionNode `gorm:"foreignKey:SubscriptionID"`
 }
 
 // Node represents a configured 3x-ui panel source.

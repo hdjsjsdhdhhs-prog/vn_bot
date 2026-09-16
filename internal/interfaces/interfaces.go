@@ -62,6 +62,7 @@ type SubscriptionQueries interface {
 	GetByID(ctx context.Context, id uint) (*database.Subscription, error)
 	GetLatestSubscriptions(ctx context.Context, limit int) ([]database.Subscription, error)
 	GetAllSubscriptions(ctx context.Context) ([]database.Subscription, error)
+	GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*database.Subscription, error)
 	GetWithPlanAndNodes(ctx context.Context, subscriptionID string) (*database.SubscriptionFull, error)
 	// GetActiveSubscriptionsWithTrafficLimit returns active subscriptions whose
 	// plan has a non-zero traffic limit, together with that limit (in bytes).

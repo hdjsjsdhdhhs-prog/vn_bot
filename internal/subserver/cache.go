@@ -3,6 +3,7 @@ package subserver
 import (
 	"bytes"
 	"maps"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,6 +98,18 @@ func (c *Cache) Delete(key string) {
 	defer c.mu.Unlock()
 
 	delete(c.entries, key)
+}
+
+// DeletePrefix removes every entry whose key starts with prefix.
+func (c *Cache) DeletePrefix(prefix string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key := range c.entries {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.entries, key)
+		}
+	}
 }
 
 // cleanupLoop periodically evicts expired entries every TTL/2.

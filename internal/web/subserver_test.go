@@ -468,6 +468,46 @@ func TestHandleSubscription_DatabaseError_Returns500GenericBody(t *testing.T) {
 	assert.Equal(t, "Internal Server Error", w.Body.String(), "500 body must be generic, not 'Subscription not found'")
 }
 
+func TestHandleSubscription_ProviderSourceUnavailableReturnsSafe503(t *testing.T) {
+	t.Parallel()
+
+	const (
+		upstreamURL = "https://provider.example/private/subscription-token"
+		hwid        = "provider-secret-hwid"
+		userAgent   = "provider-secret-agent"
+	)
+
+	sourceID := uint(91)
+	db := testutil.NewDatabaseService()
+	db.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
+		return &database.Subscription{
+			ID:               1,
+			SubscriptionID:   "provider-unavailable",
+			Status:           string(database.SubscriptionStatusActive),
+			ProviderSourceID: &sourceID,
+			ProviderSource: &database.ProviderSource{
+				ID:              sourceID,
+				SubscriptionURL: upstreamURL,
+				HWID:            hwid,
+				UserAgent:       userAgent,
+				Headers:         `{}`,
+				Enabled:         false,
+			},
+		}, nil
+	}
+
+	srv := testServer(t, db, &config.Config{})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/sub/provider-unavailable", nil)
+	srv.handleSubscription(w, r)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, "Subscription source is unavailable", w.Body.String())
+	assert.NotContains(t, w.Body.String(), upstreamURL)
+	assert.NotContains(t, w.Body.String(), hwid)
+	assert.NotContains(t, w.Body.String(), userAgent)
+}
+
 func TestHandleSubscription_CacheSubscriptionResult(t *testing.T) {
 	t.Parallel()
 

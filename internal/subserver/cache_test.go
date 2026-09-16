@@ -33,6 +33,26 @@ func TestCache_GetMiss(t *testing.T) {
 	assert.Nil(t, headers)
 }
 
+func TestCache_DeletePrefix(t *testing.T) {
+	t.Parallel()
+
+	cache := NewCache(time.Minute)
+	defer cache.Stop()
+
+	cache.Set("sub-1", []byte("legacy"), nil)
+	cache.Set("sub-1:provider:10:100", []byte("provider"), nil)
+	cache.Set("sub-2:provider:10:100", []byte("other"), nil)
+
+	cache.DeletePrefix("sub-1:provider:")
+
+	_, _, legacyOK := cache.Get("sub-1")
+	_, _, providerOK := cache.Get("sub-1:provider:10:100")
+	_, _, otherOK := cache.Get("sub-2:provider:10:100")
+	assert.True(t, legacyOK)
+	assert.False(t, providerOK)
+	assert.True(t, otherOK)
+}
+
 func TestCache_SetAndGet(t *testing.T) {
 	t.Parallel()
 
