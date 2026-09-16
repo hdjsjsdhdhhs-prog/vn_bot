@@ -212,6 +212,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/payment/callback", s.handlePaymentCallback)
 	mux.HandleFunc("/i/", s.handleInvite)
+	mux.HandleFunc("/subscription-info/", s.handleSubscriptionInfo)
 	mux.HandleFunc("/sub/", s.handleSubscription)
 	mux.HandleFunc("/static/logo.png", s.handleLogo)
 
@@ -665,6 +666,56 @@ func (s *Server) writeJSON(w http.ResponseWriter, resp HealthResponse) {
 // handleInvite is the route adapter for the public invite landing page.
 func (s *Server) handleInvite(w http.ResponseWriter, r *http.Request) {
 	s.HandleInvite(w, r)
+}
+
+// handleSubscriptionInfo returns the minimal customer-safe subscription state
+// for a holder of the public bearer token.
+func (s *Server) handleSubscriptionInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	const pathPrefix = "/subscription-info/"
+	token := strings.TrimPrefix(r.URL.Path, pathPrefix)
+	if !strings.HasPrefix(r.URL.Path, pathPrefix) || strings.Contains(token, "/") || !utils.IsValidSubscriptionToken(token) {
+		http.Error(w, "Subscription not found", http.StatusNotFound)
+
+		return
+	}
+
+	if s.subService == nil {
+		logger.Error("Subscription service not initialized")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+
+		return
+	}
+
+	info, err := s.subService.GetPublicSubscriptionInfo(r.Context(), token)
+	if err != nil {
+		if errors.Is(err, database.ErrSubscriptionNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "Subscription not found", http.StatusNotFound)
+
+			return
+		}
+
+		logger.Error("Failed to load public subscription info",
+			zap.String("client_ip", getClientIP(r)),
+			zap.Error(err))
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err = json.NewEncoder(w).Encode(info); err != nil {
+		logger.Error("Failed to encode public subscription info", zap.Error(err))
+	}
 }
 
 // HandleInvite validates an invite code, reuses an unactivated trial from the

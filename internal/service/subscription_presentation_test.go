@@ -1,10 +1,43 @@
 package service
 
 import (
+	"context"
 	"testing"
+	"time"
 
+	"github.com/kereal/rs8kvn_bot/internal/config"
+	"github.com/kereal/rs8kvn_bot/internal/database"
+	"github.com/kereal/rs8kvn_bot/internal/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestGetPublicSubscriptionInfo(t *testing.T) {
+	const token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	expiresAt := time.Date(2027, time.January, 2, 3, 4, 5, 0, time.UTC)
+	db := testutil.NewDatabaseService()
+	db.GetByTokenFunc = func(_ context.Context, gotToken string) (*database.Subscription, error) {
+		require.Equal(t, token, gotToken)
+		return &database.Subscription{
+			ID:             123,
+			SubscriptionID: "internal-id",
+			Token:          gotToken,
+			Status:         string(database.SubscriptionStatusActive),
+			ExpiresAt:      &expiresAt,
+		}, nil
+	}
+	cfg := &config.Config{GlobalSubURL: "https://customer.example/sub/"}
+	svc := NewSubscriptionService(db, nil, nil, nil, cfg)
+
+	info, err := svc.GetPublicSubscriptionInfo(context.Background(), token)
+	require.NoError(t, err)
+	assert.Equal(t, string(database.SubscriptionStatusActive), info.Status)
+	assert.Equal(t, expiresAt, *info.ExpiresAt)
+	assert.Equal(t, cfg.SubURL(token), info.SubscriptionURL)
+
+	_, err = svc.GetPublicSubscriptionInfo(context.Background(), "malformed")
+	assert.ErrorIs(t, err, database.ErrSubscriptionNotFound)
+}
 
 func TestFormatSubscriptionMessage_UsesCanonicalFields(t *testing.T) {
 	traffic := &TrafficInfo{
