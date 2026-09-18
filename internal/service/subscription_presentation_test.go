@@ -39,6 +39,35 @@ func TestGetPublicSubscriptionInfo(t *testing.T) {
 	assert.ErrorIs(t, err, database.ErrSubscriptionNotFound)
 }
 
+func TestGetPublicSubscriptionInfo_EffectiveStatus(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Hour)
+	for _, tc := range []struct {
+		status    string
+		expiresAt *time.Time
+		want      string
+	}{
+		{"active", nil, "active"},
+		{"active", &future, "active"},
+		{"active", &past, "expired"},
+		{"revoked", &past, "revoked"},
+		{"paused", &past, "paused"},
+		{"canceled", &past, "canceled"},
+		{"expired", &future, "expired"},
+	} {
+		t.Run(tc.status+"/"+tc.want, func(t *testing.T) {
+			db := testutil.NewDatabaseService()
+			sub := &database.Subscription{Token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: tc.status, ExpiresAt: tc.expiresAt}
+			db.GetByTokenFunc = func(context.Context, string) (*database.Subscription, error) { return sub, nil }
+			svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{GlobalSubURL: "https://customer.example/sub/"})
+			info, err := svc.GetPublicSubscriptionInfo(context.Background(), sub.Token)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, info.Status)
+			assert.Equal(t, tc.status, sub.Status, "presentation must not mutate persisted state")
+		})
+	}
+}
+
 func TestFormatSubscriptionMessage_UsesCanonicalFields(t *testing.T) {
 	traffic := &TrafficInfo{
 		PlanName:           "Premium",

@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -396,10 +395,10 @@ func TestServer_StartPortInUse(t *testing.T) {
 	defer listener.Close()
 
 	addr := listener.Addr().String()
-	port := strings.Split(addr, ":")[1]
 
 	t.Run("start_binds_fails", func(t *testing.T) {
-		srv := NewServer(":"+port, nil, &config.Config{}, "testbot", nil, nil)
+		// Bind the same address, not a wildcard that may use a different IP stack.
+		srv := NewServer(addr, nil, &config.Config{}, "testbot", nil, nil)
 		ctx := context.Background()
 		err := srv.Start(ctx)
 		require.Error(t, err, "Start() should return error when port is already in use")

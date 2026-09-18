@@ -87,28 +87,28 @@ type PaymentConfig struct {
 // Server owns the HTTP listener, endpoint dependencies, health checkers, and
 // lifecycle state for the public web service.
 type Server struct {
-	addr            string
-	db              interfaces.WebRepository
-	cfg             *config.Config
-	botUsername     string
-	bot             interfaces.BotAPI
-	subService      *service.SubscriptionService
-	orderService    *service.OrderService
-	paymentConfig   *PaymentConfig
-	subServer       *subserver.Service
-	subserverLogger *subserver.AccessLogger
-	server          *http.Server
-	listenerAddr    string
-	mu              sync.RWMutex
-	trialRateMu     sync.Mutex
-	ready           bool
-	paymentReady    bool
-	checkers        map[string]func(context.Context) ComponentHealth
-	inviteCodeRegex *regexp.Regexp
-	startTime       time.Time
-	trialTemplate   *template.Template
+	addr               string
+	db                 interfaces.WebRepository
+	cfg                *config.Config
+	botUsername        string
+	bot                interfaces.BotAPI
+	subService         *service.SubscriptionService
+	orderService       *service.OrderService
+	paymentConfig      *PaymentConfig
+	subServer          *subserver.Service
+	subserverLogger    *subserver.AccessLogger
+	server             *http.Server
+	listenerAddr       string
+	mu                 sync.RWMutex
+	trialRateMu        sync.Mutex
+	ready              bool
+	paymentReady       bool
+	checkers           map[string]func(context.Context) ComponentHealth
+	inviteCodeRegex    *regexp.Regexp
+	startTime          time.Time
+	trialTemplate      *template.Template
 	connectionTemplate *template.Template
-	errorTemplate   *template.Template
+	errorTemplate      *template.Template
 }
 
 // NewServer constructs a web server and parses the embedded templates. It does
@@ -725,6 +725,7 @@ func (s *Server) handleSubscriptionInfo(w http.ResponseWriter, r *http.Request) 
 // connectionPageData contains only customer-safe subscription presentation
 // fields. The QR image is generated from the public subscription URL.
 type connectionPageData struct {
+	Active        bool
 	StatusLabel   string
 	ExpiresAt     string
 	SubURL        string
@@ -767,9 +768,9 @@ func (s *Server) handleConnectionPage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		logger.Error("Failed to load connection page subscription info",
-			zap.String("client_ip", getClientIP(r)),
-			zap.Error(err))
+		// Repository errors may contain query parameters, including the bearer
+		// token. Do not include the raw error or request URI in page logs.
+		logger.Error("Failed to load connection page subscription info")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
 		s.renderErrorPage(w, "Ошибка сервера. Попробуйте позже.")
@@ -779,7 +780,7 @@ func (s *Server) handleConnectionPage(w http.ResponseWriter, r *http.Request) {
 
 	qrPNG, err := utils.GenerateQRCodePNG(info.SubscriptionURL)
 	if err != nil {
-		logger.Error("Failed to generate connection page QR code", zap.Error(err))
+		logger.Error("Failed to generate connection page QR code")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
 		s.renderErrorPage(w, "Ошибка сервера. Попробуйте позже.")
@@ -792,9 +793,8 @@ func (s *Server) handleConnectionPage(w http.ResponseWriter, r *http.Request) {
 		expiresAt = info.ExpiresAt.UTC().Format("02.01.2006 15:04 UTC")
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
 	s.renderConnectionPage(w, connectionPageData{
+		Active:        info.Status == string(database.SubscriptionStatusActive),
 		StatusLabel:   connectionStatusLabel(info.Status),
 		ExpiresAt:     expiresAt,
 		SubURL:        info.SubscriptionURL,
@@ -809,8 +809,22 @@ func (s *Server) renderConnectionNotFound(w http.ResponseWriter) {
 }
 
 func (s *Server) renderConnectionPage(w http.ResponseWriter, data connectionPageData) {
-	if err := s.connectionTemplate.Execute(w, data); err != nil {
-		logger.Error("Failed to render connection page", zap.Error(err))
+	// Render before committing 200 so template failures cannot send a partial
+	// success page. Template errors can include values, so log only the event.
+	var body bytes.Buffer
+	if err := s.connectionTemplate.Execute(&body, data); err != nil {
+		logger.Error("Failed to render connection page")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		s.renderErrorPage(w, "Ошибка сервера. Попробуйте позже.")
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body.Bytes()); err != nil {
+		logger.Debug("Failed to write connection page")
 	}
 }
 

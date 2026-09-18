@@ -43,6 +43,12 @@ func TestNormalizePath(t *testing.T) {
 		{"subscription uuid", "/sub/550e8400-e29b-41d4-a716-446655440000", "/sub/:id"},
 		{"subscription info token", "/subscription-info/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "/subscription-info/:token"},
 		{"connection token", "/connect/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "/connect/:token"},
+		{"connection root redirect", "/connect", "/connect/:token"},
+		{"connection empty token", "/connect/", "/connect/:token"},
+		{"connection malformed token", "/connect/not-a-token/extra", "/connect/:token"},
+		{"connection leading slashes", "//connect/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "/connect/:token"},
+		{"connection dot segments", "/prefix/../connect/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/connect/:token"},
+		{"connection removed token", "/connect/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/../../healthz", "/connect/:token"},
 		{"static after slash", "/static/logo.png", "/static/logo.png"},
 		{"mixed static", "/api/v1/users/123", "/api/v1/users/123"},
 	}

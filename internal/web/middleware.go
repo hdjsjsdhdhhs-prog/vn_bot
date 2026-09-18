@@ -3,6 +3,7 @@ package web
 import (
 	"crypto/subtle"
 	"net/http"
+	"path"
 	"strings"
 
 	"github.com/kereal/rs8kvn_bot/internal/logger"
@@ -19,6 +20,13 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		// Cover ServeMux redirects as well as handler responses for bearer pages,
+		// including paths with duplicate slashes or dot segments.
+		cleanPath := path.Clean(r.URL.Path)
+		if strings.HasPrefix(r.URL.Path, "/connect/") || cleanPath == "/connect" || strings.HasPrefix(cleanPath, "/connect/") {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+		}
 		next.ServeHTTP(w, r)
 	})
 }

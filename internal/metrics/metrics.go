@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"net"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -399,7 +400,10 @@ func normalizePath(p string) string {
 		return "/subscription-info/:token"
 	}
 
-	if strings.HasPrefix(p, "/connect/") {
+	// Instrumentation runs before ServeMux cleans paths and redirects. Mask
+	// both forms so e.g. //connect/<token> cannot leak into metric labels.
+	cleanPath := path.Clean(p)
+	if strings.HasPrefix(p, "/connect/") || cleanPath == "/connect" || strings.HasPrefix(cleanPath, "/connect/") {
 		return "/connect/:token"
 	}
 

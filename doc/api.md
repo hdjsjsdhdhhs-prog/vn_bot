@@ -87,6 +87,30 @@ Returns the merged subscription configuration from all active nodes. Responses a
 
 ---
 
+### `GET /connect/{token}` — customer connection page
+
+Server-rendered mobile-first HTML (`internal/web/templates/connect.html`, embedded in the Go binary). Uses the same bearer-token lookup and customer-safe presentation as `GET /subscription-info/{token}`; no Telegram authentication is required.
+
+- Shows subscription status, expiration in UTC (or no expiration), the public subscription URL, an embedded QR image, and a local copy-link button.
+- The URL comes only from `Config.SubURL(token)` (`GLOBAL_SUB_URL`), not from a ProviderSource. The existing `utils.GenerateQRCodePNG` encodes exactly that URL on the server. No client deep links or third-party QR services are used.
+- Copy uses the browser Clipboard API, with local selection/`execCommand` fallback and manual-copy guidance when clipboard access is blocked. The page remains readable without JavaScript.
+- Existing expired, revoked, paused and canceled subscriptions return **200** with their inactive state. An `active` row whose expiry has passed is presented as expired, matching subscription-serving eligibility; this also applies to `/subscription-info/{token}`. Presentation does not mutate the row.
+- Malformed, unknown and mismatched tokens return the same safe **404** page. Non-GET methods return **405** (`Allow: GET`); infrastructure/rendering failures return a generic **500**.
+- Responses (including errors and connection-path canonicalization redirects) use `Cache-Control: no-store`. The server sets `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex, nofollow` and existing browser security headers. Metrics normalize connection paths to `/connect/:token`, including canonicalization redirects.
+- No provider URL, HWID, upstream User-Agent/headers, credentials or internal subscription/infrastructure IDs enter the page view model. Treat the page URL, subscription link and QR as credentials; do not share or log them. Reverse proxies must independently redact bearer paths in their access logs.
+
+**Focused verification** (Go checks require the project's CGO/SQLite toolchain):
+
+```bash
+go test -p 1 ./internal/web ./internal/metrics ./internal/utils
+go test -p 1 ./internal/service -run 'TestGetPublicSubscriptionInfo|TestFormatSubscriptionMessage'
+node --test internal/web/testdata/connect_copy.test.cjs
+```
+
+The web tests include a real local HTTP listener backed by a temporary migrated SQLite database, legacy/ProviderSource fixtures, exact QR-image comparison, data-boundary checks, safe failures and metrics redaction. The optional Node check uses only built-in modules; no frontend build or npm dependencies are required.
+
+---
+
 ## 4. Prometheus Metrics
 
 ### `GET /metrics`

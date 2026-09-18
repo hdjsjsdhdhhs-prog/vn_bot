@@ -17,12 +17,14 @@
         .detail { display: flex; justify-content: space-between; gap: 16px; padding: 12px 0; font-size: 14px; }
         .detail dt { color: #5c6975; }
         .detail dd { margin: 0; text-align: right; font-weight: 600; }
-        .status { color: #106c4b; }
+        .status { color: #735215; }
+        .status.active { color: #106c4b; }
+        .privacy { margin: 16px 0 0; color: #5c6975; font-size: 14px; line-height: 1.5; }
         .qr { display: block; width: min(100%, 280px); height: auto; margin: 0 auto 12px; image-rendering: pixelated; }
         .qr-note { margin: 0 0 24px; color: #5c6975; text-align: center; font-size: 14px; line-height: 1.5; }
         label { display: block; margin-bottom: 8px; font-size: 14px; font-weight: 600; }
         .url-row { display: flex; gap: 8px; }
-        input { min-width: 0; flex: 1; border: 1px solid #b8c3cd; border-radius: 6px; background: #f9fafb; color: #20262d; padding: 12px; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+        input { min-width: 0; flex: 1; border: 1px solid #b8c3cd; border-radius: 6px; background: #f9fafb; color: #20262d; padding: 12px; font: 16px ui-monospace, SFMono-Regular, Menlo, monospace; }
         button { flex: 0 0 auto; border: 1px solid #106c4b; border-radius: 6px; background: #106c4b; color: #ffffff; padding: 12px 16px; font: inherit; font-weight: 600; cursor: pointer; }
         button:hover { background: #0d5a3f; }
         button:focus-visible, input:focus-visible { outline: 3px solid #8acdb4; outline-offset: 2px; }
@@ -35,10 +37,11 @@
         <div class="brand"><img src="/static/logo.png" alt=""><span>RS8 KVN</span></div>
         <section class="panel" aria-labelledby="page-title">
             <h1 id="page-title">Подключение к подписке</h1>
-            <p class="lead">Сканируйте QR-код или скопируйте ссылку подписки в ваше приложение.</p>
+            {{if .Active}}<p class="lead">Сканируйте QR-код или скопируйте ссылку подписки в ваше VPN-приложение.</p>
+            {{else}}<p class="lead">Подписка сейчас неактивна. Подключение будет доступно после её возобновления.</p>{{end}}
 
             <dl class="details">
-                <div class="detail"><dt>Статус</dt><dd class="status">{{.StatusLabel}}</dd></div>
+                <div class="detail"><dt>Статус</dt><dd class="status{{if .Active}} active{{end}}">{{.StatusLabel}}</dd></div>
                 <div class="detail"><dt>Срок действия</dt><dd>{{.ExpiresAt}}</dd></div>
             </dl>
 
@@ -47,10 +50,12 @@
 
             <label for="subscription-url">Ссылка подписки</label>
             <div class="url-row">
-                <input id="subscription-url" type="text" value="{{.SubURL}}" readonly aria-describedby="copy-status">
-                <button id="copy-url" type="button">Скопировать</button>
+                <input id="subscription-url" type="text" value="{{.SubURL}}" readonly spellcheck="false" autocomplete="off" aria-describedby="copy-status link-privacy">
+                <button id="copy-url" type="button">Скопировать ссылку</button>
             </div>
             <p id="copy-status" role="status" aria-live="polite"></p>
+            <p id="link-privacy" class="privacy">Не передавайте эту страницу, ссылку и QR-код другим людям: они дают доступ к вашей подписке.</p>
+            <noscript><p class="privacy">Для копирования выделите ссылку и используйте меню браузера.</p></noscript>
         </section>
     </main>
     <script>
@@ -66,6 +71,7 @@
             function fallbackCopy() {
                 input.focus();
                 input.select();
+                input.setSelectionRange(0, input.value.length);
                 try {
                     if (!document.execCommand('copy')) {
                         throw new Error('copy failed');
@@ -78,11 +84,15 @@
 
             button.addEventListener('click', function () {
                 var value = input.value;
-                if (navigator.clipboard && window.isSecureContext) {
-                    navigator.clipboard.writeText(value).then(function () {
-                        showMessage('Ссылка скопирована.');
-                    }, fallbackCopy);
-                    return;
+                if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function' && window.isSecureContext) {
+                    try {
+                        navigator.clipboard.writeText(value).then(function () {
+                            showMessage('Ссылка скопирована.');
+                        }, fallbackCopy);
+                        return;
+                    } catch (error) {
+                        // Some WebViews expose the API but block it synchronously.
+                    }
                 }
                 fallbackCopy();
             });

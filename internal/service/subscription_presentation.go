@@ -37,8 +37,14 @@ func (s *SubscriptionService) GetPublicSubscriptionInfo(ctx context.Context, tok
 		return nil, database.ErrSubscriptionNotFound
 	}
 
+	// Match the serving runtime even before the expiry worker updates the row.
+	status := sub.Status
+	if status == string(database.SubscriptionStatusActive) && sub.ExpiresAt != nil && !sub.ExpiresAt.After(time.Now()) {
+		status = string(database.SubscriptionStatusExpired)
+	}
+
 	return &PublicSubscriptionInfo{
-		Status:          sub.Status,
+		Status:          status,
 		ExpiresAt:       sub.ExpiresAt,
 		SubscriptionURL: SubscriptionURL(s.cfg, sub.Token),
 	}, nil
