@@ -41,10 +41,35 @@ func (s *SubscriptionService) RenewSubscription(ctx context.Context, subscriptio
 	if err != nil {
 		return nil, fmt.Errorf("renew subscription: %w", err)
 	}
+	return s.completeSubscriptionRenewal(ctx, sub), nil
+}
+
+// renewCustomerSubscription uses the same lifecycle with an owner-scoped DB
+// selector. Only the management boundary calls it after authorizing the grant.
+func (s *SubscriptionService) renewCustomerSubscription(ctx context.Context, telegramID int64, days int) (*RenewalResult, error) {
+	if err := s.validatePublicSubscriptionURL(); err != nil {
+		return nil, err
+	}
+	repo, ok := s.db.(interface {
+		RenewCustomerSubscription(context.Context, int64, int) (*database.Subscription, error)
+	})
+	if !ok {
+		return nil, errors.New("customer renewal repository is not configured")
+	}
+	sub, err := repo.RenewCustomerSubscription(ctx, telegramID, days)
+	if err != nil {
+		return nil, fmt.Errorf("renew customer subscription: %w", err)
+	}
+	return s.completeSubscriptionRenewal(ctx, sub), nil
+}
+
+// completeSubscriptionRenewal is shared by trusted ID-based and customer-scoped
+// renewal. It must only receive a successfully committed repository result.
+func (s *SubscriptionService) completeSubscriptionRenewal(ctx context.Context, sub *database.Subscription) *RenewalResult {
 	// Invalidation belongs to this operation, never to its future callers.
 	// Existing wiring clears both the bot cache and provider/legacy feed keys.
 	s.InvalidateSubscription(ctx, sub.TelegramID)
 	s.InvalidateBySubID(ctx, sub.SubscriptionID)
 	s.RefreshActiveSubscriptionsMetric(ctx)
-	return &RenewalResult{Subscription: sub, SubscriptionURL: s.cfg.SubURL(sub.Token)}, nil
+	return &RenewalResult{Subscription: sub, SubscriptionURL: s.cfg.SubURL(sub.Token)}
 }

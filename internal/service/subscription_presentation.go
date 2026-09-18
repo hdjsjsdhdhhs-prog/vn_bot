@@ -37,6 +37,11 @@ func (s *SubscriptionService) GetPublicSubscriptionInfo(ctx context.Context, tok
 		return nil, database.ErrSubscriptionNotFound
 	}
 
+	return s.publicSubscriptionInfo(sub), nil
+}
+
+// publicSubscriptionInfo keeps management and bearer-token presentation aligned.
+func (s *SubscriptionService) publicSubscriptionInfo(sub *database.Subscription) *PublicSubscriptionInfo {
 	// Match the serving runtime even before the expiry worker updates the row.
 	status := sub.Status
 	if status == string(database.SubscriptionStatusActive) && sub.ExpiresAt != nil && !sub.ExpiresAt.After(time.Now()) {
@@ -47,7 +52,7 @@ func (s *SubscriptionService) GetPublicSubscriptionInfo(ctx context.Context, tok
 		Status:          status,
 		ExpiresAt:       sub.ExpiresAt,
 		SubscriptionURL: SubscriptionURL(s.cfg, sub.Token),
-	}, nil
+	}
 }
 
 // FormatSubscriptionMessage renders the canonical subscription presentation.
