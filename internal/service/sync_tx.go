@@ -34,6 +34,14 @@ func (s *SyncService) ApplyPlanToSubscriptionInTx(ctx context.Context, tx *gorm.
 		return fmt.Errorf("apply plan to subscription %d: nil transaction", subscriptionID)
 	}
 
+	var sub database.Subscription
+	if err := tx.WithContext(ctx).Select("id", "provider_source_id").First(&sub, subscriptionID).Error; err != nil {
+		return fmt.Errorf("apply plan: load subscription: %w", err)
+	}
+	if sub.ProviderSourceID != nil {
+		return nil
+	}
+
 	// Load plan-linked active nodes within the tx.
 	var targetNodes []database.Node
 

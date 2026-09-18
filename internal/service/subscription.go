@@ -104,16 +104,28 @@ func (s *SubscriptionService) trialNodes(ctx context.Context) ([]database.Node, 
 	return nodes, nil
 }
 
-// Create provisions a new free-plan subscription. inviteCode, when non-empty,
+// Create is the application creation entry point. CustomerSubscriptionTerms
+// creates finite ProviderSource-backed access; omitting terms preserves the
+// legacy free-plan get-or-create flow used by the bot and existing orders.
+// inviteCode, when non-empty,
 // is resolved atomically inside the DB transaction and persisted in
 // sub.InviteCode / sub.ReferredBy. The resolved ReferrerTGID (nil if unset) is
 // returned in CreateResult so callers can update aggregate referral state.
 // VPN node access is provisioned asynchronously via the sync module.
-func (s *SubscriptionService) Create(ctx context.Context, telegramID int64, username, inviteCode string) (*CreateResult, error) {
+func (s *SubscriptionService) Create(ctx context.Context, telegramID int64, username, inviteCode string, terms ...CustomerSubscriptionTerms) (*CreateResult, error) {
+	if len(terms) > 1 {
+		return nil, errors.New("only one set of customer subscription terms is allowed")
+	}
+	if len(terms) == 1 {
+		return s.createCustomer(ctx, telegramID, username, inviteCode, terms[0])
+	}
 	username = XUIEmail(username, telegramID)
 
 	existing, err := s.db.GetByTelegramID(ctx, telegramID)
 	if err == nil {
+		if existing.ProviderSourceID != nil && !existing.IsActive() {
+			return nil, ErrSubscriptionInactive
+		}
 		err = s.ensureSubscriptionNodes(ctx, existing)
 		if err != nil {
 			return nil, fmt.Errorf("ensure subscription nodes: %w", err)
@@ -166,52 +178,7 @@ func (s *SubscriptionService) Create(ctx context.Context, telegramID int64, user
 		return nil, fmt.Errorf("failed to resolve free plan: %w", err)
 	}
 
-	clientID, err := utils.GenerateUUID()
-	if err != nil {
-		return nil, fmt.Errorf("generate client id: %w", err)
-	}
-
-	subID, err := utils.GenerateSubID()
-	if err != nil {
-		return nil, fmt.Errorf("generate sub id: %w", err)
-	}
-
-	sub := &database.Subscription{
-		TelegramID:     telegramID,
-		Username:       username,
-		ClientID:       clientID,
-		SubscriptionID: subID,
-		PlanID:         plan.ID,
-		Status:         string(database.SubscriptionStatusActive),
-	}
-
-	err = s.db.CreateSubscription(ctx, sub, inviteCode)
-	if err != nil {
-		return nil, fmt.Errorf("create subscription: %w", err)
-	}
-
-	err = s.ensureSubscriptionNodes(ctx, sub)
-	if err != nil {
-		return nil, fmt.Errorf("ensure subscription nodes: %w", err)
-	}
-
-	referrerID := int64(0)
-	if sub.ReferredBy != nil {
-		referrerID = *sub.ReferredBy
-	}
-
-	subscriptionURL := s.cfg.SubURL(sub.Token)
-	result := &CreateResult{
-		Subscription:    sub,
-		SubscriptionURL: subscriptionURL,
-		ReferrerTGID:    referrerID,
-	}
-
-	metrics.SubscriptionCreatesTotal.Inc()
-
-	s.RefreshActiveSubscriptionsMetric(ctx)
-
-	return result, nil
+	return s.createNewSubscription(ctx, telegramID, username, inviteCode, plan.ID, nil, nil, nil)
 }
 
 // reanimateRevokedSubscription recovers a subscription left in a non-active state
@@ -224,6 +191,10 @@ func (s *SubscriptionService) Create(ctx context.Context, telegramID int64, user
 // them as pending_add — leftovers from the failed delete (pending_remove) would
 // otherwise make the next sync attempt to deprovision instead of re-provision.
 func (s *SubscriptionService) reanimateRevokedSubscription(ctx context.Context, sub *database.Subscription, inviteCode string) (*database.Subscription, error) {
+	// Opening the legacy free flow must not revive paid provider access.
+	if sub.ProviderSourceID != nil {
+		return nil, ErrSubscriptionInactive
+	}
 	freePlan, err := s.db.GetPlanByName(ctx, database.FreePlanName)
 	if err != nil {
 		return nil, fmt.Errorf("resolve free plan: %w", err)
@@ -293,6 +264,9 @@ func (s *SubscriptionService) reanimateRevokedSubscription(ctx context.Context, 
 func (s *SubscriptionService) DowngradeToFreePlan(ctx context.Context, sub *database.Subscription) (*database.Subscription, error) {
 	if sub == nil {
 		return nil, errors.New("downgrade: subscription is nil")
+	}
+	if sub.ProviderSourceID != nil {
+		return nil, errors.New("provider subscriptions cannot be downgraded to perpetual legacy access")
 	}
 
 	freePlan, err := s.db.GetPlanByName(ctx, database.FreePlanName)
@@ -471,6 +445,9 @@ func (s *SubscriptionService) AdminSetPlan(ctx context.Context, subscriptionID, 
 		return nil, fmt.Errorf("admin set plan: load plan: %w", err)
 	}
 
+	if sub.ProviderSourceID != nil && plan.Name == database.FreePlanName {
+		return nil, errors.New("provider subscriptions require a finite expiry; legacy free downgrade is unsupported")
+	}
 	now := time.Now().UTC()
 	if plan.Name == database.FreePlanName {
 		// Free plan: clear expiry and paid state, mirroring DowngradeToFreePlan.
@@ -908,6 +885,9 @@ func (s *SubscriptionService) ReconcileOrphanedClients(ctx context.Context) (int
 	revoked := 0
 
 	for _, sub := range activeSubs {
+		if sub.ProviderSourceID != nil {
+			continue // Provider access has no legacy node queue to repair.
+		}
 		subNodes, nodeErr := s.db.GetBySubscriptionID(ctx, sub.ID)
 		if nodeErr != nil {
 			logger.Warn("failed to load subscription nodes for orphan reconciliation",
@@ -1053,72 +1033,11 @@ func (s *SubscriptionService) CleanupExpiredTrials(ctx context.Context) (int64, 
 
 // GetOrCreateSubscription returns an existing subscription or creates a new free-plan one with sync.
 func (s *SubscriptionService) GetOrCreateSubscription(ctx context.Context, telegramID int64, username, inviteCode string) (*database.Subscription, error) {
-	username = XUIEmail(username, telegramID)
-
-	existing, err := s.db.GetByTelegramID(ctx, telegramID)
-	if err == nil {
-		err = s.ensureSubscriptionNodes(ctx, existing)
-		if err != nil {
-			return nil, fmt.Errorf("repair subscription nodes: %w", err)
-		}
-
-		return existing, nil
-	}
-
-	if !errors.Is(err, database.ErrSubscriptionNotFound) && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, fmt.Errorf("lookup subscription: %w", err)
-	}
-	// No active subscription. If a non-active one exists (e.g. left "revoked"
-	// after a partially-failed delete), reanimate it instead of inserting a
-	// duplicate row that would violate telegram_id uniqueness.
-	existingAny, anyErr := s.db.GetAnyByTelegramID(ctx, telegramID)
-	if anyErr == nil {
-		return s.reanimateRevokedSubscription(ctx, existingAny, inviteCode)
-	}
-
-	if !errors.Is(anyErr, database.ErrSubscriptionNotFound) && !errors.Is(anyErr, gorm.ErrRecordNotFound) {
-		return nil, fmt.Errorf("lookup subscription (any status): %w", anyErr)
-	}
-
-	freePlan, err := s.db.GetPlanByName(ctx, database.FreePlanName)
+	result, err := s.Create(ctx, telegramID, username, inviteCode)
 	if err != nil {
-		return nil, fmt.Errorf("resolve free plan: %w", err)
+		return nil, err
 	}
-
-	clientID, err := utils.GenerateUUID()
-	if err != nil {
-		return nil, fmt.Errorf("generate client id: %w", err)
-	}
-
-	subID, err := utils.GenerateSubID()
-	if err != nil {
-		return nil, fmt.Errorf("generate sub id: %w", err)
-	}
-
-	sub := &database.Subscription{
-		TelegramID:     telegramID,
-		Username:       username,
-		ClientID:       clientID,
-		SubscriptionID: subID,
-		PlanID:         freePlan.ID,
-		Status:         string(database.SubscriptionStatusActive),
-	}
-
-	err = s.db.CreateSubscription(ctx, sub, inviteCode)
-	if err != nil {
-		return nil, fmt.Errorf("create subscription: %w", err)
-	}
-
-	err = s.ensureSubscriptionNodes(ctx, sub)
-	if err != nil {
-		return nil, fmt.Errorf("ensure subscription nodes: %w", err)
-	}
-
-	metrics.SubscriptionCreatesTotal.Inc()
-
-	s.RefreshActiveSubscriptionsMetric(ctx)
-
-	return sub, nil
+	return result.Subscription, nil
 }
 
 // ensureSubscriptionNodes creates pending_add records for plan nodes missing from subscription_nodes, then triggers sync.
@@ -1126,6 +1045,9 @@ func (s *SubscriptionService) GetOrCreateSubscription(ctx context.Context, teleg
 func (s *SubscriptionService) ensureSubscriptionNodes(ctx context.Context, sub *database.Subscription) error {
 	if sub == nil {
 		return fmt.Errorf("nil subscription")
+	}
+	if sub.ProviderSourceID != nil {
+		return nil
 	}
 
 	nodes, err := s.db.GetNodesByPlanID(ctx, sub.PlanID)
@@ -1182,11 +1104,25 @@ type expiryRepository interface {
 	ExpireSubscriptionWithPlanCAS(ctx context.Context, subscriptionID, planID uint, applyPlan database.ExpireSubscriptionPlanInTxFn) error
 }
 
-// ExpireSubscription downgrades the subscription to the Free plan and syncs node removals.
+// ExpireSubscription expires provider access or downgrades legacy access to Free.
 func (s *SubscriptionService) ExpireSubscription(ctx context.Context, subscriptionID uint) error {
 	sub, err := s.db.GetByID(ctx, subscriptionID)
 	if err != nil {
 		return fmt.Errorf("get subscription: %w", err)
+	}
+	if sub.ProviderSourceID != nil {
+		repo, ok := s.db.(interface {
+			ExpireProviderSubscription(context.Context, uint) error
+		})
+		if !ok {
+			return errors.New("provider expiry repository is not configured")
+		}
+		if err := repo.ExpireProviderSubscription(ctx, sub.ID); err != nil {
+			return err
+		}
+		s.InvalidateSubscription(ctx, sub.TelegramID)
+		s.InvalidateBySubID(ctx, sub.SubscriptionID)
+		return nil
 	}
 
 	freePlan, err := s.db.GetPlanByName(ctx, database.FreePlanName)

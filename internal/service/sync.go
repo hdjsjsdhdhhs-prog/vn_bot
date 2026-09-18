@@ -136,6 +136,9 @@ func (s *SyncService) reconcilePlanNodesLocked(ctx context.Context, subscription
 	if err != nil {
 		return fmt.Errorf("reconcile plan nodes: load subscription: %w", err)
 	}
+	if sub.ProviderSourceID != nil {
+		return nil
+	}
 
 	targetNodes, err := s.db.GetNodesByPlanID(ctx, sub.PlanID)
 	if err != nil {
@@ -426,6 +429,9 @@ func (s *SyncService) syncNodes(ctx context.Context, sub *database.Subscription,
 	var nodeErrs []error
 
 	for _, sn := range pending {
+		if sub.ProviderSourceID != nil && sn.Status != database.SyncStatusPendingRemove {
+			continue // Never provision legacy nodes for provider-backed access.
+		}
 		// pending_remove is dispatched before the runtime node-type check: a
 		// removal binding may reference a node that is now gone or inactive, in
 		// which case the binding is stale and must be dropped instead of being
@@ -997,6 +1003,9 @@ func (s *SyncService) applyPlanToSubscriptionLocked(ctx context.Context, subscri
 	sub, err := s.db.GetByID(ctx, subscriptionID)
 	if err != nil {
 		return fmt.Errorf("apply plan to subscription %d: load subscription: %w", subscriptionID, err)
+	}
+	if sub.ProviderSourceID != nil {
+		return nil
 	}
 
 	newNodes, err := s.db.GetNodesByPlanID(ctx, sub.PlanID)

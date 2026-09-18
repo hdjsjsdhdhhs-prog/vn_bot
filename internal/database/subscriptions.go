@@ -149,7 +149,37 @@ func (s *Service) UnbindProviderSource(ctx context.Context, id uint) error {
 // If inviteCode is non-empty and resolves to a valid Invite, sub.InviteCode and sub.ReferredBy
 // are populated atomically inside the same transaction.
 func (s *Service) CreateSubscription(ctx context.Context, sub *Subscription, inviteCode string) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if sub == nil {
+		return errors.New("create subscription: nil subscription")
+	}
+	// Publish generated IDs/token to the caller only after a successful commit.
+	created := *sub
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		sub := &created
+		if sub.ProviderSourceID != nil {
+			// Read and validate assignment in the same SQLite transaction as the
+			// INSERT. A concurrent writer cannot change the source and let this
+			// transaction commit a stale assignment (it either commits first or
+			// this transaction fails with contention). Never auto-save associations.
+			var source ProviderSource
+			if err := tx.First(&source, *sub.ProviderSourceID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrProviderSourceNotFound
+				}
+				return fmt.Errorf("load subscription provider source: %w", err)
+			}
+			if _, _, err := source.RequestConfiguration(); err != nil {
+				return err
+			}
+			var plan Plan
+			if err := tx.First(&plan, sub.PlanID).Error; err != nil {
+				return fmt.Errorf("load subscription plan: %w", err)
+			}
+			if !plan.IsActive {
+				return errors.New("subscription plan is inactive")
+			}
+			sub.ProviderSource = nil
+		}
 		if inviteCode != "" {
 			var inv Invite
 
@@ -171,6 +201,11 @@ func (s *Service) CreateSubscription(ctx context.Context, sub *Subscription, inv
 
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	*sub = created
+	return nil
 }
 
 func createSubscriptionWithToken(db *gorm.DB, sub *Subscription) error {
@@ -575,7 +610,7 @@ func (s *Service) GetExpiredPaidSubscriptions(ctx context.Context, now time.Time
 		Where("name IN ?", []string{FreePlanName, TrialPlanName})
 
 	result := s.db.WithContext(ctx).
-		Where("expires_at <= ? AND status = ? AND plan_id NOT IN (?)",
+		Where("expires_at <= ? AND status = ? AND (provider_source_id IS NOT NULL OR plan_id NOT IN (?))",
 			now, string(SubscriptionStatusActive), nonExpiringPlanSubQuery).
 		Find(&subs)
 	if result.Error != nil {

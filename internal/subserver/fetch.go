@@ -227,6 +227,16 @@ func FetchFromProviderSource(ctx context.Context, source database.ProviderSource
 			continue
 		}
 
+		// URL-valued headers can reflect the private endpoint as a relative
+		// reference. Do not resolve ordinary metadata against the source URL:
+		// a root endpoint would make every such value look like a private URL.
+		if strings.HasSuffix(lowerKey, "-url") || lowerKey == "location" || lowerKey == "content-location" {
+			if reference, parseErr := url.Parse(values[0]); parseErr == nil &&
+				containsSensitiveProviderValue(req.URL.ResolveReference(reference).String(), sensitiveValues) {
+				continue
+			}
+		}
+
 		responseHeaders[lowerKey] = values[0]
 	}
 
@@ -237,39 +247,11 @@ func FetchFromProviderSource(ctx context.Context, source database.ProviderSource
 // fetch and returns lower-cased configured headers plus values that must never
 // appear in a downstream response.
 func validateProviderSourceConfiguration(source database.ProviderSource) (map[string]string, []string, error) {
-	if !source.Enabled || strings.TrimSpace(source.SubscriptionURL) == "" {
+	headers, sensitiveValues, err := source.RequestConfiguration()
+	if err != nil {
 		return nil, nil, ErrProviderSourceUnavailable
 	}
-
-	parsedURL, err := url.Parse(source.SubscriptionURL)
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-		return nil, nil, ErrProviderSourceUnavailable
-	}
-
-	headers := make(map[string]string)
-	rawHeaders := strings.TrimSpace(source.Headers)
-	if rawHeaders != "" {
-		if err := json.Unmarshal([]byte(rawHeaders), &headers); err != nil {
-			return nil, nil, ErrProviderSourceUnavailable
-		}
-	}
-
-	normalizedHeaders := make(map[string]string, len(headers))
-	sensitiveValues := nonEmptyStrings(source.SubscriptionURL, source.HWID, source.UserAgent)
-
-	for key, value := range headers {
-		lowerKey := strings.ToLower(strings.TrimSpace(key))
-		if lowerKey == "" {
-			return nil, nil, ErrProviderSourceUnavailable
-		}
-
-		normalizedHeaders[lowerKey] = value
-		// Every configured request-header value is server-side configuration.
-		// An upstream must not be able to reflect it into a customer response.
-		sensitiveValues = append(sensitiveValues, value)
-	}
-
-	return normalizedHeaders, sensitiveValues, nil
+	return headers, sensitiveValues, nil
 }
 
 // providerSourceHTTPClient retains the shared transport, timeout, and response
@@ -303,17 +285,6 @@ func containsSensitiveProviderValue(value string, sensitiveValues []string) bool
 	}
 
 	return false
-}
-
-func nonEmptyStrings(values ...string) []string {
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if value != "" {
-			result = append(result, value)
-		}
-	}
-
-	return result
 }
 
 // Format represents the detected encoding format of a subscription response body.

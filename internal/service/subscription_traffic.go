@@ -83,8 +83,8 @@ func (s *SubscriptionService) GetWithTraffic(ctx context.Context, telegramID int
 		}
 	}
 
-	// Если лимит трафика нулевой — не опрашиваем серверы
-	if limitGB == 0 {
+	// Provider access is independent of local plan quotas and legacy panels.
+	if limitGB == 0 || sub.ProviderSourceID != nil {
 		return sub, &TrafficInfo{
 			UsedGB:             0,
 			LimitGB:            0,

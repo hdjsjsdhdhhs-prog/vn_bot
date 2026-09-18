@@ -29,7 +29,7 @@ func (s *Service) GetActiveSubscriptionsWithTrafficLimit(ctx context.Context) ([
 		Table("subscriptions").
 		Select("subscriptions.*, plans.traffic_limit AS traffic_limit").
 		Joins("JOIN plans ON plans.id = subscriptions.plan_id").
-		Where("subscriptions.status = ? AND plans.traffic_limit > 0", string(SubscriptionStatusActive)).
+		Where("subscriptions.status = ? AND subscriptions.provider_source_id IS NULL AND plans.traffic_limit > 0", string(SubscriptionStatusActive)).
 		Order("subscriptions.id ASC").
 		Scan(&targets)
 	if result.Error != nil {

@@ -120,6 +120,67 @@ func TestHandleSubscription_ProviderSource_UsesConfiguredRequestAndHidesCredenti
 	}
 }
 
+func TestFetchFromProviderSource_FiltersPrivateURLReferences(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		header string
+		omit   bool
+	}{
+		{"root relative", "/private/feed", true},
+		{"path relative", "feed", true},
+		{"normalized relative", "./feed", true},
+		{"fragment", "#profile", true},
+		{"query", "?view=1", true},
+		{"public absolute", "https://support.example/help", false},
+		{"public relative", "/help", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Profile-Web-Page-Url", tc.header)
+				w.Header().Set("Subscription-Userinfo", "upload=10; download=20; total=1000")
+				_, _ = w.Write([]byte("vless://connection@vpn.example:443#Customer"))
+			}))
+			defer upstream.Close()
+
+			response, err := FetchFromProviderSource(context.Background(), database.ProviderSource{
+				SubscriptionURL: upstream.URL + "/private/feed",
+				Enabled:         true,
+			})
+			require.NoError(t, err)
+			if tc.omit {
+				assert.NotContains(t, response.Headers, "profile-web-page-url")
+			} else {
+				assert.Equal(t, tc.header, response.Headers["profile-web-page-url"])
+			}
+			assert.Equal(t, "upload=10; download=20; total=1000", response.Headers["subscription-userinfo"])
+			assert.Equal(t, "vless://connection@vpn.example:443#Customer", string(response.Body))
+		})
+	}
+}
+
+func TestFetchFromProviderSource_RootURLPreservesMetadata(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Profile-Web-Page-Url", "/")
+		w.Header().Set("Subscription-Userinfo", "upload=10; download=20; total=1000")
+		w.Header().Set("Profile-Update-Interval", "12")
+		_, _ = w.Write([]byte("vless://connection@vpn.example:443#Customer"))
+	}))
+	defer upstream.Close()
+
+	response, err := FetchFromProviderSource(context.Background(), database.ProviderSource{
+		SubscriptionURL: upstream.URL,
+		Enabled:         true,
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, response.Headers, "profile-web-page-url")
+	assert.Equal(t, "upload=10; download=20; total=1000", response.Headers["subscription-userinfo"])
+	assert.Equal(t, "12", response.Headers["profile-update-interval"])
+}
+
 func TestFetchFromProviderSource_CrossHostRedirectStripsCredentials(t *testing.T) {
 	t.Parallel()
 

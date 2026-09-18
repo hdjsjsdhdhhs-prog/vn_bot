@@ -90,7 +90,7 @@ func (s *SubscriptionService) trafficNotifyCandidates(ctx context.Context, sub *
 // returns an error, an empty, negative, or overflowing snapshot, the condition
 // is logged at Warn and processing stops without taking an action.
 func (s *SubscriptionService) ProcessTrafficNotifications(ctx context.Context, sub *database.Subscription) error {
-	if sub == nil || sub.TelegramID <= 0 || s.bot == nil {
+	if sub == nil || sub.ProviderSourceID != nil || sub.TelegramID <= 0 || s.bot == nil {
 		return nil
 	}
 
