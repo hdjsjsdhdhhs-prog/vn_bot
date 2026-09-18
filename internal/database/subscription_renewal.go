@@ -1,0 +1,100 @@
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+// MaxSubscriptionRenewalDays bounds each grant, not the subscription's lifetime.
+const MaxSubscriptionRenewalDays = 3650
+
+var (
+	ErrInvalidRenewalDays       = errors.New("renewal days must be between 1 and 3650")
+	ErrSubscriptionNotRenewable = errors.New("subscription is not eligible for renewal")
+)
+
+// RenewSubscription extends the current finite entitlement in one transaction.
+// Each successful call is a distinct extension (not an idempotent payment API).
+// No identity, plan, source, purchase, traffic, or provisioning fields change.
+func (s *Service) RenewSubscription(ctx context.Context, id uint, days int) (*Subscription, error) {
+	if days <= 0 || days > MaxSubscriptionRenewalDays {
+		return nil, ErrInvalidRenewalDays
+	}
+	var renewed Subscription
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// SQLite has no SELECT FOR UPDATE. Acquire its writer reservation BEFORE
+		// reading expiry/source so concurrent renewals (even on separate DB
+		// connections) read the previous committed extension, not a stale snapshot.
+		// This no-op does not change UpdatedAt and rolls back with any failure.
+		claim := tx.Model(&Subscription{}).Where("id = ?", id).
+			UpdateColumn("id", gorm.Expr("id"))
+		if claim.Error != nil {
+			return fmt.Errorf("lock subscription for renewal: %w", claim.Error)
+		}
+		if claim.RowsAffected == 0 {
+			return ErrSubscriptionNotFound
+		}
+		if err := tx.First(&renewed, id).Error; err != nil {
+			return fmt.Errorf("load subscription for renewal: %w", err)
+		}
+		if renewed.TelegramID <= 0 || renewed.ExpiresAt == nil ||
+			(renewed.Status != string(SubscriptionStatusActive) && renewed.Status != string(SubscriptionStatusExpired)) {
+			return ErrSubscriptionNotRenewable
+		}
+		var plan Plan
+		if err := tx.First(&plan, renewed.PlanID).Error; err != nil {
+			return fmt.Errorf("load renewal plan: %w", err)
+		}
+		if plan.Name == TrialPlanName {
+			return ErrSubscriptionNotRenewable
+		}
+		if renewed.ProviderSourceID != nil {
+			var source ProviderSource
+			if err := tx.First(&source, *renewed.ProviderSourceID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrProviderSourceNotFound
+				}
+				return fmt.Errorf("load renewal provider source: %w", err)
+			}
+			// Local configuration validation only: no upstream I/O and no fallback.
+			if _, _, err := source.RequestConfiguration(); err != nil {
+				return err
+			}
+			if !plan.IsActive {
+				return ErrSubscriptionNotRenewable
+			}
+		} else if plan.Name == FreePlanName {
+			// An already-downgraded legacy subscription needs explicit plan
+			// selection through the existing activation/admin flow, not inference.
+			return ErrSubscriptionNotRenewable
+		}
+
+		base := time.Now().UTC()
+		if renewed.ExpiresAt.After(base) {
+			base = renewed.ExpiresAt.UTC()
+		}
+		expiry := base.AddDate(0, 0, days)
+		if !expiry.After(base) || expiry.Year() > 9999 {
+			return ErrSubscriptionNotRenewable
+		}
+		result := tx.Model(&Subscription{}).Where("id = ?", id).Updates(map[string]any{
+			"expires_at":     expiry,
+			"status":         string(SubscriptionStatusActive),
+			"reminders_sent": 0,
+		})
+		if result.Error != nil {
+			return fmt.Errorf("update subscription renewal: %w", result.Error)
+		}
+		// No associations are preloaded: the internal result carries no source
+		// credentials. Publish the committed snapshot only after commit succeeds.
+		return tx.First(&renewed, id).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &renewed, nil
+}

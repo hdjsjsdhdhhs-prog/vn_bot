@@ -1130,10 +1130,14 @@ func (s *SubscriptionService) ExpireSubscription(ctx context.Context, subscripti
 		return fmt.Errorf("resolve free plan: %w", err)
 	}
 
-	if repo, ok := s.db.(expiryRepository); ok && s.syncService != nil {
-		err = repo.ExpireSubscriptionWithPlanCAS(ctx, sub.ID, freePlan.ID, func(ctx context.Context, tx *gorm.DB, subscriptionID, planID uint) error {
-			return s.syncService.ApplyPlanToSubscriptionInTx(ctx, tx, subscriptionID, planID)
-		})
+	if repo, ok := s.db.(expiryRepository); ok {
+		// The current expiry must be checked atomically even when sync is not
+		// wired. A queued scan must never undo a committed renewal.
+		var applyPlan database.ExpireSubscriptionPlanInTxFn
+		if s.syncService != nil {
+			applyPlan = s.syncService.ApplyPlanToSubscriptionInTx
+		}
+		err = repo.ExpireSubscriptionWithPlanCAS(ctx, sub.ID, freePlan.ID, applyPlan)
 		if err != nil {
 			return fmt.Errorf("expire subscription: %w", err)
 		}

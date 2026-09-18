@@ -133,6 +133,46 @@ func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 	assert.NotContains(t, body, sub.SubscriptionID)
 	assert.NotContains(t, body, sub.ClientID)
 
+	assertRenewalVisible := func() {
+		t.Helper()
+		callsBefore, legacyBefore := providerCalls.Load(), legacyCalls.Load()
+		renewed, err := subSvc.RenewSubscription(ctx, sub.ID, 7)
+		require.NoError(t, err)
+		assert.Equal(t, sub.ID, renewed.Subscription.ID)
+		assert.Equal(t, sub.SubscriptionID, renewed.Subscription.SubscriptionID)
+		assert.Equal(t, sub.Token, renewed.Subscription.Token)
+		assert.Equal(t, sub.ProviderSourceID, renewed.Subscription.ProviderSourceID)
+		assert.Equal(t, created.SubscriptionURL, renewed.SubscriptionURL)
+		assert.Equal(t, callsBefore, providerCalls.Load(), "renewal must not call upstream")
+		for range 2 {
+			status, body, headers := get("/sub/" + sub.Token)
+			require.Equal(t, http.StatusOK, status)
+			assertSafe(body, headers)
+			decoded, err := base64.StdEncoding.DecodeString(body)
+			require.NoError(t, err)
+			assertSafe(string(decoded), headers)
+			assert.Contains(t, string(decoded), "vless://connection@vpn.example")
+		}
+		assert.Equal(t, callsBefore+1, providerCalls.Load(), "renewal must invalidate the warmed provider cache")
+		assert.Equal(t, legacyBefore, legacyCalls.Load(), "renewal must never fall back to legacy")
+		status, body, headers := get("/subscription-info/" + sub.Token)
+		require.Equal(t, http.StatusOK, status)
+		assertSafe(body, headers)
+		var info service.PublicSubscriptionInfo
+		require.NoError(t, json.Unmarshal([]byte(body), &info))
+		assert.Equal(t, "active", info.Status)
+		require.NotNil(t, info.ExpiresAt)
+		assert.True(t, renewed.Subscription.ExpiresAt.Equal(*info.ExpiresAt))
+		assert.Equal(t, created.SubscriptionURL, info.SubscriptionURL)
+		status, body, headers = get("/connect/" + sub.Token)
+		require.Equal(t, http.StatusOK, status)
+		assertSafe(body, headers)
+		assertConnectionURLAndQR(t, body, created.SubscriptionURL)
+		assert.NotContains(t, body, "Истекла")
+		assert.Contains(t, body, renewed.Subscription.ExpiresAt.UTC().Format("02.01.2006 15:04 UTC"))
+	}
+	assertRenewalVisible() // active renewal with warmed feed cache
+
 	// Existing free creation still delivers through legacy nodes.
 	legacy, err := subSvc.Create(ctx, 876543210, "legacy", "")
 	require.NoError(t, err)
@@ -174,6 +214,7 @@ func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 		assert.Contains(t, body, "Истекла")
 		assertSafe(body, headers)
 	}
+	assertRenewalVisible() // expired access becomes available immediately at the same URLs
 	for _, entry := range logs.All() {
 		text := entry.Message + fmt.Sprint(entry.ContextMap())
 		for _, secret := range []string{sub.Token, legacy.Subscription.Token, source.SubscriptionURL, "private-hwid", "private-agent", "private-auth"} {

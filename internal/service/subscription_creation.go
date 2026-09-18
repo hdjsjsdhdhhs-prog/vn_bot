@@ -30,14 +30,8 @@ func (s *SubscriptionService) createCustomer(ctx context.Context, telegramID int
 	if telegramID <= 0 || terms.ProviderSourceID == 0 || terms.PlanID == 0 || !terms.ExpiresAt.After(now) {
 		return nil, errors.New("customer creation requires a positive identity, provider source, plan and future expiry")
 	}
-	// Fail before persistence if a caller bypassed startup configuration checks.
-	// Do not include the URL in the error: the canonical URL is a credential.
-	if s.cfg == nil {
-		return nil, errors.New("public subscription URL is not configured")
-	}
-	u, err := url.Parse(s.cfg.SubURL(""))
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, errors.New("public subscription URL is invalid")
+	if err := s.validatePublicSubscriptionURL(); err != nil {
+		return nil, err
 	}
 	plan, err := s.db.GetPlanByID(ctx, terms.PlanID)
 	if err != nil {
@@ -50,6 +44,19 @@ func (s *SubscriptionService) createCustomer(ctx context.Context, telegramID int
 	// No get-or-renew here: the unique telegram_id constraint arbitrates
 	// concurrent creation, including races against the legacy/trial paths.
 	return s.createNewSubscription(ctx, telegramID, XUIEmail(username, telegramID), inviteCode, plan.ID, &terms.ProviderSourceID, &expiry, &now)
+}
+
+// validatePublicSubscriptionURL fails before creation/renewal persistence if a
+// caller bypassed startup configuration checks. Errors never contain the URL.
+func (s *SubscriptionService) validatePublicSubscriptionURL() error {
+	if s.cfg == nil {
+		return errors.New("public subscription URL is not configured")
+	}
+	u, err := url.Parse(s.cfg.SubURL(""))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("public subscription URL is invalid")
+	}
+	return nil
 }
 
 func (s *SubscriptionService) createNewSubscription(ctx context.Context, telegramID int64, username, inviteCode string, planID uint, sourceID *uint, expiry, started *time.Time) (*CreateResult, error) {
