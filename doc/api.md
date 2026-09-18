@@ -16,6 +16,7 @@
 8. [Rate Limits](#8-rate-limits)
 9. [cURL Examples](#9-curl-examples)
 10. [Versioning](#10-versioning)
+11. [Telegram Mini App Authentication](#11-telegram-mini-app-authentication)
 
 ---
 
@@ -211,6 +212,60 @@ curl -i -X POST http://localhost:8880/payment/callback \
 ## 10. Versioning
 
 API version is implicit in endpoint paths. Bot version in logs: `rs8kvn_bot@<version>`.
+
+---
+
+## 11. Telegram Mini App Authentication
+
+### `GET /api/miniapp/subscription`
+
+Read-only authenticated view of the current Telegram user's subscription. Registered by `web.Server.Start` in the existing application; uses the same `SubscriptionService` through `SubscriptionManagement.Current`, with no additional user table, subscription model, cache or lifecycle logic. Response shape and eligibility semantics: [Subscription Management contract](subscription-management.md).
+
+Send exactly one header:
+
+```http
+Authorization: tma <Telegram.WebApp.initData>
+```
+
+Use the original URL-encoded `initData` string, not `initDataUnsafe`, a decoded/re-encoded JSON object, a bot token or a public subscription token. Credentials in query parameters, cookies, request bodies or alternate identity headers do not authenticate. Unsigned IDs and target tokens never select a customer. `tma` is case-insensitive.
+
+### Validation and lifetime
+
+- HMAC-SHA256 verification uses the existing configured `TELEGRAM_BOT_TOKEN`, without calling Telegram. The derived key is HMAC-SHA256 with key `WebAppData` and message bot token; the data-check-string contains sorted decoded field names and values, excluding only `hash`. `signature`, when present, remains signed by this HMAC procedure.
+- Signature comparison is constant-time. Missing, malformed, ambiguous/duplicate fields, invalid user JSON/IDs, wrong-bot signatures and oversized data are rejected. Maximum raw initData size: **16 KiB**. Identity comes exclusively from verified `user.id` (positive integer, at most 52 bits), not chat, receiver, username or request-supplied IDs.
+- `auth_date` must be no older than **5 minutes**, with at most **30 seconds** future clock skew, inclusive at Unix-second precision. Every request is validated; there are no cookies, server sessions, refresh tokens or sliding expiry. Reopen the Mini App to obtain fresh initData after expiration.
+- A captured credential can be replayed within this fixed lifetime; this read-only milestone does not implement single-use nonces. Keep production traffic on HTTPS, synchronize the server clock, and never log initData, Authorization, returned URLs or tokens. TLS/proxy configuration is not changed by this milestone.
+
+### Responses and authority
+
+| HTTP | JSON error / result |
+| --- | --- |
+| 200 | Existing customer-safe Subscription Management representation |
+| 401 | `{"error":"unauthorized"}`; missing/invalid/expired auth, with `WWW-Authenticate: tma realm="miniapp"` |
+| 403 | `{"error":"forbidden"}`; management authorization/ownership rejected |
+| 404 | `{"error":"subscription_not_found"}`; authenticated customer has no subscription |
+| 404 | `{"error":"not_found"}`; authenticated request to an unknown Mini App route |
+| 405 | `{"error":"method_not_allowed"}`, `Allow: GET`; authenticated non-GET request |
+| 503 | `{"error":"service_unavailable"}`; bot configuration, service or database unavailable |
+
+Authentication precedes route/method dispatch (including OPTIONS). No permissive CORS or cookie authentication is enabled. Missing credentials return 401 even if bot configuration is missing; a `tma` request with missing bot configuration returns 503. Standard ServeMux path-canonicalization redirects can occur before authentication and disclose no subscription data.
+
+Existing expired/revoked/paused/canceled subscriptions remain readable; effective expiry, customer links and renewal eligibility come from Subscription Management. Reads never create, revive, renew or provision access. `renewal.eligible` is lifecycle information, **not grant authority**: there is no renewal route and the Mini App policy denies all grants, even for the bot administrator.
+
+Responses and namespace canonicalization redirects use `Cache-Control: no-store`, `X-Robots-Tag: noindex, nofollow` and existing security headers. Errors do not expose parser/DB details. Metrics collapse the namespace to `/api/miniapp/*`, including unknown paths and canonicalization redirects. Reverse-proxy logs must independently exclude/redact Authorization, query credentials and sensitive paths. Existing `/connect/`, `/subscription-info/`, `/sub/`, health and callback routes retain their own policies.
+
+### Verification
+
+Run sequentially with CGO/SQLite enabled:
+
+```bash
+go test -p 1 ./internal/telegramauth -count=1 -timeout=120s
+go test -p 1 ./internal/web -run '^TestMiniApp' -count=1 -timeout=120s
+go test -p 1 ./internal/web ./internal/metrics -count=1 -timeout=120s
+go test -p 1 ./internal/database ./internal/service -run 'TestSubscriptionManagement|TestSubscriptionRenewal|TestGetPublicSubscriptionInfo' -count=1 -timeout=120s
+```
+
+Mini App tests exercise the actual HTTP listener with a migrated SQLite database, two customers (legacy and ProviderSource-backed), the configured admin, forged identities, denied writes, fresh lifecycle state, missing subscriptions, safe failures, headers, logs and metrics. Validator tests include a fixed independent HMAC vector, malformed signed data, time boundaries and fuzz seeds.
 
 ---
 

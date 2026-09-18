@@ -11,7 +11,7 @@
 
 The adapter must distinguish `SubscriptionManagementRead` (`days=0`) from `SubscriptionManagementRenew` and authorize the **specific duration** being granted. Knowing a customer's identity, authenticating as that customer, or holding a `/sub/` token is not by itself permission to grant access days. Missing adapters, adapter errors and zero/negative identities fail closed with `service.ErrSubscriptionAccessDenied`.
 
-Adapters for future bot/Mini App/admin/confirmation callers must verify their own trusted context. This milestone does not implement Telegram authentication or connect the contract to a transport. Do not implement an adapter that trusts arbitrary request IDs, public tokens or unsigned client claims. Construct management once with trusted policy code, not with a callback chosen by the requesting customer.
+Adapters for bot/Mini App/admin/confirmation callers must verify their own trusted context. The Mini App read adapter is now wired in `web.Server.Start`: it verifies Telegram initData, places only the authenticated user ID into a private context key, and calls `Current` using a startup-bound read-only policy. See [Telegram Mini App API](api.md#11-telegram-mini-app-authentication). It never authorizes `Renew`, including for the configured bot administrator. Do not implement an adapter that trusts arbitrary request IDs, public tokens or unsigned client claims. Construct management once with trusted policy code, not with a callback chosen by the requesting customer.
 
 ## Customer representation
 
@@ -45,7 +45,7 @@ Adapters for future bot/Mini App/admin/confirmation callers must verify their ow
 
 ## Limits
 
-No new HTTP endpoint, UI, payment processing or automatic billing. The existing public bearer routes stay read-only. Each successful `Renew` call adds days; future payment/queue callers must implement deduplication before calling it, rather than treating this operation as an idempotent payment API.
+The Mini App exposes only authenticated reads of this contract; no HTTP renewal/grant endpoint, UI, payment processing or automatic billing is introduced. The existing public bearer routes stay read-only. Each successful `Renew` call adds days; future payment/queue callers must implement deduplication before calling it, rather than treating this operation as an idempotent payment API.
 
 ## Focused verification
 

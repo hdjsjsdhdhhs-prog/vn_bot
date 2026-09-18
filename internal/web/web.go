@@ -215,6 +215,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/payment/callback", s.handlePaymentCallback)
 	mux.HandleFunc("/i/", s.handleInvite)
+	mux.Handle("/api/miniapp/", newMiniAppHandler(s.cfg, s.subService))
 	mux.HandleFunc("/subscription-info/", s.handleSubscriptionInfo)
 	mux.HandleFunc("/connect/", s.handleConnectionPage)
 	mux.HandleFunc("/sub/", s.handleSubscription)

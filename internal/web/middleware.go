@@ -27,6 +27,10 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("X-Robots-Tag", "noindex, nofollow")
 		}
+		if strings.HasPrefix(r.URL.Path, "/api/miniapp/") || cleanPath == "/api/miniapp" || strings.HasPrefix(cleanPath, "/api/miniapp/") {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+		}
 		next.ServeHTTP(w, r)
 	})
 }

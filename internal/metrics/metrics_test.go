@@ -49,6 +49,14 @@ func TestNormalizePath(t *testing.T) {
 		{"connection leading slashes", "//connect/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "/connect/:token"},
 		{"connection dot segments", "/prefix/../connect/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/connect/:token"},
 		{"connection removed token", "/connect/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/../../healthz", "/connect/:token"},
+		{"miniapp route", "/api/miniapp/subscription", "/api/miniapp/*"},
+		{"miniapp root redirect", "/api/miniapp", "/api/miniapp/*"},
+		{"miniapp unknown credential path", "/api/miniapp/private-credential", "/api/miniapp/*"},
+		{"miniapp leading slashes", "//api/miniapp/private-credential", "/api/miniapp/*"},
+		{"miniapp dot segments", "/prefix/../api/miniapp/private-credential", "/api/miniapp/*"},
+		{"miniapp removed credential", "/api/miniapp/private-credential/../../../healthz", "/api/miniapp/*"},
+		{"bearer prefix redirects to miniapp", "/sub/../api/miniapp/private-credential", "/api/miniapp/*"},
+		{"miniapp redirects to bearer prefix", "/api/miniapp/../../connect/private-credential", "/api/miniapp/*"},
 		{"static after slash", "/static/logo.png", "/static/logo.png"},
 		{"mixed static", "/api/v1/users/123", "/api/v1/users/123"},
 	}
@@ -58,6 +66,30 @@ func TestNormalizePath(t *testing.T) {
 			assert.Equal(t, tt.want, normalizePath(tt.in))
 		})
 	}
+}
+
+func TestInstrumentHTTPMiniAppMethodLabels(t *testing.T) {
+	// Do not run in parallel: these HTTP collectors are shared with other tests.
+	const privateMethod = "private-miniapp-credential"
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions, http.MethodConnect, http.MethodTrace, privateMethod} {
+		handler := InstrumentHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, method, r.Method, "label normalization must not change dispatch")
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		for _, path := range []string{"/api/miniapp/subscription", "/api/miniapp", "/sub/../api/miniapp/subscription", "/api/miniapp/../../connect/unknown"} {
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, httptest.NewRequest(method, path, nil))
+			assert.Equal(t, http.StatusUnauthorized, rr.Code)
+		}
+	}
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(HTTPRequestsTotal, HTTPRequestDuration)
+	rr := httptest.NewRecorder()
+	promhttp.HandlerFor(registry, promhttp.HandlerOpts{}).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	assert.NotContains(t, rr.Body.String(), privateMethod)
+	assert.Contains(t, rr.Body.String(), `http_requests_total{method="OTHER",path="/api/miniapp/*",status="Unauthorized"}`)
+	assert.Contains(t, rr.Body.String(), `http_request_duration_seconds_count{method="OTHER",path="/api/miniapp/*"}`)
+	assert.Contains(t, rr.Body.String(), `http_requests_total{method="GET",path="/api/miniapp/*",status="Unauthorized"}`)
 }
 
 func TestStatusCodeString(t *testing.T) {

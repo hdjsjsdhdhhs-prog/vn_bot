@@ -369,6 +369,16 @@ func InstrumentHTTP(next http.Handler) http.Handler {
 
 		path := normalizePath(r.URL.Path)
 		method := r.Method
+		if path == "/api/miniapp/*" {
+			// Methods are client-controlled too. Keep unknown methods from
+			// exposing credentials/IDs in labels; leave request dispatch intact.
+			switch method {
+			case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete,
+				http.MethodConnect, http.MethodOptions, http.MethodTrace, http.MethodPatch:
+			default:
+				method = "OTHER"
+			}
+		}
 
 		start := time.Now()
 		rr := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
@@ -387,6 +397,13 @@ func shouldSkipHTTPMetrics(path string) bool {
 }
 
 func normalizePath(p string) string {
+	// Check the Mini App namespace before other raw prefixes: ServeMux may
+	// redirect /sub/../api/miniapp/... into it. Neither form may retain IDs.
+	cleanPath := path.Clean(p)
+	if strings.HasPrefix(p, "/api/miniapp/") || cleanPath == "/api/miniapp" || strings.HasPrefix(cleanPath, "/api/miniapp/") {
+		return "/api/miniapp/*"
+	}
+
 	// Dynamic routes with slash separator
 	if strings.HasPrefix(p, "/i/") {
 		return "/i/:code"
@@ -402,7 +419,6 @@ func normalizePath(p string) string {
 
 	// Instrumentation runs before ServeMux cleans paths and redirects. Mask
 	// both forms so e.g. //connect/<token> cannot leak into metric labels.
-	cleanPath := path.Clean(p)
 	if strings.HasPrefix(p, "/connect/") || cleanPath == "/connect" || strings.HasPrefix(cleanPath, "/connect/") {
 		return "/connect/:token"
 	}
