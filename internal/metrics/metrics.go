@@ -399,6 +399,10 @@ func normalizePath(p string) string {
 		return "/subscription-info/:token"
 	}
 
+	if strings.HasPrefix(p, "/connect/") {
+		return "/connect/:token"
+	}
+
 	// Static/known application paths pass through unchanged.
 	return p
 }

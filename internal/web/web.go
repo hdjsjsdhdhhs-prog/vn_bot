@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,6 +107,7 @@ type Server struct {
 	inviteCodeRegex *regexp.Regexp
 	startTime       time.Time
 	trialTemplate   *template.Template
+	connectionTemplate *template.Template
 	errorTemplate   *template.Template
 }
 
@@ -113,9 +115,10 @@ type Server struct {
 // not open a listener; call Start to begin serving requests.
 func NewServer(addr string, db interfaces.WebRepository, cfg *config.Config, botUsername string, subService *service.SubscriptionService, subServer *subserver.Service) *Server {
 	trialTmpl := template.Must(template.New("trial.html").Funcs(template.FuncMap{"formatTime": func(t time.Time) string { return t.Format("02.01.2006 15:04") }}).ParseFS(staticFiles, "templates/trial.html"))
+	connectionTmpl := template.Must(template.New("connect.html").ParseFS(staticFiles, "templates/connect.html"))
 	errorTmpl := template.Must(template.New("error.html").ParseFS(staticFiles, "templates/error.html"))
 
-	return &Server{addr: addr, db: db, cfg: cfg, botUsername: botUsername, subService: subService, subServer: subServer, checkers: make(map[string]func(context.Context) ComponentHealth), inviteCodeRegex: regexp.MustCompile(`^[a-zA-Z0-9_-]+$`), startTime: time.Now(), trialTemplate: trialTmpl, errorTemplate: errorTmpl}
+	return &Server{addr: addr, db: db, cfg: cfg, botUsername: botUsername, subService: subService, subServer: subServer, checkers: make(map[string]func(context.Context) ComponentHealth), inviteCodeRegex: regexp.MustCompile(`^[a-zA-Z0-9_-]+$`), startTime: time.Now(), trialTemplate: trialTmpl, connectionTemplate: connectionTmpl, errorTemplate: errorTmpl}
 }
 
 // SetBot wires Telegram delivery for payment notifications and administrator alerts.
@@ -213,6 +216,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/payment/callback", s.handlePaymentCallback)
 	mux.HandleFunc("/i/", s.handleInvite)
 	mux.HandleFunc("/subscription-info/", s.handleSubscriptionInfo)
+	mux.HandleFunc("/connect/", s.handleConnectionPage)
 	mux.HandleFunc("/sub/", s.handleSubscription)
 	mux.HandleFunc("/static/logo.png", s.handleLogo)
 
@@ -715,6 +719,115 @@ func (s *Server) handleSubscriptionInfo(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 	if err = json.NewEncoder(w).Encode(info); err != nil {
 		logger.Error("Failed to encode public subscription info", zap.Error(err))
+	}
+}
+
+// connectionPageData contains only customer-safe subscription presentation
+// fields. The QR image is generated from the public subscription URL.
+type connectionPageData struct {
+	StatusLabel   string
+	ExpiresAt     string
+	SubURL        string
+	QRCodeDataURL template.URL
+}
+
+// handleConnectionPage renders the customer connection page for a bearer token.
+func (s *Server) handleConnectionPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	const pathPrefix = "/connect/"
+	token := strings.TrimPrefix(r.URL.Path, pathPrefix)
+	if !strings.HasPrefix(r.URL.Path, pathPrefix) || strings.Contains(token, "/") || !utils.IsValidSubscriptionToken(token) {
+		s.renderConnectionNotFound(w)
+
+		return
+	}
+
+	if s.subService == nil {
+		logger.Error("Subscription service not initialized")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		s.renderErrorPage(w, "Ошибка сервера. Попробуйте позже.")
+
+		return
+	}
+
+	info, err := s.subService.GetPublicSubscriptionInfo(r.Context(), token)
+	if err != nil {
+		if errors.Is(err, database.ErrSubscriptionNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
+			s.renderConnectionNotFound(w)
+
+			return
+		}
+
+		logger.Error("Failed to load connection page subscription info",
+			zap.String("client_ip", getClientIP(r)),
+			zap.Error(err))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		s.renderErrorPage(w, "Ошибка сервера. Попробуйте позже.")
+
+		return
+	}
+
+	qrPNG, err := utils.GenerateQRCodePNG(info.SubscriptionURL)
+	if err != nil {
+		logger.Error("Failed to generate connection page QR code", zap.Error(err))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		s.renderErrorPage(w, "Ошибка сервера. Попробуйте позже.")
+
+		return
+	}
+
+	expiresAt := "Бессрочно"
+	if info.ExpiresAt != nil {
+		expiresAt = info.ExpiresAt.UTC().Format("02.01.2006 15:04 UTC")
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	s.renderConnectionPage(w, connectionPageData{
+		StatusLabel:   connectionStatusLabel(info.Status),
+		ExpiresAt:     expiresAt,
+		SubURL:        info.SubscriptionURL,
+		QRCodeDataURL: template.URL("data:image/png;base64," + base64.StdEncoding.EncodeToString(qrPNG)), // #nosec G203 -- server-generated PNG for the server-generated public URL
+	})
+}
+
+func (s *Server) renderConnectionNotFound(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	s.renderErrorPage(w, "Подписка не найдена")
+}
+
+func (s *Server) renderConnectionPage(w http.ResponseWriter, data connectionPageData) {
+	if err := s.connectionTemplate.Execute(w, data); err != nil {
+		logger.Error("Failed to render connection page", zap.Error(err))
+	}
+}
+
+func connectionStatusLabel(status string) string {
+	switch database.SubscriptionStatus(status) {
+	case database.SubscriptionStatusActive:
+		return "Активна"
+	case database.SubscriptionStatusExpired:
+		return "Истекла"
+	case database.SubscriptionStatusRevoked:
+		return "Отозвана"
+	case database.SubscriptionStatusPaused:
+		return "Приостановлена"
+	case database.SubscriptionStatusCanceled:
+		return "Отменена"
+	default:
+		return "Неактивна"
 	}
 }
 
