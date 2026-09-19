@@ -26,7 +26,7 @@ func TestMiniAppStars_AuthenticatedPurchaseToTelegramSettlement(t *testing.T) {
 	db, err := database.NewService(filepath.Join(t.TempDir(), "stars.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	cfg := &config.Config{TelegramBotToken: miniAppTestToken} // legacy payments disabled
+	cfg := &config.Config{TelegramBotToken: miniAppTestToken, GlobalSubURL: "https://customer.example/sub/"} // legacy payments disabled
 	plan := &database.Plan{Name: "stars-paid", IsActive: true}
 	require.NoError(t, db.GetDB().Create(plan).Error)
 	product := &database.Product{PlanID: plan.ID, Name: "Monthly Stars", DurationDays: 30, PriceCents: 123, Currency: "XTR", IsActive: true}
@@ -118,6 +118,26 @@ func TestMiniAppStars_AuthenticatedPurchaseToTelegramSettlement(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &checkout))
 	h.HandleUpdate(ctx, checkout)
 	assert.Equal(t, 1, answers)
+	readRecent := func() []service.PurchaseOrderInfo {
+		t.Helper()
+		response := request("GET", "/api/miniapp/orders/recent", "", sub.TelegramID, 200)
+		var result struct {
+			Orders []service.PurchaseOrderInfo `json:"orders"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &result))
+		// checkout_started is public; reservation IDs and payment credentials are not.
+		for _, secret := range []string{sub.Token, sub.ClientID, `"checkout"`, payload, "telegram-official-charge"} {
+			assert.NotContains(t, response.Body.String(), secret)
+		}
+		return result.Orders
+	}
+	recent := readRecent()
+	require.Len(t, recent, 1)
+	assert.Equal(t, purchase.OrderID, recent[0].OrderID)
+	assert.Equal(t, database.OrderStatusPending, recent[0].Status)
+	assert.True(t, recent[0].CheckoutStarted)
+	request("POST", path, "", sub.TelegramID, 409)
+	assert.Equal(t, 1, invoiceCalls, "reserved checkouts must not reopen an invoice")
 	unchanged, err := db.GetByID(ctx, sub.ID)
 	require.NoError(t, err)
 	assert.Equal(t, before, unchanged, "invoice and pre-checkout grant no access")
@@ -141,6 +161,10 @@ func TestMiniAppStars_AuthenticatedPurchaseToTelegramSettlement(t *testing.T) {
 	response := request("GET", "/api/miniapp/orders/"+purchase.OrderID, "", sub.TelegramID, 200)
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &purchase))
 	assert.Equal(t, database.OrderStatusPaid, purchase.Status)
+	recent = readRecent()
+	require.Len(t, recent, 1)
+	assert.Equal(t, purchase, recent[0], "reopening must discover the same settled order")
+	assert.True(t, recent[0].CheckoutStarted)
 	request("POST", path, "", sub.TelegramID, 409)
 	orders, err := db.GetOrdersBySubscriptionID(ctx, sub.ID)
 	require.NoError(t, err)
@@ -148,4 +172,18 @@ func TestMiniAppStars_AuthenticatedPurchaseToTelegramSettlement(t *testing.T) {
 	assert.Equal(t, "telegram_stars", orders[0].PaymentProvider)
 	assert.Equal(t, "telegram-official-charge", orders[0].ProviderPaymentID)
 	assert.Equal(t, orders[0].ExpiresAt, after.ExpiresAt)
+	// Follow the actual customer read contract through to the existing QR page.
+	response = request("GET", "/api/miniapp/subscription", "", sub.TelegramID, 200)
+	var current service.SubscriptionManagementInfo
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &current))
+	assert.Equal(t, "active", current.Status)
+	assert.Equal(t, after.ExpiresAt, current.ExpiresAt)
+	assert.Equal(t, cfg.SubURL(after.Token), current.SubscriptionURL)
+	assert.Equal(t, "https://customer.example/connect/"+after.Token, current.ConnectionURL)
+	server := NewServer(":0", db, cfg, "stars_test_bot", subscriptions, nil)
+	connection := httptest.NewRecorder()
+	server.handleConnectionPage(connection, httptest.NewRequest("GET", current.ConnectionURL, nil))
+	require.Equal(t, http.StatusOK, connection.Code)
+	assert.Equal(t, "no-store", connection.Header().Get("Cache-Control"))
+	assertConnectionURLAndQR(t, connection.Body.String(), current.SubscriptionURL)
 }

@@ -52,7 +52,9 @@ export class Api {
       const headers: Record<string, string> = { Authorization: `tma ${this.initData}` };
       if (body) headers['Content-Type'] = 'application/json';
       if (key) headers['Idempotency-Key'] = key;
-      const response = await this.transport(`/api/miniapp/${path}`, {
+      // Native Window.fetch must not receive the Api instance as its receiver.
+      const transport = this.transport;
+      const response = await transport(`/api/miniapp/${path}`, {
         method, headers, body: body ? JSON.stringify(body) : undefined,
         signal: controller.signal, cache: 'no-store', credentials: 'omit', redirect: 'error',
       });

@@ -4,6 +4,13 @@ import { json, offer, order } from './fixtures';
 
 afterEach(() => vi.useRealTimers());
 describe('existing API boundary', () => {
+  it('does not bind the transport to the Api instance (native browser fetch)', async () => {
+    const transport = vi.fn(function (this: unknown) {
+      expect(this).toBeUndefined();
+      return Promise.resolve(json(order));
+    });
+    await expect(new Api('signed', transport).order(order.order_id)).resolves.toEqual(order);
+  });
   it('sends initData only in Authorization and does not send client-owned payment terms', async () => {
     const transport = vi.fn<typeof fetch>().mockResolvedValue(json(order));
     const api = new Api('raw+signed&data', transport);

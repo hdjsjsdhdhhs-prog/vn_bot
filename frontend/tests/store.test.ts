@@ -22,6 +22,91 @@ beforeEach(() => { sessionStorage.clear(); vi.useFakeTimers(); });
 afterEach(() => { stores.splice(0).forEach(store => store.dispose()); vi.useRealTimers(); });
 
 describe('purchase orchestration', () => {
+  it('ignores older subscription/recent refreshes that finish after settlement', async () => {
+    const { api, store } = setup();
+    let resolveSubscription!: (value: typeof subscription) => void;
+    let resolveRecent!: (value: { orders: Order[] }) => void;
+    vi.mocked(api.subscription).mockReturnValueOnce(new Promise(done => { resolveSubscription = done; }));
+    vi.mocked(api.recent).mockReturnValueOnce(new Promise(done => { resolveRecent = done; }));
+    const refresh = store.refresh();
+    const paid: Order = { ...order, status: 'paid', checkout_started: true };
+    vi.mocked(api.order).mockResolvedValue(paid);
+    await store.selectOrder(order.order_id);
+    resolveSubscription({ ...subscription, status: 'expired' });
+    resolveRecent({ orders: [order] });
+    await refresh;
+    expect(store.subscription.data).toEqual(subscription);
+    expect(store.recent.data).toEqual([paid]);
+    expect(store.subscription.loading).toBe(false);
+    expect(store.recent.loading).toBe(false);
+  });
+  it('does not release the current read lock on rapid A → B → A navigation', async () => {
+    const { api, store } = setup();
+    let resolveOld!: (value: Order) => void;
+    let resolveNew!: (value: Order) => void;
+    vi.mocked(api.order).mockReturnValueOnce(new Promise(done => { resolveOld = done; }));
+    const old = store.selectOrder(order.order_id);
+    vi.mocked(api.order).mockResolvedValueOnce({ ...order, order_id: 'c'.repeat(32) });
+    await store.selectOrder('c'.repeat(32));
+    vi.mocked(api.order).mockReturnValueOnce(new Promise(done => { resolveNew = done; }));
+    const current = store.selectOrder(order.order_id);
+    resolveOld(order); await old;
+    expect(store.checking).toBe(true);
+    resolveNew(order); await current;
+    expect(store.checking).toBe(false);
+  });
+  it('does not open a delayed invoice after a different purchase is selected', async () => {
+    const { api, store, tg } = setup();
+    await store.selectOrder(order.order_id);
+    let resolve!: (value: { invoice_url: string }) => void;
+    vi.mocked(api.invoice).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    const paying = store.pay();
+    vi.mocked(api.order).mockResolvedValueOnce({ ...order, order_id: 'c'.repeat(32) });
+    await store.selectOrder('c'.repeat(32));
+    resolve({ invoice_url: 'https://t.me/$old-invoice' }); await paying;
+    expect(tg.openInvoice).not.toHaveBeenCalled();
+    expect(store.busy).toBe(false);
+    expect(store.paymentHint).toBeNull();
+  });
+  it('does not attach the previous invoice callback to another purchase', async () => {
+    const { api, store, tg } = setup();
+    await store.selectOrder(order.order_id); await store.pay();
+    vi.mocked(api.order).mockResolvedValueOnce({ ...order, order_id: 'c'.repeat(32) });
+    await store.selectOrder('c'.repeat(32));
+    vi.mocked(tg.openInvoice).mock.calls[0][1]('paid');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.paymentHint).toBeNull();
+    expect(store.order?.order_id).toBe('c'.repeat(32));
+  });
+  it.each([408, 429])('retains the idempotency key on ambiguous HTTP %i', async status => {
+    const { api, store } = setup();
+    vi.mocked(api.create).mockRejectedValueOnce(new ApiError('service_unavailable', status));
+    await store.buy(offer);
+    await store.buy(offer);
+    expect(vi.mocked(api.create).mock.calls[1][1]).toBe(vi.mocked(api.create).mock.calls[0][1]);
+  });
+  it('leaving a purchase stops polling and suppresses a delayed invoice', async () => {
+    const { api, store, tg } = setup();
+    await store.selectOrder(order.order_id);
+    let resolve!: (value: { invoice_url: string }) => void;
+    vi.mocked(api.invoice).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    const paying = store.pay();
+    store.leaveOrder();
+    resolve({ invoice_url: 'https://t.me/$old-invoice' }); await paying;
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(api.order).toHaveBeenCalledTimes(1);
+    expect(tg.openInvoice).not.toHaveBeenCalled();
+    expect(store.order).toBeNull();
+    expect(store.busy).toBe(false);
+  });
+  it('keeps the reopen instruction when concurrent requests fail after a 401', async () => {
+    const { api, store } = setup();
+    vi.mocked(api.subscription).mockRejectedValue(new ApiError('unauthorized', 401));
+    vi.mocked(api.offers).mockRejectedValue(new ApiError('network'));
+    await store.refresh();
+    expect(store.unauthorized).toBe(true);
+    expect(store.error).toMatchObject({ code: 'unauthorized', status: 401 });
+  });
   it('loads independent resources and handles users without a subscription', async () => {
     const { api, store } = setup();
     vi.mocked(api.subscription).mockResolvedValue(null);

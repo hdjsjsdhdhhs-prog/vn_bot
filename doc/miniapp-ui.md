@@ -80,3 +80,78 @@ Local tests simulate Telegram SDK and HTTP responses; Go tests exercise real
 SQLite/authentication/Stars settlement with a local Bot API server. Live Telegram
 WebView / real Stars acceptance requires an operator-run smoke test; simulated
 callbacks are not verification of a real payment.
+
+## Checkpoint follow-up (6d3373c)
+
+The checkpoint was incomplete, not a release acceptance marker:
+
+| Area | Initial classification | Follow-up |
+| --- | --- | --- |
+| TypeScript/Vite, screens, auth adapter, purchase and Stars integration | PARTIAL | Kept the architecture and existing backend contracts; exercised the production bundle in Chromium. |
+| Browser API requests | BROKEN | Detached the stored fetch function before calling it: binding native fetch to the Api instance caused `Illegal invocation` in Chromium despite passing Node-based unit tests. |
+| Recent-purchase HTTP tests | BROKEN | Historical fixtures now supply required deadlines at creation instead of modifying immutable purchase terms; production DB triggers remain enabled. |
+| Concurrent requests and invoice navigation | PARTIAL | Older subscription/history responses cannot replace settlement state; old order reads cannot release a newer read's lock; leaving a purchase stops polling and suppresses delayed invoices. SDK callbacks remain attached to their own purchase. |
+| Retry and reopen | PARTIAL | Keep idempotency keys on ambiguous HTTP 408/429; test lost responses and recovery without session storage. Home also offers recovery for expired, approved checkouts awaiting settlement. |
+| Mobile launch and theme | PARTIAL | Consume Telegram launch hash after SDK initialization; handle all four safe-area edges and remove obsolete theme overrides. |
+| Server payment authority and ownership | DONE for audited contracts | Retain verified initData, buyer + current-owner filtering, bounded safe recent DTO, server-only settlement. Invoice preparation now rejects already-reserved checkouts under the existing DB transaction. |
+| Real Telegram / VPN acceptance and final Docker image | MISSING verification | Docker build and Linux embedded-UI tests now pass. Live Telegram/VPN acceptance still requires the release checks below. |
+
+Browser tests run `vite build` then `vite preview`, not the development server.
+Run `npm run test:browser` from `frontend/`; if Chromium is missing, run
+`npx playwright install chromium` there first. Tests cover launch parameters,
+loading/empty/error states, mobile navigation, duplicate Pay, failed/cancelled/
+pending SDK signals, lost responses, reopen and delayed settlement. The Go
+Stars HTTP integration test uses signed initData, real SQLite and bot update
+routing, then reads recent orders and the subscription API and validates the
+existing connection page's QR against the returned subscription URL.
+
+### Windows verification notes
+
+- This environment's `npm --prefix frontend ...` incorrectly selected the root
+  package. Run npm with cwd set to `frontend` instead; no package.json change is
+  necessary.
+- Vitest loaded duplicate runner contexts with lowercase `d:` here. Using the
+  canonical cwd from Node `fs.realpathSync.native('frontend')` fixed the actual
+  test run without changing dependency versions or skipping tests.
+- Playwright's readiness requests went through the environment proxy and got
+  HTTP 503. Set `NO_PROXY=127.0.0.1,localhost` (and lowercase `no_proxy` when
+  needed) for the test process only. Do not change production networking.
+- Go/SQLite tests use the existing `tests\\run-stars-tests.cmd` helper (CGO and
+  MSYS2 UCRT gcc), with packages executed sequentially using `-p 1`.
+- A full `go test ./... -count=1` was attempted and **failed** outside the Mini
+  App scope: open-file rename/cleanup failures on Windows, stale migration
+  expectations (41 vs current 43), older token fixtures, and an `expires_now`
+  timing assertion. The full regression is not green; focused passing tests
+  must not be reported as a complete regression pass.
+- Docker initially had no running daemon; a subsequent build hit a temporary
+  `storage.googleapis.com` DNS timeout. Retrying the unchanged Dockerfile
+  completed successfully, including frontend build, Linux Go/CGO compilation,
+  UPX and final image export. No DNS settings were changed.
+
+### Observed automated verification (2026-09-19)
+
+- `npm install`, lint, typecheck, production build: passed; package manifests and
+  lockfile unchanged. Vitest: **47 passed**. Playwright Chromium: **15 passed**.
+- Windows: complete `internal/web`, `internal/telegramauth`,
+  `internal/telegramstars` package tests passed. Focused MiniApp/Purchase/Stars/
+  SubscriptionManagement/navigation tests passed across web/service/database/bot.
+- Native CGO build of `./cmd/bot` passed after rebuilding frontend assets.
+- `docker build -t rs8-miniapp-verification .`: passed.
+- Builder image from the same Dockerfile: `go test -p 1 ./internal/web -run
+  MiniApp -count=1` passed under Linux with networking disabled. This includes
+  production embedded HTML/CSS/JS serving and signed-auth purchase settlement.
+- Full Windows regression: **FAILED**, as detailed above. Not replaced by a
+  claim that the narrower Linux run is a full regression.
+
+### Release acceptance still required
+
+1. Smoke-test `/miniapp/` and its hashed assets in the deployed production
+   service. The image has been built, but the live service was not started.
+2. Resolve the unrelated full-regression failures or record an explicit release
+   decision; do not disable assertions to get a green run.
+3. Open from the configured Telegram bot in native mobile and Telegram Web.
+   Check safe areas, Back, invoice cancellation, then an operator-authorized real
+   Stars payment. Closing and reopening must recover the same server order.
+4. Verify that official payment settlement produces the subscription, that
+   provisioning finishes, and that the connection URL/QR imports into a real VPN
+   client. Until then, live payment and connection are **UNVERIFIED**.

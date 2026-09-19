@@ -22,6 +22,7 @@ export class Store {
   private checkingID?: string;
   private paymentUncertain = false;
   private refreshing = false;
+  private resourceRequests = new WeakMap<object, symbol>();
   private intent?: { offer: string; key: string };
   constructor(readonly api: Api, private telegram?: WebApp, private storage?: Storage) {
     try {
@@ -36,6 +37,7 @@ export class Store {
   subscribe(fn: () => void) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
   private emit() { if (!this.stopped) this.listeners.forEach(fn => fn()); }
   private fail(error: unknown) {
+    if (this.unauthorized) return; // Preserve the reopen instruction after concurrent failures.
     this.error = error;
     if (error instanceof ApiError && error.status === 401) {
       this.unauthorized = true;
@@ -48,14 +50,21 @@ export class Store {
     }
   }
   private async load<T>(resource: Resource<T>, read: () => Promise<T>) {
+    const request = Symbol();
+    this.resourceRequests.set(resource, request);
     resource.loading = true;
     resource.error = undefined;
     this.emit();
     try {
       const data = await read();
-      if (!this.unauthorized && !this.stopped) resource.data = data;
-    } catch (error) { resource.error = error; this.fail(error); }
-    finally { resource.loading = false; this.emit(); }
+      if (this.resourceRequests.get(resource) === request && !this.unauthorized && !this.stopped) resource.data = data;
+    } catch (error) {
+      if (this.resourceRequests.get(resource) === request) { resource.error = error; this.fail(error); }
+      else if (error instanceof ApiError && error.status === 401) this.fail(error);
+    } finally {
+      if (this.resourceRequests.get(resource) === request) resource.loading = false;
+      this.emit();
+    }
   }
   async refresh() {
     if (this.unauthorized || this.stopped || this.refreshing) return;
@@ -75,6 +84,10 @@ export class Store {
       try { this.storage?.removeItem('miniapp-intent'); } catch { /* Optional storage. */ }
     }
     this.order = order;
+    // An older history read must not overwrite this newer authoritative order.
+    this.resourceRequests.delete(this.recent);
+    this.recent.loading = false;
+    this.recent.error = undefined;
     this.recent.data = [order, ...this.recent.data.filter(item => item.order_id !== order.order_id)].slice(0, 20);
   }
   async buy(offer: Offer): Promise<Order | null> {
@@ -95,7 +108,7 @@ export class Store {
       return order;
     } catch (error) {
       // A definitive rejection did not create an order; allow a fresh selection.
-      if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status)) {
         this.intent = undefined;
         try { this.storage?.removeItem('miniapp-intent'); } catch { /* Optional storage. */ }
       }
@@ -104,12 +117,17 @@ export class Store {
       return null;
     } finally { this.busy = false; this.emit(); }
   }
-  async selectOrder(id: string) {
-    if (this.unauthorized || (this.checking && this.checkingID === id)) return;
+  leaveOrder() {
     clearTimeout(this.timer);
     this.generation++;
     this.order = null;
     this.paymentHint = null;
+    this.checkingID = undefined;
+    this.checking = false;
+  }
+  async selectOrder(id: string) {
+    if (this.unauthorized || (this.checking && this.checkingID === id)) return;
+    this.leaveOrder();
     this.error = undefined;
     this.attempts = 0;
     await this.checkOrder(id);
@@ -132,7 +150,7 @@ export class Store {
       }
     } catch (error) { if (generation === this.generation) this.fail(error); }
     finally {
-      if (this.checkingID === id) {
+      if (generation === this.generation && this.checkingID === id) {
         this.checkingID = undefined;
         this.checking = false;
         this.emit();
@@ -154,23 +172,31 @@ export class Store {
     if (!order || this.busy || this.checking || this.unauthorized || order.status !== 'pending' || order.checkout_started || order.currency !== 'XTR') return;
     if (this.paymentUncertain) { await this.checkOrder(); return; }
     if (!this.telegram?.isVersionAtLeast('6.1')) { this.fail(new Error('Unsupported Telegram')); this.emit(); return; }
+    const generation = this.generation;
     this.busy = true; this.error = undefined; this.paymentHint = 'opening'; this.emit();
     try {
       const invoice = await this.api.invoice(order.order_id);
-      if (this.unauthorized || this.stopped) { this.busy = false; return; }
+      if (this.unauthorized || this.stopped || generation !== this.generation) {
+        this.busy = false; this.emit(); return;
+      }
       this.paymentUncertain = true;
       this.telegram.openInvoice(safeInvoice(invoice.invoice_url), status => {
         if (this.stopped || this.unauthorized) return;
         this.busy = false;
-        this.paymentHint = status;
-        this.attempts = 0;
-        // SDK status is not authoritative, even when it says paid.
-        if (this.order?.order_id === order.order_id) void this.checkOrder(order.order_id);
-        else void this.refresh();
+        // SDK status belongs only to the invoice that was actually opened.
+        // It is not authoritative, even when it says paid.
+        if (generation === this.generation && this.order?.order_id === order.order_id) {
+          this.paymentHint = status;
+          this.attempts = 0;
+          void this.checkOrder(order.order_id);
+        } else void this.refresh();
         this.emit();
       });
     } catch (error) {
-      this.busy = false; this.paymentHint = null; this.fail(error); this.emit();
+      this.busy = false;
+      if (generation === this.generation) { this.paymentHint = null; this.fail(error); }
+      else if (error instanceof ApiError && error.status === 401) this.fail(error);
+      this.emit();
     }
   }
   dispose() { this.stopped = true; clearTimeout(this.timer); this.listeners.clear(); }

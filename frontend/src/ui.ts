@@ -122,7 +122,7 @@ export function mount(root: HTMLElement, store: Store, telegram?: WebApp) {
       main.append(resource(store.subscription, sub => subscriptionCard(sub), refresh));
       const banner = el('section', 'card promo');
       banner.append(el('span', 'eyebrow', 'БОЛЬШЕ ВОЗМОЖНОСТЕЙ'), el('h2', '', 'Доступ в вашем ритме'), el('p', 'muted', 'Выберите срок и оплатите прямо в Telegram.'), link('Смотреть предложения', 'catalog', true)); main.append(banner);
-      const pending = store.recent.data.find(order => order.status === 'pending');
+      const pending = store.recent.data.find(order => order.status === 'pending' || (order.status === 'expired' && order.checkout_started));
       if (pending) main.append(link('Продолжить покупку →', `purchase/${pending.order_id}`, true));
       main.append(button('Обновить данные', refresh, true, store.subscription.loading));
     } else if (route === 'catalog') {
@@ -156,7 +156,7 @@ export function mount(root: HTMLElement, store: Store, telegram?: WebApp) {
         } else {
           if (order.status === 'pending') {
             if (order.expires_at) card.append(el('p', 'small muted', `Счёт действует до ${new Date(order.expires_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`));
-            if (order.checkout_started) card.append(el('p', 'muted', 'Платёж уже начат. Ждём подтверждение. Не оплачивайте повторно. Если оплата прервана, дождитесь окончания срока счёта.'));
+            if (order.checkout_started) card.append(el('p', 'muted', 'Платёж уже начат. Ждём подтверждение. Не оплачивайте повторно. Если статус долго не меняется, обратитесь в поддержку через бота.'));
             else card.append(button(store.busy ? 'Открываем Telegram…' : `Оплатить ${price(order)}`, () => { void store.pay(); }, false, store.busy || store.checking || !telegram.isVersionAtLeast('6.1') || order.currency !== 'XTR'));
             if (!telegram.isVersionAtLeast('6.1')) card.append(el('p', 'muted', 'Для оплаты обновите Telegram.'));
           }
@@ -232,6 +232,7 @@ export function mount(root: HTMLElement, store: Store, telegram?: WebApp) {
     notice = '';
     const route = location.hash.slice(1);
     if (route.startsWith('purchase/')) void store.selectOrder(route.split('/')[1]);
+    else store.leaveOrder();
     render();
   };
   const visibility = () => store.resume();

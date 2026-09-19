@@ -79,6 +79,11 @@ func (s *Service) PrepareStarsInvoice(ctx context.Context, ref string, payer int
 		if err = checkStarsPending(r, c.Now); err != nil {
 			return err
 		}
+		// A reserved checkout can still settle after its WebView was closed.
+		// Do not offer the reusable invoice for another payment attempt.
+		if r.Order.StarsCheckoutID != nil {
+			return ErrStarsPurchaseInvalid
+		}
 		if _, err = validate(c, &r.Product); err != nil {
 			return err
 		}

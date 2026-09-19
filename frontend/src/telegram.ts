@@ -4,8 +4,8 @@ export interface WebApp {
   initDataUnsafe?: { user?: { first_name?: string; last_name?: string; username?: string } };
   colorScheme: 'light' | 'dark';
   themeParams: { bg_color?: string; text_color?: string; secondary_bg_color?: string; hint_color?: string; button_color?: string };
-  safeAreaInset?: { top: number; bottom: number };
-  contentSafeAreaInset?: { top: number; bottom: number };
+  safeAreaInset?: { top: number; bottom: number; left?: number; right?: number };
+  contentSafeAreaInset?: { top: number; bottom: number; left?: number; right?: number };
   ready(): void;
   expand(): void;
   close(): void;
@@ -26,9 +26,11 @@ export function initializeTelegram(app?: WebApp): () => void {
     const theme = app.themeParams;
     for (const [name, value] of Object.entries({ bg: theme.bg_color, text: theme.text_color, surface: theme.secondary_bg_color })) {
       if (value && /^#[0-9a-f]{6}$/i.test(value)) root.style.setProperty(`--${name}`, value);
+      else root.style.removeProperty(`--${name}`);
     }
-    root.style.setProperty('--safe-top', `${Math.max(0, app.safeAreaInset?.top ?? 0) + Math.max(0, app.contentSafeAreaInset?.top ?? 0)}px`);
-    root.style.setProperty('--safe-bottom', `${Math.max(0, app.safeAreaInset?.bottom ?? 0) + Math.max(0, app.contentSafeAreaInset?.bottom ?? 0)}px`);
+    for (const side of ['top', 'bottom', 'left', 'right'] as const) {
+      root.style.setProperty(`--safe-${side}`, `${Math.max(0, app.safeAreaInset?.[side] ?? 0) + Math.max(0, app.contentSafeAreaInset?.[side] ?? 0)}px`);
+    }
   };
   update();
   app.onEvent('themeChanged', update);
