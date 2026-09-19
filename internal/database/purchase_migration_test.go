@@ -44,7 +44,7 @@ func TestPurchaseMigration042_DownPopulated(t *testing.T) {
 	require.NoError(t, err)
 	m, err := newMigration(sqlDB, false)
 	require.NoError(t, err)
-	require.NoError(t, m.Steps(-1), "execute the real embedded down migration on populated tables")
+	require.NoError(t, m.Migrate(41), "execute real embedded down migrations through 042 on populated tables")
 	version, dirty, err := migrationState(sqlDB)
 	require.NoError(t, err)
 	assert.Equal(t, uint(41), version)

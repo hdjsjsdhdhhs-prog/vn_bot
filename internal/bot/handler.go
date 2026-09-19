@@ -71,6 +71,7 @@ type Handler struct {
 	sender              *MessageSender
 	keyboards           *KeyboardBuilder
 	orderService        *service.OrderService
+	starsService        *service.StarsPaymentService
 	paymentEnabled      bool
 	version             string
 	referral            *ReferralHandler
@@ -653,6 +654,14 @@ func (h *Handler) ClearAdminSendRateLimit(chatID int64) {
 
 // HandleUpdate routes incoming Telegram updates through the bot handlers.
 func (h *Handler) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
+	// Payment updates are not commands and must never be dropped by user rate
+	// limiting or interpreted as broadcast drafts/help requests.
+	if update.PreCheckoutQuery != nil || (update.Message != nil && update.Message.SuccessfulPayment != nil) {
+		if err := h.HandleStarsUpdate(ctx, update); err != nil {
+			logger.Warn("Telegram payment update rejected or deferred", zap.Int("update_id", update.UpdateID), zap.Error(err))
+		}
+		return
+	}
 	start := time.Now()
 
 	// Rate limiting: extract chat ID and check for non-admin users

@@ -25,6 +25,7 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/scheduler"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/subserver"
+	"github.com/kereal/rs8kvn_bot/internal/telegramstars"
 	"github.com/kereal/rs8kvn_bot/internal/vpn"
 	"github.com/kereal/rs8kvn_bot/internal/web"
 	"github.com/kereal/rs8kvn_bot/internal/xui"
@@ -516,20 +517,25 @@ func main() {
 		logger.Warn("web server not running; share/invite page username not updated")
 	}
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = config.BotUpdateTimeout
-	u.AllowedUpdates = []string{"message", "callback_query"}
-	updates := botAPI.GetUpdatesChan(u)
+	// Stars is independent of legacy Platega configuration. Only explicit XTR
+	// purchase offers are payable, after the real bot and sync service are ready.
+	stars := service.NewStarsPaymentService(svc.orderService, telegramstars.New(api))
+	svc.handler.SetStarsPaymentService(stars)
+	if webServer != nil {
+		webServer.SetStarsPaymentService(stars)
+	}
 
-	// 9. Setup graceful shutdown context
+	// 9. Setup graceful shutdown context before starting durable payment polling.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
+	updates := telegramstars.Updates(ctx, botAPI, config.BotUpdateTimeout, stars.CaptureUpdate)
 
 	// 10. Start background goroutines
 	svc.handler.StartCacheCleanup(ctx, bot.CacheTTL/2)
 	svc.handler.StartRateLimiterCleanup(ctx, bot.CacheTTL, bot.CacheTTL*2)
 	svc.handler.StartReferralCacheSync(ctx)
 	svc.handler.StartBroadcastWorker(ctx)
+	svc.handler.StartStarsPaymentWorker(ctx)
 	bgWg := startBackgroundWorkers(ctx, svc.handler, svc.subService, svc.syncService, svc.orderService, dbService, cfg)
 
 	if webServer != nil {

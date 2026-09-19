@@ -94,6 +94,7 @@ type Server struct {
 	bot                interfaces.BotAPI
 	subService         *service.SubscriptionService
 	orderService       *service.OrderService
+	starsService       *service.StarsPaymentService
 	paymentConfig      *PaymentConfig
 	subServer          *subserver.Service
 	subserverLogger    *subserver.AccessLogger
@@ -215,7 +216,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/payment/callback", s.handlePaymentCallback)
 	mux.HandleFunc("/i/", s.handleInvite)
-	mux.Handle("/api/miniapp/", newMiniAppHandler(s.cfg, s.subService))
+	mux.Handle("/api/miniapp/", newMiniAppHandler(s.cfg, s.subService, s.starsPayments))
 	mux.HandleFunc("/subscription-info/", s.handleSubscriptionInfo)
 	mux.HandleFunc("/connect/", s.handleConnectionPage)
 	mux.HandleFunc("/sub/", s.handleSubscription)

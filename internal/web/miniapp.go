@@ -29,7 +29,7 @@ func authorizeMiniApp(ctx context.Context, action service.SubscriptionManagement
 // newMiniAppHandler binds application policies once at startup. Purchase intents
 // grant no access: no renewal or payment-confirmation route is exposed, even to
 // the configured Telegram administrator.
-func newMiniAppHandler(cfg *config.Config, subscriptions *service.SubscriptionService) http.Handler {
+func newMiniAppHandler(cfg *config.Config, subscriptions *service.SubscriptionService, stars ...func() *service.StarsPaymentService) http.Handler {
 	var token string
 	if cfg != nil {
 		token = cfg.TelegramBotToken
@@ -38,6 +38,9 @@ func newMiniAppHandler(cfg *config.Config, subscriptions *service.SubscriptionSe
 	management := service.NewSubscriptionManagement(subscriptions, authorizeMiniApp)
 	purchases := service.NewPurchaseService(subscriptions, authorizeMiniAppPurchase)
 	return miniAppAuthentication(validator, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMiniAppStarsInvoice(w, r, purchases, stars) {
+			return
+		}
 		if serveMiniAppPurchase(w, r, purchases) {
 			return
 		}

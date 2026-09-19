@@ -99,12 +99,13 @@ func (s *Service) ReadPurchaseCatalog(ctx context.Context, telegramID int64) (*P
 	return catalog, err
 }
 
-// expireUnsubmittedPurchases uses server time and touches only provider-neutral
-// purchase intents. Once attached to a provider, its existing lifecycle owns it.
+// expireUnsubmittedPurchases uses server time for provider-neutral and Stars
+// intents. Stars may still settle an approved checkout delivered after expiry;
+// expiry prevents new checkouts, not fulfillment of a payment already made.
 func expireUnsubmittedPurchases(tx *gorm.DB, telegramID int64, now time.Time) error {
 	return tx.Model(&Order{}).
 		Where("buyer_telegram_id = ? AND status = ? AND purchase_expires_at <= ?", telegramID, OrderStatusPending, now).
-		Where("COALESCE(payment_provider, '') = '' AND COALESCE(provider_payment_id, '') = '' AND payment_creation_uncertain = ?", false).
+		Where("COALESCE(payment_provider, '') IN ('', 'telegram_stars') AND COALESCE(provider_payment_id, '') = '' AND payment_creation_uncertain = ?", false).
 		UpdateColumn("status", OrderStatusExpired).Error
 }
 

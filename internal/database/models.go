@@ -195,15 +195,15 @@ type Product struct {
 	// OfferID is an opaque public reference, not a credential or database ID.
 	OfferID      string     `gorm:"column:offer_id"`
 	OfferEndsAt  *time.Time `gorm:"column:offer_ends_at"`
-	ID           uint      `gorm:"primaryKey;column:id"`
-	PlanID       uint      `gorm:"not null;column:plan_id"`
-	Name         string    `gorm:"size:255;not null;column:name"`
-	DurationDays int       `gorm:"not null;column:duration_days"`
-	PriceCents   int64     `gorm:"not null;column:price_cents"`
-	Currency     string    `gorm:"size:3;not null;default:RUB;column:currency"`
-	IsActive     bool      `gorm:"not null;default:true;column:is_active"`
-	CreatedAt    time.Time `gorm:"autoCreateTime;column:created_at"`
-	UpdatedAt    time.Time `gorm:"autoUpdateTime;column:updated_at"`
+	ID           uint       `gorm:"primaryKey;column:id"`
+	PlanID       uint       `gorm:"not null;column:plan_id"`
+	Name         string     `gorm:"size:255;not null;column:name"`
+	DurationDays int        `gorm:"not null;column:duration_days"`
+	PriceCents   int64      `gorm:"not null;column:price_cents"`
+	Currency     string     `gorm:"size:3;not null;default:RUB;column:currency"`
+	IsActive     bool       `gorm:"not null;default:true;column:is_active"`
+	CreatedAt    time.Time  `gorm:"autoCreateTime;column:created_at"`
+	UpdatedAt    time.Time  `gorm:"autoUpdateTime;column:updated_at"`
 
 	Plan   *Plan   `gorm:"foreignKey:PlanID"`
 	Orders []Order `gorm:"foreignKey:ProductID"`
@@ -242,10 +242,12 @@ const (
 type Order struct {
 	// Purchase fields are nullable for historical/provider-created orders.
 	// PurchaseExpiresAt is the intent deadline, never entitlement ExpiresAt.
-	PurchaseID        *string    `gorm:"column:purchase_id"`
-	BuyerTelegramID   *int64     `gorm:"column:buyer_telegram_id"`
-	PurchaseKey       *string    `gorm:"column:purchase_key"`
-	PurchaseExpiresAt *time.Time `gorm:"column:purchase_expires_at"`
+	StarsCheckoutID          *string     `gorm:"column:stars_checkout_id"`
+	StarsCheckoutAt          *time.Time  `gorm:"column:stars_checkout_at"`
+	PurchaseID               *string     `gorm:"column:purchase_id"`
+	BuyerTelegramID          *int64      `gorm:"column:buyer_telegram_id"`
+	PurchaseKey              *string     `gorm:"column:purchase_key"`
+	PurchaseExpiresAt        *time.Time  `gorm:"column:purchase_expires_at"`
 	ID                       uint        `gorm:"primaryKey;column:id"`
 	SubscriptionID           uint        `gorm:"not null;column:subscription_id"`
 	ProductID                uint        `gorm:"not null;column:product_id"`

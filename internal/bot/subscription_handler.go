@@ -399,6 +399,15 @@ func (sh *SubscriptionHandler) handleBuyPremiumList(ctx context.Context, chatID 
 		return sh.showBuyError(chatID, messageID, msg(MsgSubTempError))
 	}
 
+	// This is the legacy payment menu. XTR checkout belongs to the authenticated
+	// Purchase Foundation flow, never to external-provider callbacks.
+	legacyProducts := make([]database.Product, 0, len(products))
+	for _, product := range products {
+		if product.Currency != "XTR" {
+			legacyProducts = append(legacyProducts, product)
+		}
+	}
+	products = legacyProducts
 	if len(products) == 0 {
 		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, "❌ Нет доступных тарифов")
 		kb := sh.h.keyboards.Back()

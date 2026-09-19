@@ -571,6 +571,11 @@ func (o *OrderService) requestPayment(ctx context.Context, telegramID int64, use
 		return nil, nil, fmt.Errorf("load canonical product: %w", err)
 	}
 
+	// Stars products must never be routed through the legacy external provider.
+	if canonical != nil && canonical.Currency == "XTR" {
+		return nil, nil, ErrPaymentDisabled
+	}
+
 	if canonical == nil {
 		err := errors.New("load canonical product: product is nil")
 		o.notifyRequestIssue(ctx, "load_product_failed", err.Error(), "verify the product record", telegramID, product, nil)
