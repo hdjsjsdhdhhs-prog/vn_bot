@@ -66,6 +66,7 @@ type PurchaseOrderInfo struct {
 	Status database.OrderStatus `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt *time.Time `json:"expires_at"`
+	CheckoutStarted bool `json:"checkout_started"`
 }
 
 func (p *PurchaseService) customer(ctx context.Context) (int64, error) {
@@ -217,7 +218,7 @@ func purchaseInfo(record *database.PurchaseRecord, id int64) (*PurchaseOrderInfo
 	o, product := record.Order, record.Product
 	return &PurchaseOrderInfo{OrderID: *o.PurchaseID, OfferID: product.OfferID, Name: product.Name,
 		DurationDays: product.DurationDays, AmountCents: o.AmountCents, Currency: o.Currency,
-		Status: o.Status, CreatedAt: o.CreatedAt, ExpiresAt: o.PurchaseExpiresAt}, nil
+		Status: o.Status, CreatedAt: o.CreatedAt, ExpiresAt: o.PurchaseExpiresAt, CheckoutStarted: o.StarsCheckoutID != nil}, nil
 }
 
 // Preserve trusted diagnostics via Unwrap while keeping raw SQL/credentials out

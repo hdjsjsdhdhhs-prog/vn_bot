@@ -49,6 +49,13 @@ func serveMiniAppPurchase(w http.ResponseWriter, r *http.Request, purchases *ser
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	switch {
+	case path == "/api/miniapp/orders/recent":
+		orders, err := purchases.Recent(ctx)
+		if err != nil {
+			writeMiniAppPurchaseError(w, err)
+			return true
+		}
+		_ = json.NewEncoder(w).Encode(struct { Orders []service.PurchaseOrderInfo `json:"orders"` }{orders})
 	case path == "/api/miniapp/offers":
 		offers, err := purchases.Offers(ctx)
 		if err != nil {

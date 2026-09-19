@@ -47,5 +47,9 @@ Desktop.ini
 .kilocode/
 .agents/
 /skills-lock.json
+/frontend/node_modules/
+/frontend/test-results/
+/frontend/playwright-report/
+/internal/web/miniapp_dist/public/
 /graphify-out
 .freebuff/

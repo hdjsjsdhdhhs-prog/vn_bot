@@ -1,0 +1,1 @@
+Generated frontend assets belong here. Run npm --prefix frontend ci and npm --prefix frontend run build before building Go. This placeholder lets backend-only tests compile; /miniapp/ returns 503 if the frontend has not been built.
