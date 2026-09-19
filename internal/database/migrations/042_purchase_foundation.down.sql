@@ -1,0 +1,12 @@
+DROP TRIGGER IF EXISTS orders_purchase_identity_immutable;
+DROP TRIGGER IF EXISTS orders_purchase_required_insert;
+DROP INDEX IF EXISTS idx_orders_purchase_pending;
+DROP INDEX IF EXISTS idx_orders_purchase_key;
+DROP INDEX IF EXISTS idx_orders_purchase_id;
+ALTER TABLE orders DROP COLUMN purchase_expires_at;
+ALTER TABLE orders DROP COLUMN purchase_key;
+ALTER TABLE orders DROP COLUMN buyer_telegram_id;
+ALTER TABLE orders DROP COLUMN purchase_id;
+DROP INDEX IF EXISTS idx_products_offer_id;
+ALTER TABLE products DROP COLUMN offer_ends_at;
+ALTER TABLE products DROP COLUMN offer_id;

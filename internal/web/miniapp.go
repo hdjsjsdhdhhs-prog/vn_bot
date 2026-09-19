@@ -26,9 +26,9 @@ func authorizeMiniApp(ctx context.Context, action service.SubscriptionManagement
 	return id, nil
 }
 
-// newMiniAppHandler binds a read-only application policy once at server startup.
-// Eligibility is not grant authority: no renewal route is exposed, even to the
-// configured Telegram administrator. Future grants need a separate trusted policy.
+// newMiniAppHandler binds application policies once at startup. Purchase intents
+// grant no access: no renewal or payment-confirmation route is exposed, even to
+// the configured Telegram administrator.
 func newMiniAppHandler(cfg *config.Config, subscriptions *service.SubscriptionService) http.Handler {
 	var token string
 	if cfg != nil {
@@ -36,7 +36,11 @@ func newMiniAppHandler(cfg *config.Config, subscriptions *service.SubscriptionSe
 	}
 	validator := telegramauth.New(token)
 	management := service.NewSubscriptionManagement(subscriptions, authorizeMiniApp)
+	purchases := service.NewPurchaseService(subscriptions, authorizeMiniAppPurchase)
 	return miniAppAuthentication(validator, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveMiniAppPurchase(w, r, purchases) {
+			return
+		}
 		if r.URL.Path != "/api/miniapp/subscription" {
 			writeMiniAppError(w, http.StatusNotFound, "not_found")
 			return

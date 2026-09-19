@@ -61,9 +61,11 @@ func (s *Service) FindPendingPaymentOrder(ctx context.Context, subscriptionID, p
 		return nil, fmt.Errorf("find pending payment order: %w", result.Error)
 	}
 
-	if order.PaymentExpiresAt != nil && !now.Before(*order.PaymentExpiresAt) {
+	// As in FindOrCreatePendingPaymentOrder, an uncertain provider request
+	// requires reconciliation; the link deadline alone cannot release it.
+	if !order.PaymentCreationUncertain && order.PaymentExpiresAt != nil && !now.Before(*order.PaymentExpiresAt) {
 		result := s.db.WithContext(ctx).Model(&Order{}).
-			Where("id = ? AND status = ?", order.ID, OrderStatusPending).
+			Where("id = ? AND status = ? AND payment_creation_uncertain = ?", order.ID, OrderStatusPending, false).
 			Update("status", OrderStatusExpired)
 		if result.Error != nil {
 			return nil, fmt.Errorf("expire payment order: %w", result.Error)

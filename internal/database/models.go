@@ -192,6 +192,9 @@ type PlanNode struct {
 
 // Product represents a purchasable subscription product bound to a plan.
 type Product struct {
+	// OfferID is an opaque public reference, not a credential or database ID.
+	OfferID      string     `gorm:"column:offer_id"`
+	OfferEndsAt  *time.Time `gorm:"column:offer_ends_at"`
 	ID           uint      `gorm:"primaryKey;column:id"`
 	PlanID       uint      `gorm:"not null;column:plan_id"`
 	Name         string    `gorm:"size:255;not null;column:name"`
@@ -237,6 +240,12 @@ const (
 )
 
 type Order struct {
+	// Purchase fields are nullable for historical/provider-created orders.
+	// PurchaseExpiresAt is the intent deadline, never entitlement ExpiresAt.
+	PurchaseID        *string    `gorm:"column:purchase_id"`
+	BuyerTelegramID   *int64     `gorm:"column:buyer_telegram_id"`
+	PurchaseKey       *string    `gorm:"column:purchase_key"`
+	PurchaseExpiresAt *time.Time `gorm:"column:purchase_expires_at"`
 	ID                       uint        `gorm:"primaryKey;column:id"`
 	SubscriptionID           uint        `gorm:"not null;column:subscription_id"`
 	ProductID                uint        `gorm:"not null;column:product_id"`
