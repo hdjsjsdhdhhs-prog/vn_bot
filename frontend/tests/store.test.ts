@@ -3,7 +3,7 @@ import { Api, ApiError } from '../src/api';
 import type { Order } from '../src/api';
 import { Store } from '../src/store';
 import type { InvoiceResult } from '../src/telegram';
-import { offer, order, subscription, telegram } from './fixtures';
+import { json, offer, order, subscription, telegram } from './fixtures';
 
 const stores: Store[] = [];
 function setup() {
@@ -22,6 +22,69 @@ beforeEach(() => { sessionStorage.clear(); vi.useFakeTimers(); });
 afterEach(() => { stores.splice(0).forEach(store => store.dispose()); vi.useRealTimers(); });
 
 describe('purchase orchestration', () => {
+  it('retains the real API idempotency key after a malformed create response', async () => {
+    const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(json({}, 201)).mockResolvedValueOnce(json(order));
+    const store = new Store(new Api('signed', transport), telegram(), sessionStorage); stores.push(store);
+    expect(await store.buy(offer)).toBeNull();
+    expect(store.error).toMatchObject({ code: 'invalid_response' });
+    expect(store.order).toBeNull();
+    const saved = sessionStorage.getItem('miniapp-intent');
+    expect(saved).not.toBeNull();
+    await store.buy(offer);
+    expect(transport).toHaveBeenCalledTimes(2);
+    expect(transport.mock.calls[1][1]?.headers).toEqual(transport.mock.calls[0][1]?.headers);
+    expect(store.order).toEqual(order);
+    expect(sessionStorage.getItem('miniapp-intent')).toBeNull();
+  });
+  it.each([false, true])('late creation recovers in history without replacing selection (other order: %s)', async selectOther => {
+    const { api, store } = setup();
+    let resolve!: (value: Order) => void;
+    vi.mocked(api.create).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    const buying = store.buy(offer);
+    store.leaveOrder();
+    const other = { ...order, order_id: 'c'.repeat(32), offer_id: 'd'.repeat(32) };
+    if (selectOther) {
+      vi.mocked(api.order).mockResolvedValue(other);
+      await store.selectOrder(other.order_id);
+    }
+    resolve(order);
+    expect(await buying).toBeNull();
+    expect(store.order).toEqual(selectOther ? other : null);
+    expect(store.recent.data).toContainEqual(order);
+    expect(store.busy).toBe(false);
+    expect(sessionStorage.getItem('miniapp-intent')).toBeNull();
+  });
+  it.each(['pending', 'paid'] as const)('late create cannot overwrite a newer %s checkout state for the same order', async status => {
+    const { api, store } = setup();
+    let resolve!: (value: Order) => void;
+    vi.mocked(api.create).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    const buying = store.buy(offer);
+    store.leaveOrder();
+    const newer = { ...order, status, checkout_started: true };
+    vi.mocked(api.order).mockResolvedValue(newer);
+    await store.selectOrder(order.order_id);
+    resolve(order);
+    expect(await buying).toBeNull();
+    expect(store.order).toEqual(newer);
+    expect(store.recent.data).toEqual([newer]);
+    expect(store.busy).toBe(false);
+    expect(sessionStorage.getItem('miniapp-intent')).toBeNull();
+  });
+  it('a late 401 from an abandoned order still clears the session and notifies the UI', async () => {
+    const { api, store } = setup();
+    await store.refresh();
+    let reject!: (reason: unknown) => void;
+    vi.mocked(api.order).mockReturnValueOnce(new Promise((_done, fail) => { reject = fail; }));
+    const checking = store.selectOrder(order.order_id);
+    store.leaveOrder();
+    const rendered = vi.fn(); store.subscribe(rendered);
+    reject(new ApiError('unauthorized', 401));
+    await checking;
+    expect(store.unauthorized).toBe(true);
+    expect(store.subscription.data).toBeNull();
+    expect(store.recent.data).toEqual([]);
+    expect(rendered).toHaveBeenCalled();
+  });
   it('ignores older subscription/recent refreshes that finish after settlement', async () => {
     const { api, store } = setup();
     let resolveSubscription!: (value: typeof subscription) => void;

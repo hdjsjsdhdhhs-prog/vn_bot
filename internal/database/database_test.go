@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -57,21 +58,33 @@ func TestSubscription_IsExpired(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		expiryTime *time.Time
-		want       bool
+		name      string
+		offset    time.Duration
+		perpetual bool
+		want      bool
 	}{
-		{"expired", ptrTime(time.Now().Add(-1 * time.Hour)), true},
-		{"active", ptrTime(time.Now().Add(1 * time.Hour)), false},
-		{"expires now", ptrTime(time.Now()), true},
-		{"expires in future", ptrTime(time.Now().Add(24 * time.Hour)), false},
-		{"nil expiry time (no expiry set)", nil, false},
+		{"expired", -time.Hour, false, true},
+		{"active", time.Hour, false, false},
+		{"expires now", 0, false, true},
+		{"expires in future", 24 * time.Hour, false, false},
+		{"nil expiry time (no expiry set)", 0, true, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sub := &Subscription{ExpiresAt: tt.expiryTime}
-			assert.Equal(t, tt.want, sub.IsExpired())
+			synctest.Test(t, func(t *testing.T) {
+				sub := &Subscription{}
+				if !tt.perpetual {
+					sub.ExpiresAt = ptrTime(time.Now().Add(tt.offset))
+				}
+				// IsExpired uses strict After. Check equality, then advance a
+				// controlled clock without relying on Windows clock resolution.
+				if tt.offset == 0 && !tt.perpetual {
+					assert.False(t, sub.IsExpired())
+				}
+				time.Sleep(time.Nanosecond)
+				assert.Equal(t, tt.want, sub.IsExpired())
+			})
 		})
 	}
 }

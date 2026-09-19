@@ -208,6 +208,38 @@ test('loading subscription shows a status until the backend responds', async ({ 
   await expect(page.getByRole('heading', { name: 'Ваш личный доступ' })).toBeVisible();
 });
 
+test('malformed successful catalog response shows an error and can recover', async ({ page }) => {
+  await fixture(page);
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.route('**/api/miniapp/offers', route => route.fulfill({ json: { offers: null } }));
+  await page.goto('/miniapp/#catalog');
+  await expect(page.getByRole('alert')).toContainText('Не удалось прочитать ответ сервера');
+  await page.unroute('**/api/miniapp/offers');
+  await page.getByRole('button', { name: 'Попробовать снова' }).click();
+  await expect(page.getByRole('link', { name: /Месяц свободы/ })).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test('late purchase creation does not pull the user back from another screen', async ({ page }) => {
+  await fixture(page);
+  let release!: () => void;
+  const ready = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/miniapp/orders', async route => {
+    await ready;
+    await route.fulfill({ status: 201, json: baseOrder });
+  });
+  await page.goto(`/miniapp/#product/${offer.offer_id}`);
+  await page.getByRole('button', { name: 'Перейти к покупке' }).click();
+  await page.getByRole('link', { name: 'Профиль', exact: true }).click();
+  release();
+  await expect(page.getByRole('link', { name: /Месяц свободы/ })).toBeVisible();
+  await expect(page).toHaveURL(/#profile$/);
+  // The committed order stays recoverable, even though navigation was abandoned.
+  await page.getByRole('link', { name: /Месяц свободы/ }).click();
+  await expect(page.getByRole('button', { name: 'Оплатить 150 ★' })).toBeEnabled();
+});
+
 test('responsive layout at narrow and wide sizes', async ({ page }) => {
   await fixture(page); await page.goto('/miniapp/');
   for (const width of [320, 390, 768]) {

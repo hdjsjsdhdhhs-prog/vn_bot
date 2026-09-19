@@ -69,8 +69,13 @@ npm --prefix frontend test
 npm --prefix frontend run build
 ```
 
-Production output is embedded from `internal/web/miniapp_dist/`. Build frontend
-before Go; Docker has a separate Node build stage. Configure the bot's Mini App
+Vite uses base `/miniapp/` and writes production HTML and hashed assets to
+`internal/web/miniapp_dist/public/` (ignored by Git). Build frontend before Go:
+`//go:embed miniapp_dist` in `internal/web/miniapp_ui.go` includes that output;
+`fs.Sub(..., "miniapp_dist/public")` and the `/miniapp/` route serve it. Docker
+builds frontend in its Node stage and copies `/internal/web/miniapp_dist/` into
+`/app/internal/web/miniapp_dist/` before compiling Go. The runtime image needs
+neither Node nor a separate static-assets volume. Configure the bot's Mini App
 URL as `https://<existing-web-origin>/miniapp/` via BotFather. Same HTTPS origin
 must serve /api/miniapp/. No server/DNS settings are changed by this work.
 The existing Stars backend requires active XTR offers and wired Telegram services.
@@ -121,14 +126,15 @@ existing connection page's QR against the returned subscription URL.
 - A full `go test ./... -count=1` was attempted and **failed** outside the Mini
   App scope: open-file rename/cleanup failures on Windows, stale migration
   expectations (41 vs current 43), older token fixtures, and an `expires_now`
-  timing assertion. The full regression is not green; focused passing tests
-  must not be reported as a complete regression pass.
+  timing assertion. That checkpoint's full regression was not green; the
+  continuation below records the fixes and fresh full runs, not a partial-pass
+  substitute.
 - Docker initially had no running daemon; a subsequent build hit a temporary
   `storage.googleapis.com` DNS timeout. Retrying the unchanged Dockerfile
   completed successfully, including frontend build, Linux Go/CGO compilation,
   UPX and final image export. No DNS settings were changed.
 
-### Observed automated verification (2026-09-19)
+### Historical checkpoint verification (2026-09-19, before recovery from 4c312b6)
 
 - `npm install`, lint, typecheck, production build: passed; package manifests and
   lockfile unchanged. Vitest: **47 passed**. Playwright Chromium: **15 passed**.
@@ -143,15 +149,92 @@ existing connection page's QR against the returned subscription URL.
 - Full Windows regression: **FAILED**, as detailed above. Not replaced by a
   claim that the narrower Linux run is a full regression.
 
+## Continuation after 4c312b6 (2026-09-19)
+
+Implementation is complete for the local Mini App scope; live release acceptance
+is not complete. At the pre-commit verification review, the changes were
+uncommitted on `feature/miniapp-ui` with HEAD `4c312b6`. This continuation
+supersedes the earlier 47/15 counts and full Windows failure above; those remain
+historical, not current release blockers.
+
+- Runtime API shape validation rejects malformed successful responses before
+  publishing them. Ambiguous create responses retain the idempotency key.
+- Late order creation remains recoverable without forcing navigation or
+  overwriting a newer checkout/paid snapshot. An abandoned request's 401 still
+  clears the session and notifies the UI. Regression tests cover these cases.
+- Migration tests pin schema **43**, use **44** for the future-schema rejection,
+  supply valid tokens for unrelated constraint tests, and roll back explicitly
+  to **40** when testing removal of token migration 041. Production migration SQL
+  is unchanged after the checkpoint.
+- Backup syncs and closes the temporary file before rename; failure cleanup
+  closes before removal. A rename-failure regression verifies cleanup and
+  preservation of the source/destination. The POSIX **0600** assertion remains
+  on Linux; Windows checks its exposed **0666** permission bits, not POSIX ACLs.
+- The test database helper closes SQLite before TempDir cleanup (including
+  aborted tests). The expiry boundary test uses Go 1.25's controlled clock to
+  check strict equality and the subsequent nanosecond without a timing race.
+- Server initData verification, buyer/current-owner filtering, immutable payment
+  terms and server-only Stars settlement remain intact. SDK callbacks merely
+  trigger a server read; no frontend payment-confirmation authority was added.
+
+### AUTOMATED verification
+
+Historical results below are from the preceding session supplied in the
+handoff, not new full runs in this documentation review. Full regressions and
+Docker build were not repeated: no implementation changed during this review.
+
+| Check | Status | Evidence / scope |
+| --- | --- | --- |
+| npm install, lint, typecheck, production build | PASS — historical | Reported successful in the continuation handoff; not rerun here. |
+| Frontend tests | PASS — historical | **73 Vitest** reported in the handoff; not rerun here. |
+| Browser tests | PASS — historical | **17 Playwright Chromium** reported in the handoff; retained `.last-run.json` says `passed` with no failures and postdates frontend changes. That artifact alone does not record the test count. |
+| Windows full regression | PASS — historical | Full `go test ./...` reported in the handoff. Not rerun or independently reverified as a full suite in this review. |
+| Linux full regression | PASS — historical, retained evidence inspected | `rs8-miniapp-linux-full-verification`: `go test -p 1 ./... -count=1`, exit **0**, all package results `ok`; finished 2026-09-19 21:07:42 UTC. |
+| Docker production build | PASS — historical, artifacts inspected | Existing `rs8-miniapp-verification:latest` image `46b53c3a97b5`; its `/app/rs8kvn_bot` SHA-256 matches builder image `7e3c924bef77`. No rebuild or deployed-service test claimed. |
+| Embedded `/miniapp/` | PASS — fresh focused check | `tests\run-stars-tests.cmd ./internal/web -run "^TestMiniAppUI_EmbeddedProductionAssets$" -count=1 -v` exited **0**. Tests embedded HTML, hashed JS/CSS, HEAD, cache/CSP headers and rejection of nonpublic paths through the security middleware. |
+
+To bind retained Linux evidence to this worktree, 297 Go/frontend/module/build
+asset files were compared with the builder image: **296 matched byte-for-byte**;
+`go.mod` matched after CRLF/LF normalization (Docker runs `go mod tidy`). No
+substantive difference was found. Builder and production binary SHA-256:
+`301f3d548bbd45f6e300f44c4ae7102dc7c4b0b90f292ef5db8c4f765b28d8cf`.
+This is artifact consistency evidence, not a new full test/build execution.
+
+### LIVE verification
+
+**LIVE DEPLOYED: BLOCKED — public HTTPS URL not available in current local configuration.**
+
+The reviewed nonsecret Docker Compose files expose only local service settings;
+README, installation/operations/Stars/UI documentation supplies no configured
+public Mini App endpoint, only examples/placeholders. Secret environment files,
+credentials and live initData were not opened. No live HTTP or payment request
+was made and no production service was started during this review.
+
+| Acceptance check | Status |
+| --- | --- |
+| Deployed production `/miniapp/` smoke | BLOCKED — needs operator-supplied public HTTPS URL |
+| Native Telegram WebView / Telegram Web | UNVERIFIED |
+| Real Stars payment | UNVERIFIED |
+| Real VPN import and connection | UNVERIFIED |
+
+Local browser simulation and signed-auth tests against a local Bot API fixture
+are automated coverage, **not real Telegram acceptance**.
+
 ### Release acceptance still required
 
-1. Smoke-test `/miniapp/` and its hashed assets in the deployed production
-   service. The image has been built, but the live service was not started.
-2. Resolve the unrelated full-regression failures or record an explicit release
-   decision; do not disable assertions to get a green run.
-3. Open from the configured Telegram bot in native mobile and Telegram Web.
-   Check safe areas, Back, invoice cancellation, then an operator-authorized real
-   Stars payment. Closing and reopening must recover the same server order.
-4. Verify that official payment settlement produces the subscription, that
-   provisioning finishes, and that the connection URL/QR imports into a real VPN
-   client. Until then, live payment and connection are **UNVERIFIED**.
+1. Obtain the actual public HTTPS Mini App URL. Verify deployed `/miniapp/` and
+   its referenced hashed assets, content types and scoped security headers;
+   an unauthenticated `/api/miniapp/subscription` request must return 401.
+2. Open from the configured Telegram bot in native mobile and Telegram Web.
+   Check safe areas, Back, loading/error states and invoice cancellation.
+3. With explicit operator authorization, make a real Stars payment. Closing and
+   reopening must recover the same order; confirm the backend reports `paid`,
+   without treating the SDK callback as payment proof.
+4. Verify the resulting subscription and completed provisioning, then import the
+   connection URL/QR into a real VPN client and establish a connection. Record
+   the observed result without publishing credentials or subscription URLs.
+
+The existing untracked `.serena/memories/miniapp-ui.md` is local session state,
+not a production change; do not stage it. Generated frontend assets/test reports
+remain ignored. No commit or push was made during that pre-commit verification
+review; Git history records the subsequent milestone commit.

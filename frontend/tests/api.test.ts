@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Api } from '../src/api';
-import { json, offer, order } from './fixtures';
+import { json, offer, order, subscription } from './fixtures';
 
 afterEach(() => vi.useRealTimers());
 describe('existing API boundary', () => {
@@ -44,6 +44,42 @@ describe('existing API boundary', () => {
     const transport = vi.fn<typeof fetch>().mockRejectedValue(new TypeError('private network diagnostic'));
     await expect(new Api('signed', transport).create(offer.offer_id, 'key')).rejects.toMatchObject({ code: 'network' });
     expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['offers', {}], ['offers', { offers: null }], ['offers', { offers: [null] }],
+    ['offers', { offers: [{ ...offer, amount_cents: '150' }] }],
+    ['offers', { offers: [{ ...offer, duration_days: 1.5 }] }],
+    ['offers', { offers: [{ ...offer, amount_cents: Number.MAX_SAFE_INTEGER + 1 }] }],
+    ['offers', { offers: [{ ...offer, available_until: 'invalid' }] }],
+    ['recent', { orders: {} }], ['recent', { orders: [null] }],
+    ['order', { ...order, order_id: 'invalid' }], ['order', { ...order, status: 'unknown' }],
+    ['order', { ...order, checkout_started: undefined }], ['order', { ...order, created_at: 'invalid' }],
+    ['create', {}], ['subscription', []], ['subscription', { ...subscription, connection_url: null }],
+    ['subscription', { ...subscription, expires_at: 'invalid' }],
+    ['subscription', { ...subscription, status: 'unknown' }], ['invoice', { invoice_url: null }],
+  ])('rejects malformed %s responses before publishing them', async (endpoint, body) => {
+    const api = new Api('signed', vi.fn<typeof fetch>().mockResolvedValue(json(body)));
+    const calls: Record<string, () => Promise<unknown>> = {
+      offers: () => api.offers(), recent: () => api.recent(), subscription: () => api.subscription(),
+      order: () => api.order(order.order_id), create: () => api.create(offer.offer_id, 'key'),
+      invoice: () => api.invoice(order.order_id),
+    };
+    await expect(calls[endpoint as string]()).rejects.toMatchObject({ code: 'invalid_response', status: 0 });
+  });
+  it('accepts empty lists, nullable dates and additional server fields', async () => {
+    const transport = vi.fn<typeof fetch>();
+    const api = new Api('signed', transport);
+    transport.mockResolvedValue(json({ offers: [] }));
+    await expect(api.offers()).resolves.toEqual({ offers: [] });
+    transport.mockResolvedValue(json({ orders: [] }));
+    await expect(api.recent()).resolves.toEqual({ orders: [] });
+    const sub = { ...subscription, expires_at: null, renewal: { allowed: true } };
+    transport.mockResolvedValue(json(sub));
+    await expect(api.subscription()).resolves.toEqual(sub);
+    transport.mockResolvedValue(json({ orders: [{ ...order, expires_at: null }] }));
+    await expect(api.recent()).resolves.toMatchObject({ orders: [{ order_id: order.order_id, expires_at: null }] });
+    transport.mockResolvedValue(json({ offers: [{ ...offer, available_until: order.expires_at }] }));
+    await expect(api.offers()).resolves.toMatchObject({ offers: [{ offer_id: offer.offer_id }] });
   });
   it('bounds slow requests and handles invalid JSON', async () => {
     vi.useFakeTimers();

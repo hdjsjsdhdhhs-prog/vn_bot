@@ -55,7 +55,8 @@ func TestMigration041BackfillsUniqueSubscriptionTokens(t *testing.T) {
 	m, err := newMigration(db, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _, _ = m.Close() })
-	require.NoError(t, m.Steps(-1))
+	// Roll back token migration 041, not just the latest (now Stars) migration.
+	require.NoError(t, m.Migrate(40))
 
 	var subscriptionCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM subscriptions`).Scan(&subscriptionCount))

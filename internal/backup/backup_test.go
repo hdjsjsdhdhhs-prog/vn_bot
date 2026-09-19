@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -44,7 +45,13 @@ func TestBackupDatabase(t *testing.T) {
 	backupPath := dbPath + ".backup"
 	fi, err := os.Stat(backupPath)
 	require.NoError(t, err, "Backup file was not created")
-	assert.Equal(t, os.FileMode(0o600), fi.Mode().Perm(), "backup file mode should be 0600")
+	if runtime.GOOS == "windows" {
+		// Go exposes only Windows' read-only attribute as permission bits.
+		// Chmod(0600) yields 0666 here; ACL security is not a POSIX mode check.
+		assert.Equal(t, os.FileMode(0o666), fi.Mode().Perm())
+	} else {
+		assert.Equal(t, os.FileMode(0o600), fi.Mode().Perm(), "backup file mode should be 0600")
+	}
 
 	// Check backup content matches original
 	backupContent, err := os.ReadFile(backupPath)

@@ -15,12 +15,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Pin the complete Mini App/Purchase/Stars schema; future-schema fixtures must
+// remain strictly newer than this version.
+const expectedLatestMigrationVersion = 43
+
 func TestLatestEmbeddedMigrationVersion(t *testing.T) {
 	t.Parallel()
 
 	version, err := latestEmbeddedMigrationVersion()
 	require.NoError(t, err)
-	assert.Equal(t, 41, version)
+	assert.Equal(t, expectedLatestMigrationVersion, version)
 }
 
 func TestRunMigrationsRejectsDatabaseNewerThanEmbedded(t *testing.T) {
@@ -33,19 +37,19 @@ func TestRunMigrationsRejectsDatabaseNewerThanEmbedded(t *testing.T) {
 
 	sqlDB, err := db.db.DB()
 	require.NoError(t, err)
-	_, err = sqlDB.Exec("UPDATE schema_migrations SET version = ?, dirty = ?", 42, false)
+	_, err = sqlDB.Exec("UPDATE schema_migrations SET version = ?, dirty = ?", expectedLatestMigrationVersion+1, false)
 	require.NoError(t, err)
 
 	err = runMigrations(sqlDB)
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "newer than the latest embedded migration 41")
+	assert.ErrorContains(t, err, fmt.Sprintf("newer than the latest embedded migration %d", expectedLatestMigrationVersion))
 
 	var (
 		version int
 		dirty   bool
 	)
 	require.NoError(t, sqlDB.QueryRow("SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty))
-	assert.Equal(t, 42, version)
+	assert.Equal(t, expectedLatestMigrationVersion+1, version)
 	assert.False(t, dirty)
 }
 
@@ -62,7 +66,7 @@ func TestRunMigrationsCollapsesLegacyBroadcastMigration37(t *testing.T) {
 	require.NoError(t, runMigrations(sqlDB))
 	version, dirty, err := migrationState(sqlDB)
 	require.NoError(t, err)
-	assert.Equal(t, uint(41), version)
+	assert.Equal(t, uint(expectedLatestMigrationVersion), version)
 	assert.False(t, dirty)
 }
 
@@ -142,7 +146,7 @@ func TestRunMigrationsRepairsMetadataOnlyAfterCompleteNoTxMigration(t *testing.T
 		dirty   bool
 	)
 	require.NoError(t, sqlDB.QueryRow("SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty))
-	assert.Equal(t, 41, version)
+	assert.Equal(t, expectedLatestMigrationVersion, version)
 	assert.False(t, dirty)
 }
 
@@ -494,8 +498,8 @@ func TestMigration_032_EnforcesRetryInvariant(t *testing.T) {
 
 	// FK enforcement is enabled on the pool (DSN _foreign_keys=on), so the
 	// subscription_nodes rows below need real parent rows.
-	_, err = sqlDB.Exec(`INSERT INTO subscriptions (telegram_id, username, client_id, subscription_id, status)
-		VALUES (1, 'parent-sub', 'client-parent', 'sub-parent', 'active')`)
+	_, err = sqlDB.Exec(`INSERT INTO subscriptions (telegram_id, username, client_id, subscription_id, status, token)
+		VALUES (1, 'parent-sub', 'client-parent', 'sub-parent', 'active', lower(hex(randomblob(32))))`)
 	require.NoError(t, err)
 	_, err = sqlDB.Exec(`INSERT INTO nodes (name, subscription_url) VALUES ('node-1', 'http://node-1')`)
 	require.NoError(t, err)
@@ -615,20 +619,22 @@ func TestMigration_033_EnforcesSubscriptionStatusCheck(t *testing.T) {
 	sqlDB, err := db.db.DB()
 	require.NoError(t, err)
 
+	// Supply valid tokens so the current schema exercises the status constraint,
+	// not the independent token-required trigger added by migration 041.
 	// Violating insert: an arbitrary status string must be rejected.
-	_, err = sqlDB.Exec(`INSERT INTO subscriptions (telegram_id, username, client_id, subscription_id, status)
-		VALUES (888001, 'bogus-user', 'client-bogus', 'sub-bogus', 'bogus')`)
+	_, err = sqlDB.Exec(`INSERT INTO subscriptions (telegram_id, username, client_id, subscription_id, status, token)
+		VALUES (888001, 'bogus-user', 'client-bogus', 'sub-bogus', 'bogus', lower(hex(randomblob(32))))`)
 	require.Error(t, err, "insert with an unknown status must fail")
 	assert.ErrorContains(t, err, "CHECK")
 
 	// Compliant insert: 'revoked' is a declared status and must succeed.
-	_, err = sqlDB.Exec(`INSERT INTO subscriptions (telegram_id, username, client_id, subscription_id, status)
-		VALUES (888002, 'revoked-user', 'client-revoked', 'sub-revoked', 'revoked')`)
+	_, err = sqlDB.Exec(`INSERT INTO subscriptions (telegram_id, username, client_id, subscription_id, status, token)
+		VALUES (888002, 'revoked-user', 'client-revoked', 'sub-revoked', 'revoked', lower(hex(randomblob(32))))`)
 	require.NoError(t, err)
 
 	// Compliant insert: the 'active' default must succeed.
-	_, err = sqlDB.Exec(`INSERT INTO subscriptions (telegram_id, username, client_id, subscription_id)
-		VALUES (888003, 'default-user', 'client-default', 'sub-default')`)
+	_, err = sqlDB.Exec(`INSERT INTO subscriptions (telegram_id, username, client_id, subscription_id, token)
+		VALUES (888003, 'default-user', 'client-default', 'sub-default', lower(hex(randomblob(32))))`)
 	require.NoError(t, err)
 }
 

@@ -46,6 +46,8 @@ export class Store {
       this.offers.data = [];
       this.recent.data = [];
       this.order = null;
+      this.checkingID = undefined;
+      this.checking = false;
       clearTimeout(this.timer);
     }
   }
@@ -78,12 +80,12 @@ export class Store {
       ]);
     } finally { this.refreshing = false; }
   }
-  private remember(order: Order) {
+  private remember(order: Order, select = true) {
     if (this.intent?.offer === order.offer_id) {
       this.intent = undefined;
       try { this.storage?.removeItem('miniapp-intent'); } catch { /* Optional storage. */ }
     }
-    this.order = order;
+    if (select) this.order = order;
     // An older history read must not overwrite this newer authoritative order.
     this.resourceRequests.delete(this.recent);
     this.recent.loading = false;
@@ -91,7 +93,8 @@ export class Store {
     this.recent.data = [order, ...this.recent.data.filter(item => item.order_id !== order.order_id)].slice(0, 20);
   }
   async buy(offer: Offer): Promise<Order | null> {
-    if (this.busy || this.unauthorized || offer.currency !== 'XTR') return null;
+    if (this.busy || this.unauthorized || this.stopped || offer.currency !== 'XTR') return null;
+    const generation = this.generation;
     this.busy = true; this.error = undefined; this.emit();
     try {
       // Preserve key after an ambiguous transport error. No automatic POST retry.
@@ -104,8 +107,15 @@ export class Store {
       if (this.unauthorized || this.stopped) return null;
       this.intent = undefined;
       try { this.storage?.removeItem('miniapp-intent'); } catch { /* Optional storage. */ }
-      this.remember(order);
-      return order;
+      // The POST may have committed after the user left. Keep it recoverable,
+      // but do not replace another selection or trigger abandoned navigation.
+      const current = generation === this.generation;
+      // Once another screen has read this order, its snapshot supersedes the
+      // abandoned POST response (including checkout reservation or settlement).
+      if (current || !this.recent.data.some(item => item.order_id === order.order_id)) {
+        this.remember(order, current);
+      }
+      return current ? order : null;
     } catch (error) {
       // A definitive rejection did not create an order; allow a fresh selection.
       if (error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status)) {
@@ -148,14 +158,16 @@ export class Store {
         await this.load(this.subscription, () => this.api.subscription());
         await this.load(this.offers, async () => (await this.api.offers()).offers);
       }
-    } catch (error) { if (generation === this.generation) this.fail(error); }
-    finally {
+    } catch (error) {
+      // Authentication expiry is session-wide, even for an abandoned screen.
+      if (generation === this.generation || (error instanceof ApiError && error.status === 401)) this.fail(error);
+    } finally {
       if (generation === this.generation && this.checkingID === id) {
         this.checkingID = undefined;
         this.checking = false;
-        this.emit();
         this.schedule();
       }
+      this.emit();
     }
   }
   private schedule() {

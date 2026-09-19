@@ -169,12 +169,21 @@ func BackupDatabase(ctx context.Context, dbPath string) error {
 	}
 
 	tempPath := dst.Name()
+	closed, published := false, false
 	defer func() {
-		closeErr := dst.Close()
-		if closeErr != nil {
-			logger.Error("Failed to close backup file",
-				zap.String("path", tempPath),
-				zap.Error(closeErr))
+		if !closed {
+			if closeErr := dst.Close(); closeErr != nil {
+				logger.Error("Failed to close backup file",
+					zap.String("path", tempPath),
+					zap.Error(closeErr))
+			}
+		}
+		// Windows cannot remove an open file. Clean up only after closing it,
+		// and never remove a successfully published backup.
+		if !published {
+			if removeErr := os.Remove(tempPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				logger.Warn("Failed to remove temporary backup", zap.Error(removeErr))
+			}
 		}
 	}()
 
@@ -184,7 +193,6 @@ func BackupDatabase(ctx context.Context, dbPath string) error {
 	for {
 		select {
 		case <-ctx.Done():
-			_ = os.Remove(tempPath)
 			return ctx.Err()
 		default:
 		}
@@ -193,7 +201,6 @@ func BackupDatabase(ctx context.Context, dbPath string) error {
 		if n > 0 {
 			_, writeErr := dst.Write(buf[:n])
 			if writeErr != nil {
-				_ = os.Remove(tempPath)
 				return fmt.Errorf("failed to write to backup: %w", writeErr)
 			}
 		}
@@ -203,24 +210,26 @@ func BackupDatabase(ctx context.Context, dbPath string) error {
 		}
 
 		if err != nil {
-			_ = os.Remove(tempPath)
 			return fmt.Errorf("failed to read database: %w", err)
 		}
 	}
 
-	// Sync to ensure all data is written to disk
+	// Sync and close before publishing: Windows rejects renaming an open file.
 	err = dst.Sync()
 	if err != nil {
-		_ = os.Remove(tempPath)
 		return fmt.Errorf("failed to sync backup: %w", err)
 	}
+	err = dst.Close()
+	closed = true
+	if err != nil {
+		return fmt.Errorf("failed to close backup: %w", err)
+	}
 
-	// Atomic rename (defer will close files after this)
 	err = os.Rename(tempPath, backupPath)
 	if err != nil {
-		_ = os.Remove(tempPath)
 		return fmt.Errorf("failed to rename backup: %w", err)
 	}
+	published = true
 
 	// Ensure backup file has secure permissions (0600)
 	err = os.Chmod(backupPath, 0600)

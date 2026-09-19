@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,21 +52,21 @@ func InitLogger(t any) error {
 	return err
 }
 
-func NewTestDatabaseService(t any) (*database.Service, error) {
-	type testInterface interface {
-		TempDir() string
+func NewTestDatabaseService(t testing.TB) (*database.Service, error) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "test_service.db")
+	db, err := database.NewService(dbPath)
+	if err != nil {
+		return nil, err
 	}
-
-	var tmpDir string
-	if ti, ok := t.(testInterface); ok {
-		tmpDir = ti.TempDir()
-	} else {
-		tmpDir = "/tmp"
-	}
-
-	dbPath := filepath.Join(tmpDir, "test_service.db")
-
-	return database.NewService(dbPath)
+	// Cleanup is LIFO: close SQLite before TempDir removes its files, including
+	// when an assertion aborts the test. Windows cannot unlink an open database.
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close test database: %v", err)
+		}
+	})
+	return db, nil
 }
 
 func NewDatabaseService() *DatabaseService {
