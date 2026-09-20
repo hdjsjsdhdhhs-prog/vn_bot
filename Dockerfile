@@ -18,8 +18,7 @@ WORKDIR /app
 
 # Install build dependencies
 # - gcc, musl-dev: Required for CGO/SQLite
-# - upx: Binary compression (reduces size by ~30-40%)
-RUN apk add --no-cache gcc musl-dev upx
+RUN apk add --no-cache gcc musl-dev
 
 # Copy go mod files first for better caching
 COPY go.mod go.sum ./
@@ -43,10 +42,6 @@ RUN CGO_ENABLED=1 GOOS=linux go build \
         -X main.commit=${COMMIT_SHA} \
         -X main.buildTime=${BUILD_TIME}" \
     -o rs8kvn_bot ./cmd/bot
-
-# Compress binary with UPX (maximum compression)
-# Reduces binary size by ~30-40% with minimal startup overhead
-RUN upx -9 rs8kvn_bot
 
 # Runtime stage - minimal Alpine for production
 FROM alpine:3.21
