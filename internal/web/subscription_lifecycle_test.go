@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 )
 
@@ -30,7 +31,13 @@ import (
 func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)
 	previousLog := logger.Log
-	logger.Log = zap.New(core)
+	stopped := make(chan struct{})
+	logger.Log = zap.New(core, zap.Hooks(func(entry zapcore.Entry) error {
+		if entry.Message == "HTTP server stopped gracefully" {
+			close(stopped)
+		}
+		return nil
+	}))
 	t.Cleanup(func() { logger.Log = previousLog })
 	ctx := context.Background()
 	db, err := database.NewService(filepath.Join(t.TempDir(), "lifecycle.db"))
@@ -80,6 +87,13 @@ func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		require.NoError(t, srv.Stop(stopCtx))
+		// Shutdown waits for requests, not the Serve goroutine's final log.
+		// Synchronize that last global-logger read before restoring logger.Log.
+		select {
+		case <-stopped:
+		case <-stopCtx.Done():
+			t.Fatal("HTTP serve goroutine did not report shutdown")
+		}
 	})
 	base := "http://" + srv.Addr()
 	cfg.GlobalSubURL = base + "/sub/"
