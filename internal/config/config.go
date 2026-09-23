@@ -13,6 +13,10 @@ import (
 // Config holds all configuration for the application.
 // All fields are validated before use.
 type Config struct {
+	// Browser administrator credentials. Never include these in String/logs.
+	AdminUsername     string
+	AdminPasswordHash string
+
 	// Telegram configuration
 	TelegramBotToken string
 	TelegramAdminID  int64
@@ -61,6 +65,8 @@ type Config struct {
 
 // configFlags holds typed flag values for config fields.
 type configFlags struct {
+	adminUsername          *flag.StringValue
+	adminPasswordHash      *flag.StringValue
 	telegramBotToken       *flag.StringValue
 	telegramAdminID        *flag.Int64Value
 	databasePath           *flag.StringValue
@@ -91,6 +97,7 @@ type configFlags struct {
 func registerFlags() (*flag.Registry, *configFlags) {
 	r := flag.New()
 	f := &configFlags{
+		adminUsername: flag.NewString(""), adminPasswordHash: flag.NewString(""),
 		telegramBotToken: flag.NewString(""), telegramAdminID: flag.NewInt64(0),
 		databasePath: flag.NewString(DefaultDatabasePath), logFilePath: flag.NewString(DefaultLogFilePath),
 		logLevel: flag.NewString(DefaultLogLevel), heartbeatURL: flag.NewString(""),
@@ -102,6 +109,8 @@ func registerFlags() (*flag.Registry, *configFlags) {
 		globalSubURL: flag.NewString(""), subServerAccessLogPath: flag.NewString(""),
 		paymentEnabled: flag.NewBool(false), paymentProvider: flag.NewString("platega"), plategaMerchantID: flag.NewString(""), plategaSecret: flag.NewString(""),
 	}
+	r.Register("ADMIN_USERNAME", f.adminUsername)
+	r.Register("ADMIN_PASSWORD_HASH", f.adminPasswordHash)
 	r.Register("TELEGRAM_BOT_TOKEN", f.telegramBotToken)
 	r.Register("TELEGRAM_ADMIN_ID", f.telegramAdminID)
 	r.Register("GLOBAL_SUB_URL", f.globalSubURL)
@@ -140,6 +149,7 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
+		AdminUsername: f.adminUsername.Get(), AdminPasswordHash: f.adminPasswordHash.Get(),
 		TelegramBotToken: f.telegramBotToken.Get(), TelegramAdminID: f.telegramAdminID.Get(),
 		DatabasePath: f.databasePath.Get(), LogFilePath: f.logFilePath.Get(), LogLevel: f.logLevel.Get(),
 		HeartbeatURL: f.heartbeatURL.Get(), HeartbeatInterval: f.heartbeatInterval.Get(), SentryDSN: f.sentryDSN.Get(),
@@ -162,6 +172,9 @@ func Load() (*Config, error) {
 
 // validate checks that all configuration values are valid.
 func (c *Config) validate() error {
+	if _, _, err := c.AdminConfiguration(); err != nil {
+		return err
+	}
 	// Telegram validation
 	if c.TelegramBotToken == "" {
 		return fmt.Errorf("TELEGRAM_BOT_TOKEN is required")

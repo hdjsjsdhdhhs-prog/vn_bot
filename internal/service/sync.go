@@ -38,6 +38,17 @@ func syncIdentifier(sub *database.Subscription) string {
 	return XUIEmail(sub.Username, sub.TelegramID)
 }
 
+// subscriptionHasVPNAccess reports whether a status entitles the subscription
+// to VPN clients on its plan's nodes. `expired` is kept: the expiry worker
+// downgrades to free while status stays active, and renewal accepts it.
+func subscriptionHasVPNAccess(status string) bool {
+	switch database.SubscriptionStatus(status) {
+	case database.SubscriptionStatusPaused, database.SubscriptionStatusRevoked, database.SubscriptionStatusCanceled:
+		return false
+	}
+	return true
+}
+
 // NewSyncService creates a new SyncService.
 func NewSyncService(db interfaces.DatabaseService, vpnClients map[uint]vpn.Client, nodes []database.Node) *SyncService {
 	return &SyncService{
@@ -140,9 +151,16 @@ func (s *SyncService) reconcilePlanNodesLocked(ctx context.Context, subscription
 		return nil
 	}
 
-	targetNodes, err := s.db.GetNodesByPlanID(ctx, sub.PlanID)
-	if err != nil {
-		return fmt.Errorf("reconcile plan nodes: load plan nodes: %w", err)
+	var targetNodes []database.Node
+	// A paused/revoked/canceled subscription must not keep live VPN clients:
+	// its target set is empty, so every binding converges to pending_remove and
+	// the background worker cannot resurrect clients right after removing them.
+	// Admin Enable (paused → active) restores the plan's nodes on the next pass.
+	if subscriptionHasVPNAccess(sub.Status) {
+		targetNodes, err = s.db.GetNodesByPlanID(ctx, sub.PlanID)
+		if err != nil {
+			return fmt.Errorf("reconcile plan nodes: load plan nodes: %w", err)
+		}
 	}
 
 	currentNodes, err := s.db.GetBySubscriptionID(ctx, subscriptionID)

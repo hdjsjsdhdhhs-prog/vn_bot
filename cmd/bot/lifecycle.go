@@ -111,6 +111,7 @@ type appServices struct {
 	handler      *bot.Handler
 	orderService *service.OrderService
 	syncService  *service.SyncService
+	adminService *service.AdminService
 }
 
 // initServices wires the subscription service, subserver, bot handler,
@@ -137,8 +138,9 @@ func initServices(cfg *config.Config, dbService *database.Service, deps *runtime
 
 	orderService := service.NewOrderService(dbService, subService, syncSvc, payment, "", cfg)
 	handler.SetOrderService(orderService)
+	adminService := service.NewAdminService(dbService, subService, syncSvc)
 
-	return &appServices{subService: subService, subServer: subServer, handler: handler, orderService: orderService, syncService: syncSvc}
+	return &appServices{subService: subService, subServer: subServer, handler: handler, orderService: orderService, syncService: syncSvc, adminService: adminService}
 }
 
 // runEventLoop processes Telegram updates with bounded concurrency until

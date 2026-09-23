@@ -45,7 +45,7 @@ func TestPurchaseMigration042_LegacyOrderSavePreservesNulls(t *testing.T) {
 	require.NoError(t, runMigrations(sqlDB))
 	version, dirty, err := migrationState(sqlDB)
 	require.NoError(t, err)
-	require.Equal(t, uint(43), version)
+	require.Equal(t, uint(expectedLatestMigrationVersion), version)
 	require.False(t, dirty)
 
 	assertNulls := func(id uint) {

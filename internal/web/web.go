@@ -15,6 +15,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/kereal/rs8kvn_bot/internal/adminauth"
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
 	"github.com/kereal/rs8kvn_bot/internal/interfaces"
@@ -95,6 +97,7 @@ type Server struct {
 	subService         *service.SubscriptionService
 	orderService       *service.OrderService
 	starsService       *service.StarsPaymentService
+	adminService       *service.AdminService
 	paymentConfig      *PaymentConfig
 	subServer          *subserver.Service
 	subserverLogger    *subserver.AccessLogger
@@ -138,6 +141,15 @@ func (s *Server) SetOrderService(orderService *service.OrderService) {
 	defer s.mu.Unlock()
 
 	s.orderService = orderService
+}
+
+// SetAdminService wires the browser-admin JSON API under /admin/api. Without
+// it the (still session-protected) API answers 503. Set before Start.
+func (s *Server) SetAdminService(adminService *service.AdminService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.adminService = adminService
 }
 
 // SetPaymentConfig configures runtime payment settings used by the callback
@@ -210,7 +222,16 @@ func (s *Server) Addr() string {
 // background goroutine. The context is reserved for lifecycle coordination by
 // callers; use Stop to shut the server down gracefully.
 func (s *Server) Start(ctx context.Context) error {
+	admin, err := adminauth.New(s.cfg)
+	if err != nil {
+		return fmt.Errorf("initialize browser admin auth: %w", err)
+	}
 	mux := http.NewServeMux()
+	actor := ""
+	if s.cfg != nil {
+		actor = s.cfg.AdminUsername
+	}
+	adminHandler := admin.Routes(newAdminAPI(s.adminService, actor))
 
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
@@ -225,7 +246,20 @@ func (s *Server) Start(ctx context.Context) error {
 
 	mux.Handle("/metrics", promhttp.Handler())
 
-	instrumentedHandler := metrics.InstrumentHTTP(SecurityHeadersMiddleware(mux))
+	// Guard admin requests before ServeMux's automatic slash/dot redirects.
+	// Check both decoded raw and cleaned paths, but do not rewrite the request:
+	// noncanonical aliases are protected unknown routes, not login shortcuts.
+	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		isAdmin := func(p string) bool {
+			return p == "/admin" || strings.HasPrefix(p, "/admin/")
+		}
+		if isAdmin(r.URL.Path) || isAdmin(path.Clean(r.URL.Path)) {
+			adminHandler.ServeHTTP(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	instrumentedHandler := metrics.InstrumentHTTP(SecurityHeadersMiddleware(router))
 
 	s.server = &http.Server{
 		Addr:              s.addr,
