@@ -18,6 +18,7 @@ frontend/node_modules/
 frontend/test-results/
 frontend/playwright-report/
 internal/web/miniapp_dist/public/
+internal/web/admin_dist/public/
 
 # IDE
 .idea/

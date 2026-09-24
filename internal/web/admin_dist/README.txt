@@ -1,0 +1,1 @@
+Generated admin frontend assets belong here. Run npm --prefix frontend ci and npm --prefix frontend run build:admin before building Go. This placeholder lets backend-only tests compile; /admin-ui/ returns 503 if the admin frontend has not been built.

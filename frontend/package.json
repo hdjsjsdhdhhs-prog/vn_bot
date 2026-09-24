@@ -8,6 +8,7 @@
     "lint": "eslint . --max-warnings 0",
     "typecheck": "tsc --noEmit",
     "build": "vite build",
+    "build:admin": "vite build --mode admin",
     "test": "vitest run",
     "test:browser": "playwright test"
   },

@@ -1,10 +1,10 @@
-# Build the Mini App without adding Node to the production image.
+# Build the Mini App and admin UI without adding Node to the production image.
 FROM node:20-alpine AS frontend
 WORKDIR /ui
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
-RUN npm run lint && npm run typecheck && npm run build
+RUN npm run lint && npm run typecheck && npm run build && npm run build:admin
 
 # Build stage
 FROM golang:1.25-alpine AS builder
@@ -27,6 +27,7 @@ RUN go mod download
 # Copy source code
 COPY . .
 COPY --from=frontend /internal/web/miniapp_dist/ ./internal/web/miniapp_dist/
+COPY --from=frontend /internal/web/admin_dist/ ./internal/web/admin_dist/
 
 # Ensure go.mod is consistent with dependencies
 RUN go mod tidy

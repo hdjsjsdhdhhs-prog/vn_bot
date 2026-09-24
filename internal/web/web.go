@@ -239,6 +239,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/i/", s.handleInvite)
 	mux.Handle("/api/miniapp/", newMiniAppHandler(s.cfg, s.subService, s.starsPayments))
 	mux.Handle("/miniapp/", newMiniAppUIHandler())
+	mux.Handle("/admin-ui/", newAdminUIHandler())
 	mux.HandleFunc("/subscription-info/", s.handleSubscriptionInfo)
 	mux.HandleFunc("/connect/", s.handleConnectionPage)
 	mux.HandleFunc("/sub/", s.handleSubscription)
