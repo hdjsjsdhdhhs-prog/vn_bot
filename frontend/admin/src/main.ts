@@ -1,11 +1,11 @@
 import './style.css';
-import { AdminApi, ApiError, errorText, limits } from './api';
+import { AdminApi, ApiError, errorText, limits, type Dashboard } from './api';
 
 // ---------------------------------------------------------------------------
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
 // handful of glyphs does not add a runtime dependency. One family, one stroke.
 
-type IconName = 'overview' | 'users' | 'audit' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff';
+type IconName = 'overview' | 'users' | 'audit' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh';
 type Shape = readonly ['path' | 'circle' | 'rect', Readonly<Record<string, string>>];
 
 const ICONS: Record<IconName, readonly Shape[]> = {
@@ -42,6 +42,7 @@ const ICONS: Record<IconName, readonly Shape[]> = {
     ['path', { d: 'M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61' }],
     ['path', { d: 'm2 2 20 20' }],
   ],
+  refresh: [['path', { d: 'M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8' }], ['path', { d: 'M21 3v5h-5' }]],
 };
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -104,42 +105,212 @@ const byteLength = (value: string) => new TextEncoder().encode(value).length;
 const clock = (date: Date) => date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 
 // ---------------------------------------------------------------------------
-// Sections. Stage one renders the navigation and page frames only; the data
-// screens behind /admin/api/* arrive in later stages.
+// Sections. Overview reads /admin/api/dashboard; the other screens are still
+// page frames with a placeholder until their stages land.
 
 type SectionId = 'overview' | 'users' | 'audit';
 interface Section {
   id: SectionId;
   label: string;
   description: string;
-  emptyTitle: string;
-  emptyText: string;
+  placeholder?: { title: string; text: string };
 }
 
 const SECTIONS: readonly Section[] = [
   {
     id: 'overview', label: 'Обзор',
-    description: 'Ключевые показатели сервиса.',
-    emptyTitle: 'Сводка появится на следующем этапе',
-    emptyText: 'Здесь будут показатели по пользователям, подпискам и платежам.',
+    description: 'Подписки, пользователи и действия в панели по текущим данным сервиса.',
   },
   {
     id: 'users', label: 'Пользователи',
     description: 'Поиск клиентов и управление их подписками.',
-    emptyTitle: 'Список пользователей появится на следующем этапе',
-    emptyText: 'Здесь будет поиск по Telegram ID и имени, карточка клиента и действия с подпиской.',
+    placeholder: {
+      title: 'Список пользователей появится на следующем этапе',
+      text: 'Здесь будет поиск по Telegram ID и имени, карточка клиента и действия с подпиской.',
+    },
   },
   {
     id: 'audit', label: 'Журнал',
     description: 'История изменений, выполненных из панели.',
-    emptyTitle: 'Журнал появится на следующем этапе',
-    emptyText: 'Здесь будут записи о продлениях, отключениях и изменениях сроков подписок.',
+    placeholder: {
+      title: 'Журнал появится на следующем этапе',
+      text: 'Здесь будут записи о продлениях, отключениях и изменениях сроков подписок.',
+    },
   },
 ];
 
 function currentSection(): Section {
   const id = location.hash.replace(/^#\/?/, '');
   return SECTIONS.find(section => section.id === id) ?? SECTIONS[0];
+}
+
+// ---------------------------------------------------------------------------
+// Overview. Every figure is a counter from GET /admin/api/dashboard; shares
+// are derived from those counters only. The API has no time series, so the
+// only graphic is the status composition of the current snapshot.
+
+const numberFormat = new Intl.NumberFormat('ru-RU');
+const percentFormat = new Intl.NumberFormat('ru-RU', { style: 'percent', maximumFractionDigits: 0 });
+const formatCount = (value: number) => numberFormat.format(value);
+const clockSeconds = (date: Date) => date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+/** Share of the total; never rounds a non-zero part to 0 % or a partial one to 100 %. */
+function formatShare(part: number, total: number): string {
+  if (total <= 0) return percentFormat.format(0);
+  const ratio = part / total;
+  if (part > 0 && ratio < 0.005) return `< ${percentFormat.format(0.01)}`;
+  if (part < total && ratio > 0.995) return `> ${percentFormat.format(0.99)}`;
+  return percentFormat.format(ratio);
+}
+
+type StatusKey = 'active' | 'expired' | 'paused' | 'revoked' | 'canceled';
+// Labels match connectionStatusLabel in internal/web/web.go. Only "active"
+// carries the accent; the rest step down a single neutral ramp.
+const STATUS_ROWS: readonly { key: StatusKey; label: string }[] = [
+  { key: 'active', label: 'Активна' },
+  { key: 'expired', label: 'Истекла' },
+  { key: 'paused', label: 'Приостановлена' },
+  { key: 'revoked', label: 'Отозвана' },
+  { key: 'canceled', label: 'Отменена' },
+];
+
+function panelHead(id: string, title: string, meta?: string): HTMLElement {
+  const head = el('div', 'panel-head');
+  const heading = el('h2', 'panel-title', title);
+  heading.id = id;
+  head.append(heading);
+  if (meta) head.append(el('p', 'panel-meta', meta));
+  return head;
+}
+
+function kpiStrip(d: Dashboard): HTMLElement {
+  const items: readonly [label: string, value: number, meta: string][] = [
+    ['Подписки', d.total_subscriptions, 'Во всех статусах'],
+    ['Активные', d.active, `${formatShare(d.active, d.total_subscriptions)} от всех подписок`],
+    ['Пользователи', d.users, `Пробных без привязки: ${formatCount(d.trials)}`],
+    ['Платные', d.paid, `${formatShare(d.paid, d.total_subscriptions)} от всех подписок`],
+    ['Действия за 24 ч', d.audit_last_24h, 'Изменения из панели'],
+  ];
+  const strip = el('section', 'panel kpis');
+  strip.setAttribute('aria-label', 'Ключевые показатели');
+  const list = el('dl', 'kpi-grid');
+  for (const [label, value, meta] of items) {
+    const cell = el('div', 'kpi');
+    cell.append(el('dt', 'kpi-label', label), el('dd', 'kpi-value', formatCount(value)), el('dd', 'kpi-meta', meta));
+    list.append(cell);
+  }
+  strip.append(list);
+  return strip;
+}
+
+function statusPanel(d: Dashboard): HTMLElement {
+  const total = d.total_subscriptions;
+  const panel = el('section', 'panel');
+  panel.setAttribute('aria-labelledby', 'status-title');
+
+  const bar = el('div', 'dist');
+  bar.setAttribute('role', 'img');
+  bar.setAttribute('aria-label', STATUS_ROWS
+    .filter(row => d[row.key] > 0)
+    .map(row => `${row.label}: ${formatShare(d[row.key], total)}`)
+    .join(', '));
+  for (const row of STATUS_ROWS) {
+    if (d[row.key] <= 0) continue;
+    const segment = el('span', `dist-seg tone-${row.key}`);
+    // CSSOM, not a style attribute: allowed under the style-src 'self' CSP.
+    segment.style.flexGrow = String(d[row.key]);
+    bar.append(segment);
+  }
+
+  const table = el('table', 'table');
+  table.append(el('caption', 'sr-only', 'Количество подписок по статусам'));
+  const head = el('thead');
+  const headRow = el('tr');
+  for (const [text, cls] of [['Статус', ''], ['Количество', 'num'], ['Доля', 'num']] as const) {
+    const th = el('th', cls, text);
+    th.scope = 'col';
+    headRow.append(th);
+  }
+  head.append(headRow);
+  const body = el('tbody');
+  for (const row of STATUS_ROWS) {
+    const tr = el('tr');
+    if (d[row.key] === 0) tr.className = 'is-zero';
+    const name = el('th', 'status-cell');
+    name.scope = 'row';
+    name.append(el('span', `swatch tone-${row.key}`), el('span', '', row.label));
+    tr.append(name, el('td', 'num', formatCount(d[row.key])), el('td', 'num muted', formatShare(d[row.key], total)));
+    body.append(tr);
+  }
+  const foot = el('tfoot');
+  const footRow = el('tr');
+  const footName = el('th', '', 'Всего');
+  footName.scope = 'row';
+  footRow.append(footName, el('td', 'num', formatCount(total)), el('td', 'num muted', percentFormat.format(total > 0 ? 1 : 0)));
+  foot.append(footRow);
+  table.append(head, body, foot);
+
+  const scroll = el('div', 'table-wrap');
+  scroll.append(table);
+  panel.append(panelHead('status-title', 'Подписки по статусам', `Всего ${formatCount(total)}`), bar, scroll);
+  return panel;
+}
+
+function attentionPanel(d: Dashboard): HTMLElement {
+  const items: readonly [value: number, title: string, text: string, alert: boolean][] = [
+    [d.active_expired, 'Срок истёк, статус «Активна»', 'Ещё не обработаны фоновой проверкой истечения сроков.', true],
+    [d.expiring_in_7d, 'Истекают в ближайшие 7 дней', 'Активные подписки с датой окончания в течение недели.', false],
+  ];
+  const panel = el('section', 'panel');
+  panel.setAttribute('aria-labelledby', 'attention-title');
+  const list = el('ul', 'stat-list');
+  for (const [value, title, text, alert] of items) {
+    const item = el('li', 'stat');
+    const copy = el('div', 'stat-copy');
+    copy.append(el('p', 'stat-title', title), el('p', 'stat-text', text));
+    const figure = el('p', alert && value > 0 ? 'stat-value is-alert' : 'stat-value', formatCount(value));
+    item.append(copy, figure);
+    list.append(item);
+  }
+  panel.append(panelHead('attention-title', 'Требует внимания'), list);
+  return panel;
+}
+
+function overviewContent(d: Dashboard): HTMLElement[] {
+  if (d.total_subscriptions === 0) {
+    const empty = el('section', 'panel empty');
+    empty.setAttribute('aria-labelledby', 'overview-empty-title');
+    const title = el('h2', 'empty-title', 'Подписок пока нет');
+    title.id = 'overview-empty-title';
+    empty.append(icon('overview', 20), title, el('p', 'empty-text', 'Распределение по статусам и сроки появятся, когда в базе будут первые подписки.'));
+    return [kpiStrip(d), empty];
+  }
+  const grid = el('div', 'overview-grid');
+  grid.append(statusPanel(d), attentionPanel(d));
+  return [kpiStrip(d), grid];
+}
+
+function overviewSkeleton(): HTMLElement[] {
+  const strip = el('div', 'panel kpis');
+  const cells = el('div', 'kpi-grid');
+  for (let i = 0; i < 5; i++) {
+    const cell = el('div', 'kpi');
+    cell.append(el('span', 'skeleton skeleton-label'), el('span', 'skeleton skeleton-value'), el('span', 'skeleton skeleton-meta'));
+    cells.append(cell);
+  }
+  strip.append(cells);
+  const block = (rows: number) => {
+    const panel = el('div', 'panel');
+    const head = el('div', 'panel-head');
+    head.append(el('span', 'skeleton skeleton-label'));
+    const lines = el('div', 'skeleton-rows');
+    for (let i = 0; i < rows; i++) lines.append(el('span', 'skeleton skeleton-row'));
+    panel.append(head, lines);
+    return panel;
+  };
+  const grid = el('div', 'overview-grid');
+  grid.append(block(6), block(2));
+  return [strip, grid];
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +326,12 @@ interface Shell {
   content: HTMLElement;
 }
 
+interface OverviewView {
+  body: HTMLElement;
+  refresh: HTMLButtonElement;
+  updated: HTMLElement;
+}
+
 class AdminApp {
   private view: 'boot' | 'fatal' | 'login' | 'app' = 'boot';
   private shell: Shell | null = null;
@@ -164,6 +341,11 @@ class AdminApp {
   private countdownTimer = 0;
   private toastTimer = 0;
   private readonly toasts = el('div', 'toast-region');
+  // Last dashboard snapshot, kept in memory only so returning to Overview
+  // shows figures at once while a fresh request runs. Cleared on sign-out.
+  private dashboard: { data: Dashboard; at: Date } | null = null;
+  private overview: OverviewView | null = null;
+  private dashboardRequest = 0;
 
   constructor(private readonly root: HTMLElement, private readonly api: AdminApi) {
     this.toasts.setAttribute('aria-live', 'polite');
@@ -189,6 +371,7 @@ class AdminApp {
   }
 
   private mount(...nodes: HTMLElement[]) {
+    this.overview = null;
     window.clearInterval(this.countdownTimer);
     window.clearTimeout(this.toastTimer);
     this.toasts.replaceChildren();
@@ -241,6 +424,7 @@ class AdminApp {
     this.view = 'login';
     this.shell = null;
     this.signedInAt = null;
+    this.dashboard = null;
 
     const card = el('section', 'auth-card');
     card.setAttribute('aria-labelledby', 'login-title');
@@ -438,18 +622,122 @@ class AdminApp {
     document.title = `${section.label} · RS8 Admin`;
 
     const header = el('header', 'page-header');
+    const heading = el('div', 'page-heading');
     const title = el('h1', 'page-title', section.label);
     title.tabIndex = -1;
-    header.append(title, el('p', 'page-desc', section.description));
-    const empty = el('section', 'panel empty');
-    empty.setAttribute('aria-labelledby', 'empty-title');
-    const emptyTitle = el('h2', 'empty-title', section.emptyTitle);
-    emptyTitle.id = 'empty-title';
-    empty.append(icon(section.id, 20), emptyTitle, el('p', 'empty-text', section.emptyText));
+    heading.append(title, el('p', 'page-desc', section.description));
+    header.append(heading);
     const page = el('div', 'page');
-    page.append(header, empty);
+    page.append(header);
+
+    // Leaving Overview invalidates any dashboard request still in flight.
+    this.overview = null;
+    this.dashboardRequest++;
+    if (section.placeholder) {
+      const empty = el('section', 'panel empty');
+      empty.setAttribute('aria-labelledby', 'empty-title');
+      const emptyTitle = el('h2', 'empty-title', section.placeholder.title);
+      emptyTitle.id = 'empty-title';
+      empty.append(icon(section.id, 20), emptyTitle, el('p', 'empty-text', section.placeholder.text));
+      page.append(empty);
+    } else {
+      page.append(this.buildOverview(header));
+    }
     this.shell.content.replaceChildren(page);
     if (focus) title.focus();
+    if (!section.placeholder) void this.loadDashboard();
+  }
+
+  // Overview ----------------------------------------------------------------
+
+  private buildOverview(header: HTMLElement): HTMLElement {
+    const actions = el('div', 'page-actions');
+    const updated = el('p', 'updated');
+    updated.setAttribute('aria-live', 'polite');
+    const refresh = button('Обновить', 'btn btn-secondary btn-sm', 'refresh');
+    refresh.addEventListener('click', () => void this.loadDashboard());
+    actions.append(updated, refresh);
+    header.classList.add('has-actions');
+    header.append(actions);
+
+    const body = el('div', 'overview');
+    this.overview = { body, refresh, updated };
+    if (this.dashboard) this.paintDashboard(this.overview, this.dashboard.data, this.dashboard.at);
+    else this.paintSkeleton(this.overview);
+    return body;
+  }
+  private paintSkeleton(view: OverviewView) {
+    view.body.setAttribute('aria-busy', 'true');
+    view.body.setAttribute('role', 'status');
+    view.body.setAttribute('aria-label', 'Загружаем показатели');
+    view.body.replaceChildren(...overviewSkeleton());
+    view.updated.textContent = '';
+  }
+
+  private paintDashboard(view: OverviewView, data: Dashboard, at: Date) {
+    view.body.removeAttribute('aria-busy');
+    view.body.removeAttribute('role');
+    view.body.removeAttribute('aria-label');
+    view.body.replaceChildren(...overviewContent(data));
+    view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
+  }
+
+  private paintError(view: OverviewView, error: unknown) {
+    view.body.removeAttribute('aria-busy');
+    view.body.removeAttribute('role');
+    view.body.removeAttribute('aria-label');
+    const panel = el('section', 'panel empty');
+    panel.setAttribute('role', 'alert');
+    const title = el('h2', 'empty-title', 'Не удалось загрузить показатели');
+    const retry = button('Повторить', 'btn btn-secondary btn-sm', 'refresh');
+    retry.addEventListener('click', () => void this.loadDashboard());
+    panel.append(icon('alert', 20), title, el('p', 'empty-text', errorText(error)), retry);
+    view.body.replaceChildren(panel);
+    view.updated.textContent = '';
+  }
+  private setRefreshing(view: OverviewView, busy: boolean) {
+    view.refresh.disabled = busy;
+    view.refresh.setAttribute('aria-busy', String(busy));
+    setLabel(view.refresh, busy ? 'Обновляем…' : 'Обновить');
+  }
+
+  /**
+   * Loads the dashboard into the current Overview. A stale response (the
+   * administrator navigated away or a newer request started) is dropped. With
+   * figures already on screen a failed refresh keeps them and raises a toast;
+   * without them the error replaces the skeleton and offers a retry.
+   */
+  private async loadDashboard() {
+    const view = this.overview;
+    if (!view) return;
+    const request = ++this.dashboardRequest;
+    const current = () => this.overview === view && request === this.dashboardRequest;
+    this.setRefreshing(view, true);
+    if (!this.dashboard) this.paintSkeleton(view);
+    try {
+      const data = await this.api.dashboard();
+      if (!current()) return;
+      const at = new Date();
+      this.dashboard = { data, at };
+      this.lastSessionCheck = Date.now();
+      this.paintDashboard(view, data, at);
+    } catch (error) {
+      if (!current()) return;
+      // Confirm a 401 against /admin/session before leaving: re-entering the
+      // app on a session the API still rejects would loop without end.
+      if (error instanceof ApiError && error.code === 'unauthorized') {
+        const session = await this.api.session().catch(() => null);
+        if (!current()) return;
+        if (session && !session.authenticated) {
+          await this.signedOut('Сессия завершилась. Войдите снова.');
+          return;
+        }
+      }
+      if (this.dashboard) this.toast(`Не удалось обновить показатели. ${errorText(error)}`);
+      else this.paintError(view, error);
+    } finally {
+      if (current()) this.setRefreshing(view, false);
+    }
   }
 
   // Session lifecycle -------------------------------------------------------

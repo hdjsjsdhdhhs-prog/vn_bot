@@ -20,6 +20,22 @@ export interface Session {
   authenticated: boolean;
 }
 
+// GET /admin/api/dashboard (database.AdminDashboard): one snapshot of counters.
+//   total_subscriptions  every subscription row, all statuses
+//   users / trials       rows with telegram_id > 0 / < 0 (unbound trials)
+//   active ... canceled  rows per status; together they sum to the total
+//   active_expired       status active, expiry passed, not yet downgraded
+//   paid                 product_id set or price_paid_cents > 0, any status
+//   expiring_in_7d       status active, expiring within the next 7 days
+//   audit_last_24h       admin panel audit entries in the last 24 hours
+const DASHBOARD_FIELDS = [
+  'total_subscriptions', 'users', 'trials',
+  'active', 'paused', 'revoked', 'expired', 'canceled',
+  'active_expired', 'paid', 'expiring_in_7d', 'audit_last_24h',
+] as const;
+
+export type Dashboard = Readonly<Record<(typeof DASHBOARD_FIELDS)[number], number>>;
+
 /** Server-side credential bounds (adminauth.login), measured in UTF-8 bytes. */
 export const limits = { usernameBytes: 64, passwordBytes: 72 } as const;
 
@@ -52,6 +68,13 @@ const CSRF_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 function isSessionPayload(value: unknown): value is { authenticated: boolean; csrf_token: string } {
   return isRecord(value) && typeof value.authenticated === 'boolean' &&
     typeof value.csrf_token === 'string' && CSRF_PATTERN.test(value.csrf_token);
+}
+
+function isDashboard(value: unknown): value is Dashboard {
+  return isRecord(value) && DASHBOARD_FIELDS.every(key => {
+    const count = value[key];
+    return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
+  });
 }
 
 function errorCode(data: unknown, status: number): string {
@@ -132,6 +155,13 @@ export class AdminApi {
       }
     }
     this.#csrf = '';
+  }
+
+  /** GET /admin/api/dashboard: overview counters. 401 means the session ended. */
+  async dashboard(): Promise<Dashboard> {
+    const data = await this.#send('GET', '/admin/api/dashboard');
+    if (!isDashboard(data)) throw new ApiError('invalid_response');
+    return data;
   }
 
   #adopt(payload: unknown): Session {
