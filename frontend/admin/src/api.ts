@@ -36,8 +36,103 @@ const DASHBOARD_FIELDS = [
 
 export type Dashboard = Readonly<Record<(typeof DASHBOARD_FIELDS)[number], number>>;
 
-/** Server-side credential bounds (adminauth.login), measured in UTF-8 bytes. */
-export const limits = { usernameBytes: 64, passwordBytes: 72 } as const;
+// GET /admin/api/users and GET /admin/api/users/{telegram_id}
+// (service.AdminUsersPage, service.AdminSubscriptionPage). A user is a
+// subscription row with telegram_id > 0; telegram_id is unique, so every linked
+// customer has exactly one row. Unbound trials (telegram_id < 0) never appear.
+
+/** Values accepted by the status filter (service.isKnownSubscriptionStatus). */
+export const SUBSCRIPTION_STATUSES = ['active', 'expired', 'paused', 'revoked', 'canceled'] as const;
+export type SubscriptionStatus = (typeof SUBSCRIPTION_STATUSES)[number];
+
+/** service.AdminSubscriptionView. Timestamps are RFC 3339 strings. */
+export interface AdminSubscription {
+  readonly id: number;
+  readonly telegram_id: number;
+  readonly username: string;
+  /** Stored status; the known values are SUBSCRIPTION_STATUSES. */
+  readonly status: string;
+  /** null: the subscription never expires. */
+  readonly expires_at: string | null;
+  readonly plan_id: number;
+  /** Omitted on the wire when the plan row is missing; '' here. */
+  readonly plan_name: string;
+  /** Set for provider-backed subscriptions, which use no service nodes. */
+  readonly provider_source_id: number | null;
+  readonly product_id: number | null;
+  readonly is_paid: boolean;
+  /** Minor units of currency; for XTR (Telegram Stars) whole Stars. */
+  readonly price_paid_cents: number;
+  readonly currency: string | null;
+  readonly referred_by: number | null;
+  readonly started_at: string | null;
+  /** Last subscription feed request; null until the first one. */
+  readonly last_request: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+  readonly reminders_sent: number;
+  /** Registered device entries. */
+  readonly devices: number;
+  /** Recorded IP address entries. */
+  readonly ips: number;
+}
+
+/** service.AdminUsersPage, newest first; limit is the page size the server applied. */
+export interface UsersPage {
+  readonly users: readonly AdminSubscription[];
+  readonly total: number;
+  readonly limit: number;
+  readonly offset: number;
+}
+
+/**
+ * Query of GET /admin/api/users. q matches a numeric Telegram or subscription
+ * ID exactly, otherwise a username substring (a leading @ is ignored). The page
+ * size is left to the server default (database.AdminDefaultPageSize).
+ */
+export interface UsersQuery {
+  readonly q: string;
+  readonly status: SubscriptionStatus | '';
+  readonly offset: number;
+}
+
+/** service.AdminPlanView. traffic_limit is in bytes, 0 means unlimited. */
+export interface AdminPlan {
+  readonly id: number;
+  readonly name: string;
+  readonly is_active: boolean;
+  readonly devices_limit: number;
+  readonly traffic_limit: number;
+}
+
+/** database.AdminSubscriptionNode: sync state of the subscription on one VPN node. */
+export interface AdminNode {
+  readonly node_id: number;
+  readonly node_name: string;
+  /** database.SyncStatus: active, pending_add, pending_remove or pending_update. */
+  readonly status: string;
+  readonly retry_count: number;
+  readonly retry_at: string | null;
+  readonly last_error: string;
+  readonly updated_at: string;
+}
+
+/**
+ * GET /admin/api/users/{telegram_id}: the subscription page of the user. The
+ * response also carries recent audit entries; they belong to the audit screen
+ * and are not exposed here.
+ */
+export interface UserDetail {
+  readonly subscription: AdminSubscription;
+  readonly plan: AdminPlan | null;
+  readonly nodes: readonly AdminNode[];
+}
+
+/**
+ * Server-side input bounds in UTF-8 bytes: credentials from adminauth.login,
+ * the users search query from web.adminAPI.users.
+ */
+export const limits = { usernameBytes: 64, passwordBytes: 72, queryBytes: 128 } as const;
 
 const CSRF_HEADER = 'X-CSRF-Token';
 const REQUEST_TIMEOUT_MS = 12_000;
@@ -53,6 +148,7 @@ export function errorText(error: unknown): string {
     case 'network': return 'Нет связи с сервером. Проверьте подключение.';
     case 'timeout': return 'Сервер не ответил вовремя. Попробуйте ещё раз.';
     case 'invalid_response': return 'Не удалось прочитать ответ сервера.';
+    case 'invalid_request': return 'Сервер отклонил параметры запроса. Измените условия поиска.';
     case 'service_unavailable': return 'Сервис временно недоступен. Попробуйте позже.';
     default: return 'Не удалось выполнить действие. Попробуйте ещё раз.';
   }
@@ -75,6 +171,86 @@ function isDashboard(value: unknown): value is Dashboard {
     const count = value[key];
     return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
   });
+}
+
+const isInteger = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value);
+const isCount = (value: unknown): value is number => isInteger(value) && value >= 0;
+const isPositive = (value: unknown): value is number => isInteger(value) && value > 0;
+const isText = (value: unknown): value is string => typeof value === 'string';
+// Go encodes time.Time as RFC 3339 with up to nine fractional digits.
+const isTime = (value: unknown): value is string =>
+  typeof value === 'string' && value.length <= 40 && !Number.isNaN(Date.parse(value));
+const isCurrency = (value: unknown): value is string => typeof value === 'string' && /^[A-Z]{3}$/.test(value);
+
+function isNullable<T>(value: unknown, check: (item: unknown) => item is T): value is T | null {
+  return value === null || check(value);
+}
+
+function parseSubscription(value: unknown): AdminSubscription | null {
+  if (!isRecord(value)) return null;
+  const {
+    id, telegram_id, username, status, expires_at, plan_id, plan_name = '', provider_source_id, product_id,
+    is_paid, price_paid_cents, currency, referred_by, started_at, last_request, created_at, updated_at,
+    reminders_sent, devices, ips,
+  } = value;
+  if (!isPositive(id) || !isInteger(telegram_id) || !isText(username) || !isText(status) || status === '' ||
+    !isNullable(expires_at, isTime) || !isCount(plan_id) || !isText(plan_name) ||
+    !isNullable(provider_source_id, isPositive) || !isNullable(product_id, isPositive) ||
+    typeof is_paid !== 'boolean' || !isCount(price_paid_cents) || !isNullable(currency, isCurrency) ||
+    !isNullable(referred_by, isInteger) || !isNullable(started_at, isTime) || !isNullable(last_request, isTime) ||
+    !isTime(created_at) || !isTime(updated_at) || !isCount(reminders_sent) || !isCount(devices) || !isCount(ips)) return null;
+  return {
+    id, telegram_id, username, status, expires_at, plan_id, plan_name, provider_source_id, product_id,
+    is_paid, price_paid_cents, currency, referred_by, started_at, last_request, created_at, updated_at,
+    reminders_sent, devices, ips,
+  };
+}
+
+function parseUsersPage(value: unknown): UsersPage | null {
+  if (!isRecord(value)) return null;
+  const { users: list, total, limit, offset } = value;
+  if (!Array.isArray(list) || !isCount(total) || !isPositive(limit) || !isCount(offset) ||
+    list.length > limit || list.length > total) return null;
+  const users: AdminSubscription[] = [];
+  for (const item of list) {
+    const user = parseSubscription(item);
+    // The list only ever holds linked customers.
+    if (!user || user.telegram_id <= 0) return null;
+    users.push(user);
+  }
+  return { users, total, limit, offset };
+}
+
+function parsePlan(value: unknown): AdminPlan | undefined {
+  if (!isRecord(value)) return undefined;
+  const { id, name, is_active, devices_limit, traffic_limit } = value;
+  if (!isPositive(id) || !isText(name) || typeof is_active !== 'boolean' || !isCount(devices_limit) ||
+    !isCount(traffic_limit)) return undefined;
+  return { id, name, is_active, devices_limit, traffic_limit };
+}
+
+function parseNode(value: unknown): AdminNode | null {
+  if (!isRecord(value)) return null;
+  const { node_id, node_name, status, retry_count, retry_at, last_error, updated_at } = value;
+  if (!isPositive(node_id) || !isText(node_name) || !isText(status) || status === '' || !isCount(retry_count) ||
+    !isNullable(retry_at, isTime) || !isText(last_error) || !isTime(updated_at)) return null;
+  return { node_id, node_name, status, retry_count, retry_at, last_error, updated_at };
+}
+
+function parseUserDetail(value: unknown, telegramId: number): UserDetail | null {
+  if (!isRecord(value) || !Array.isArray(value.nodes) || !Array.isArray(value.audit)) return null;
+  const subscription = parseSubscription(value.subscription);
+  // The route resolves by Telegram ID; any other row is not this user.
+  if (!subscription || subscription.telegram_id !== telegramId) return null;
+  const plan = value.plan === null ? null : parsePlan(value.plan);
+  if (plan === undefined) return null;
+  const nodes: AdminNode[] = [];
+  for (const item of value.nodes) {
+    const node = parseNode(item);
+    if (!node) return null;
+    nodes.push(node);
+  }
+  return { subscription, plan, nodes };
 }
 
 function errorCode(data: unknown, status: number): string {
@@ -162,6 +338,27 @@ export class AdminApi {
     const data = await this.#send('GET', '/admin/api/dashboard');
     if (!isDashboard(data)) throw new ApiError('invalid_response');
     return data;
+  }
+
+  /** GET /admin/api/users: one page of linked customers. 401 means the session ended. */
+  async users(query: UsersQuery): Promise<UsersPage> {
+    const params = new URLSearchParams();
+    if (query.q) params.set('q', query.q);
+    if (query.status) params.set('status', query.status);
+    if (query.offset > 0) params.set('offset', String(query.offset));
+    const search = params.toString();
+    const page = parseUsersPage(await this.#send('GET', search ? `/admin/api/users?${search}` : '/admin/api/users'));
+    if (!page) throw new ApiError('invalid_response');
+    return page;
+  }
+
+  /** GET /admin/api/users/{telegram_id}. 404 means no linked customer has this ID. */
+  async user(telegramId: number): Promise<UserDetail> {
+    // The route only accepts canonical positive IDs and answers 404 otherwise.
+    if (!Number.isSafeInteger(telegramId) || telegramId <= 0) throw new ApiError('not_found', 404);
+    const detail = parseUserDetail(await this.#send('GET', `/admin/api/users/${telegramId}`), telegramId);
+    if (!detail) throw new ApiError('invalid_response');
+    return detail;
   }
 
   #adopt(payload: unknown): Session {

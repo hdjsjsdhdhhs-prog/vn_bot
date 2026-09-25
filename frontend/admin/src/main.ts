@@ -1,11 +1,16 @@
 import './style.css';
-import { AdminApi, ApiError, errorText, limits, type Dashboard } from './api';
+import {
+  AdminApi, ApiError, errorText, limits,
+  type AdminNode, type AdminPlan, type AdminSubscription, type Dashboard, type SubscriptionStatus,
+  type UserDetail, type UsersPage, type UsersQuery,
+} from './api';
 
 // ---------------------------------------------------------------------------
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
 // handful of glyphs does not add a runtime dependency. One family, one stroke.
 
-type IconName = 'overview' | 'users' | 'audit' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh';
+type IconName = 'overview' | 'users' | 'audit' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
+  | 'search' | 'back' | 'prev' | 'next' | 'chevron';
 type Shape = readonly ['path' | 'circle' | 'rect', Readonly<Record<string, string>>];
 
 const ICONS: Record<IconName, readonly Shape[]> = {
@@ -43,6 +48,11 @@ const ICONS: Record<IconName, readonly Shape[]> = {
     ['path', { d: 'm2 2 20 20' }],
   ],
   refresh: [['path', { d: 'M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8' }], ['path', { d: 'M21 3v5h-5' }]],
+  search: [['circle', { cx: '11', cy: '11', r: '8' }], ['path', { d: 'm21 21-4.3-4.3' }]],
+  back: [['path', { d: 'm12 19-7-7 7-7' }], ['path', { d: 'M19 12H5' }]],
+  prev: [['path', { d: 'm15 18-6-6 6-6' }]],
+  next: [['path', { d: 'm9 18 6-6-6-6' }]],
+  chevron: [['path', { d: 'm6 9 6 6 6-6' }]],
 };
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -105,8 +115,8 @@ const byteLength = (value: string) => new TextEncoder().encode(value).length;
 const clock = (date: Date) => date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 
 // ---------------------------------------------------------------------------
-// Sections. Overview reads /admin/api/dashboard; the other screens are still
-// page frames with a placeholder until their stages land.
+// Sections. Overview reads /admin/api/dashboard, Users reads /admin/api/users;
+// Audit is still a page frame with a placeholder until its stage lands.
 
 type SectionId = 'overview' | 'users' | 'audit';
 interface Section {
@@ -123,11 +133,7 @@ const SECTIONS: readonly Section[] = [
   },
   {
     id: 'users', label: 'Пользователи',
-    description: 'Поиск клиентов и управление их подписками.',
-    placeholder: {
-      title: 'Список пользователей появится на следующем этапе',
-      text: 'Здесь будет поиск по Telegram ID и имени, карточка клиента и действия с подпиской.',
-    },
+    description: 'Клиенты с привязанным Telegram-аккаунтом и их подписки. Пробные подписки без привязки сюда не входят.',
   },
   {
     id: 'audit', label: 'Журнал',
@@ -139,9 +145,20 @@ const SECTIONS: readonly Section[] = [
   },
 ];
 
-function currentSection(): Section {
-  const id = location.hash.replace(/^#\/?/, '');
-  return SECTIONS.find(section => section.id === id) ?? SECTIONS[0];
+// Routes: #/overview, #/users, #/users/{telegram_id}, #/audit. Only canonical
+// positive Telegram IDs open a user, matching the API route.
+interface Route { section: Section; userId: number | null }
+const USER_ROUTE = /^users\/([1-9][0-9]{0,15})$/;
+
+function currentRoute(): Route {
+  const path = location.hash.replace(/^#\/?/, '');
+  const match = USER_ROUTE.exec(path);
+  const users = SECTIONS.find(section => section.id === 'users');
+  if (match && users) {
+    const id = Number(match[1]);
+    if (Number.isSafeInteger(id)) return { section: users, userId: id };
+  }
+  return { section: SECTIONS.find(section => section.id === path) ?? SECTIONS[0], userId: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +331,311 @@ function overviewSkeleton(): HTMLElement[] {
 }
 
 // ---------------------------------------------------------------------------
+// Users. Rows come from GET /admin/api/users and the user page from
+// GET /admin/api/users/{telegram_id}; only fields those responses carry are
+// shown. Search, filter and page live in memory, never in the URL.
+
+const SEARCH_DEBOUNCE_MS = 350;
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+const dateFormat = new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
+const dateTimeFormat = new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+const relativeFormat = new Intl.RelativeTimeFormat('ru-RU', { numeric: 'auto' });
+const trafficFormat = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
+const formatDate = (iso: string) => dateFormat.format(new Date(iso));
+const formatDateTime = (iso: string) => dateTimeFormat.format(new Date(iso));
+
+function relativeTime(iso: string, now: number): string {
+  const diff = Date.parse(iso) - now;
+  const abs = Math.abs(diff);
+  if (abs >= DAY_MS) return relativeFormat.format(Math.round(diff / DAY_MS), 'day');
+  if (abs >= HOUR_MS) return relativeFormat.format(Math.round(diff / HOUR_MS), 'hour');
+  return relativeFormat.format(Math.round(diff / MINUTE_MS), 'minute');
+}
+
+const handle = (username: string) => (username.startsWith('@') ? username : `@${username}`);
+const displayName = (user: AdminSubscription) => (user.username ? handle(user.username) : `Пользователь ${user.telegram_id}`);
+const planLabel = (user: AdminSubscription) => user.plan_name || `Тариф #${user.plan_id}`;
+const statusLabel = (status: string) => STATUS_ROWS.find(row => row.key === status)?.label ?? status;
+const parseStatus = (value: string): SubscriptionStatus | '' => STATUS_ROWS.find(row => row.key === value)?.key ?? '';
+
+/** Status active with the expiry already passed: not yet downgraded by the expiry worker. */
+const isActiveExpired = (user: AdminSubscription, now: number) =>
+  user.status === 'active' && user.expires_at !== null && Date.parse(user.expires_at) <= now;
+
+function formatPrice(amount: number, currency: string | null): string {
+  // Telegram Stars are stored as whole Stars, other currencies in minor units.
+  if (currency === 'XTR') return `${formatCount(amount)} XTR`;
+  if (!currency) return `${formatCount(amount)} (валюта не указана)`;
+  try {
+    return new Intl.NumberFormat('ru-RU', { style: 'currency', currency }).format(amount / 100);
+  } catch {
+    return `${formatCount(amount)} ${currency}`;
+  }
+}
+
+function formatTraffic(bytes: number): string {
+  if (bytes === 0) return 'Без ограничения';
+  const gib = bytes / 1024 ** 3;
+  return gib >= 1 ? `${trafficFormat.format(gib)} ГБ` : `${trafficFormat.format(bytes / 1024 ** 2)} МБ`;
+}
+
+// database.SyncStatus values.
+const SYNC_LABELS: Readonly<Record<string, string>> = {
+  active: 'Синхронизирован',
+  pending_add: 'Ожидает добавления',
+  pending_remove: 'Ожидает удаления',
+  pending_update: 'Ожидает обновления',
+};
+
+interface UsersState {
+  /** Last applied query; the page size is the server default. */
+  query: UsersQuery;
+  /** Search box text, possibly not applied yet. */
+  draft: string;
+  page: UsersPage | null;
+  pageQuery: UsersQuery | null;
+  at: Date | null;
+  /** Telegram ID of the user opened from the list, to restore focus on return. */
+  lastOpened: number | null;
+}
+
+interface UsersView {
+  results: HTMLElement;
+  refresh: HTMLButtonElement;
+  updated: HTMLElement;
+  summary: HTMLElement;
+  search: HTMLInputElement;
+  clear: HTMLButtonElement;
+  status: HTMLSelectElement;
+  setSearchError: (text: string) => void;
+  pagerFocus: 'prev' | 'next' | null;
+}
+
+interface DetailView {
+  id: number;
+  body: HTMLElement;
+  refresh: HTMLButtonElement;
+  updated: HTMLElement;
+  title: HTMLElement;
+  desc: HTMLElement;
+}
+
+function initialUsersState(): UsersState {
+  return { query: { q: '', status: '', offset: 0 }, draft: '', page: null, pageQuery: null, at: null, lastOpened: null };
+}
+
+const sameQuery = (a: UsersQuery, b: UsersQuery) => a.q === b.q && a.status === b.status && a.offset === b.offset;
+
+function setLoading(node: HTMLElement, label: string | null) {
+  if (label) {
+    node.setAttribute('aria-busy', 'true');
+    node.setAttribute('role', 'status');
+    node.setAttribute('aria-label', label);
+  } else {
+    node.removeAttribute('aria-busy');
+    node.removeAttribute('role');
+    node.removeAttribute('aria-label');
+  }
+}
+
+function refreshActions(onRefresh: () => void) {
+  const actions = el('div', 'page-actions');
+  const updated = el('p', 'updated');
+  updated.setAttribute('aria-live', 'polite');
+  const refresh = button('Обновить', 'btn btn-secondary btn-sm', 'refresh');
+  refresh.addEventListener('click', onRefresh);
+  actions.append(updated, refresh);
+  return { actions, refresh, updated };
+}
+
+function setRefreshBusy(refresh: HTMLButtonElement, busy: boolean) {
+  refresh.disabled = busy;
+  refresh.setAttribute('aria-busy', String(busy));
+  setLabel(refresh, busy ? 'Обновляем…' : 'Обновить');
+}
+
+/** A table cell that also carries its column name for the stacked mobile layout. */
+function cell(label: string, content: string | Node, className = ''): HTMLTableCellElement {
+  const td = el('td', className);
+  td.dataset.label = label;
+  td.append(content);
+  return td;
+}
+
+function headRow(columns: readonly (readonly [string, string])[]): HTMLTableSectionElement {
+  const head = el('thead');
+  const row = el('tr');
+  for (const [text, className] of columns) {
+    const th = el('th', className, text);
+    th.scope = 'col';
+    row.append(th);
+  }
+  head.append(row);
+  return head;
+}
+
+function option(value: string, label: string): HTMLOptionElement {
+  const node = el('option', '', label);
+  node.value = value;
+  return node;
+}
+
+function messagePanel(name: IconName, title: string, text: string, role: 'status' | 'alert', action?: HTMLElement): HTMLElement {
+  const panel = el('section', 'panel empty');
+  panel.setAttribute('role', role);
+  panel.append(icon(name, 20), el('h2', 'empty-title', title), el('p', 'empty-text', text));
+  if (action) panel.append(action);
+  return panel;
+}
+
+function retryButton(onRetry: () => void): HTMLButtonElement {
+  const retry = button('Повторить', 'btn btn-secondary btn-sm', 'refresh');
+  retry.addEventListener('click', onRetry);
+  return retry;
+}
+
+function skeletonPanel(rows: number, head = true): HTMLElement {
+  const panel = el('div', 'panel');
+  if (head) {
+    const top = el('div', 'panel-head');
+    top.append(el('span', 'skeleton skeleton-label'));
+    panel.append(top);
+  }
+  const lines = el('div', 'skeleton-rows');
+  for (let i = 0; i < rows; i++) lines.append(el('span', 'skeleton skeleton-row'));
+  panel.append(lines);
+  return panel;
+}
+
+function statusBadge(status: string): HTMLElement {
+  const node = el('span', 'status');
+  const known = STATUS_ROWS.some(row => row.key === status);
+  node.append(el('span', known ? `swatch tone-${status}` : 'swatch tone-unknown'), el('span', '', statusLabel(status)));
+  return node;
+}
+
+function userLink(telegramId: number): HTMLAnchorElement {
+  const link = el('a', 'inline-link', String(telegramId));
+  link.href = `#/users/${telegramId}`;
+  return link;
+}
+
+const USER_COLUMNS = [
+  ['Пользователь', 'col-user'], ['Telegram ID', 'col-id'], ['Статус', 'col-status'], ['Тариф', 'col-md'],
+  ['Действует до', ''], ['Последний запрос', 'col-lg'], ['Оплата', 'col-md'],
+] as const;
+
+const NODE_COLUMNS = [
+  ['Узел', ''], ['Синхронизация', ''], ['Попытки', 'num'], ['Следующая попытка', ''], ['Обновлено', ''], ['Последняя ошибка', ''],
+] as const;
+
+function fact(label: string, value: string | Node, note?: string, noteClass = ''): HTMLElement {
+  const item = el('div', 'fact');
+  const data = el('dd');
+  data.append(value);
+  if (note) data.append(el('span', noteClass ? `fact-note ${noteClass}` : 'fact-note', note));
+  item.append(el('dt', '', label), data);
+  return item;
+}
+
+function subscriptionPanel(user: AdminSubscription, plan: AdminPlan | null, now: number): HTMLElement {
+  const panel = el('section', 'panel');
+  panel.setAttribute('aria-labelledby', 'subscription-title');
+  const expired = isActiveExpired(user, now);
+  const referrer: string | Node = user.referred_by === null ? 'Нет'
+    : user.referred_by > 0 ? userLink(user.referred_by) : String(user.referred_by);
+  const facts = el('dl', 'facts');
+  facts.append(
+    fact('Статус', statusBadge(user.status), expired ? 'Срок истёк, статус ещё не обновлён' : undefined, 'is-danger'),
+    fact('Действует до', user.expires_at ? formatDateTime(user.expires_at) : 'Бессрочно',
+      user.expires_at ? relativeTime(user.expires_at, now) : undefined, expired ? 'is-danger' : ''),
+    fact('Тариф', planLabel(user)),
+    fact('Оплата', user.is_paid ? 'Платная' : 'Бесплатная',
+      user.price_paid_cents > 0 ? formatPrice(user.price_paid_cents, user.currency) : undefined),
+    fact('Устройства', formatCount(user.devices), plan ? `Лимит тарифа: ${formatCount(plan.devices_limit)}` : undefined),
+    fact('IP-адреса', formatCount(user.ips)),
+    fact('Последний запрос', user.last_request ? formatDateTime(user.last_request) : 'Не было',
+      user.last_request ? relativeTime(user.last_request, now) : undefined),
+    fact('Начало', user.started_at ? formatDateTime(user.started_at) : 'Нет данных'),
+    fact('Источник', user.provider_source_id === null ? 'Узлы сервиса' : `Внешний провайдер #${user.provider_source_id}`),
+    fact('Пригласил', referrer),
+    fact('Создана', formatDateTime(user.created_at)),
+    fact('Обновлена', formatDateTime(user.updated_at)),
+  );
+  panel.append(panelHead('subscription-title', 'Подписка', `#${user.id}`), facts);
+  return panel;
+}
+
+function planPanel(user: AdminSubscription, plan: AdminPlan | null): HTMLElement {
+  const panel = el('section', 'panel');
+  panel.setAttribute('aria-labelledby', 'plan-title');
+  panel.append(panelHead('plan-title', 'Тариф', plan ? `#${plan.id}` : undefined));
+  if (!plan) {
+    panel.append(el('p', 'panel-note', `Тариф #${user.plan_id} не найден в базе.`));
+    return panel;
+  }
+  const facts = el('dl', 'facts facts-single');
+  facts.append(
+    fact('Название', plan.name || `Тариф #${plan.id}`),
+    fact('Состояние', plan.is_active ? 'Доступен' : 'Отключён'),
+    fact('Лимит устройств', formatCount(plan.devices_limit)),
+    fact('Лимит трафика', formatTraffic(plan.traffic_limit)),
+  );
+  panel.append(facts);
+  return panel;
+}
+
+function nodesPanel(user: AdminSubscription, nodes: readonly AdminNode[]): HTMLElement {
+  const panel = el('section', 'panel');
+  panel.setAttribute('aria-labelledby', 'nodes-title');
+  panel.append(panelHead('nodes-title', 'Узлы', formatCount(nodes.length)));
+  if (nodes.length === 0) {
+    panel.append(el('p', 'panel-note', user.provider_source_id === null
+      ? 'К подписке не привязан ни один узел.'
+      : 'Подписка обслуживается внешним провайдером, узлы сервиса к ней не привязываются.'));
+    return panel;
+  }
+  const table = el('table', 'table table-cards nodes-table');
+  table.append(el('caption', 'sr-only', 'Узлы подписки'), headRow(NODE_COLUMNS));
+  const body = el('tbody');
+  for (const node of nodes) {
+    const sync = el('span', 'status');
+    sync.append(el('span', node.status === 'active' ? 'swatch tone-active' : 'swatch tone-paused'),
+      el('span', '', SYNC_LABELS[node.status] ?? node.status));
+    const row = el('tr');
+    row.append(
+      cell('Узел', node.node_name || `Узел #${node.node_id}`),
+      cell('Синхронизация', sync),
+      cell('Попытки', formatCount(node.retry_count), 'num'),
+      cell('Следующая попытка', node.retry_at ? formatDateTime(node.retry_at) : 'Нет', node.retry_at ? '' : 'muted'),
+      cell('Обновлено', formatDateTime(node.updated_at)),
+      cell('Последняя ошибка', node.last_error ? el('span', 'error-text', node.last_error) : 'Нет',
+        node.last_error ? 'cell-wrap' : 'muted'),
+    );
+    body.append(row);
+  }
+  table.append(body);
+  const wrap = el('div', 'table-wrap');
+  wrap.append(table);
+  panel.append(wrap);
+  return panel;
+}
+
+function usersSkeleton(): HTMLElement {
+  const panel = skeletonPanel(8, false);
+  panel.classList.add('users-panel');
+  return panel;
+}
+
+function detailSkeleton(): HTMLElement[] {
+  const grid = el('div', 'detail-grid');
+  grid.append(skeletonPanel(6), skeletonPanel(4));
+  return [grid, skeletonPanel(3)];
+}
+
+// ---------------------------------------------------------------------------
 // Application
 
 const SESSION_CHECK_INTERVAL_MS = 60_000;
@@ -346,6 +668,15 @@ class AdminApp {
   private dashboard: { data: Dashboard; at: Date } | null = null;
   private overview: OverviewView | null = null;
   private dashboardRequest = 0;
+  // Users list state (search, filter, page, last snapshot) survives navigation
+  // within the signed-in session; it is never written to the URL or storage.
+  private usersState: UsersState = initialUsersState();
+  private usersView: UsersView | null = null;
+  private usersRequest = 0;
+  private searchTimer = 0;
+  private detailCache: { id: number; data: UserDetail; at: Date } | null = null;
+  private detailView: DetailView | null = null;
+  private detailRequest = 0;
 
   constructor(private readonly root: HTMLElement, private readonly api: AdminApi) {
     this.toasts.setAttribute('aria-live', 'polite');
@@ -372,6 +703,9 @@ class AdminApp {
 
   private mount(...nodes: HTMLElement[]) {
     this.overview = null;
+    this.usersView = null;
+    this.detailView = null;
+    window.clearTimeout(this.searchTimer);
     window.clearInterval(this.countdownTimer);
     window.clearTimeout(this.toastTimer);
     this.toasts.replaceChildren();
@@ -425,6 +759,8 @@ class AdminApp {
     this.shell = null;
     this.signedInAt = null;
     this.dashboard = null;
+    this.usersState = initialUsersState();
+    this.detailCache = null;
 
     const card = el('section', 'auth-card');
     card.setAttribute('aria-labelledby', 'login-title');
@@ -612,8 +948,8 @@ class AdminApp {
 
   private renderSection(focus: boolean) {
     if (!this.shell) return;
-    const section = currentSection();
-    const canonical = `#/${section.id}`;
+    const { section, userId } = currentRoute();
+    const canonical = userId === null ? `#/${section.id}` : `#/users/${userId}`;
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
     for (const [id, link] of this.shell.links) {
       if (id === section.id) link.setAttribute('aria-current', 'page');
@@ -621,31 +957,50 @@ class AdminApp {
     }
     document.title = `${section.label} · RS8 Admin`;
 
+    // Leaving a screen invalidates every request still in flight for it.
+    this.overview = null;
+    this.usersView = null;
+    this.detailView = null;
+    this.dashboardRequest++;
+    this.usersRequest++;
+    this.detailRequest++;
+    window.clearTimeout(this.searchTimer);
+
     const header = el('header', 'page-header');
     const heading = el('div', 'page-heading');
     const title = el('h1', 'page-title', section.label);
     title.tabIndex = -1;
-    heading.append(title, el('p', 'page-desc', section.description));
+    const desc = el('p', 'page-desc', section.description);
+    heading.append(title, desc);
     header.append(heading);
     const page = el('div', 'page');
-    page.append(header);
 
-    // Leaving Overview invalidates any dashboard request still in flight.
-    this.overview = null;
-    this.dashboardRequest++;
-    if (section.placeholder) {
+    let load: (() => Promise<void>) | null = null;
+    if (userId !== null) {
+      const back = el('a', 'back-link');
+      back.href = '#/users';
+      back.append(icon('back'), el('span', '', 'Назад к пользователям'));
+      page.append(back, header, this.buildUserDetail(userId, header, title, desc));
+      load = () => this.loadUser();
+    } else if (section.id === 'overview') {
+      page.append(header, this.buildOverview(header));
+      load = () => this.loadDashboard();
+    } else if (section.id === 'users') {
+      page.append(header, this.buildUsers(header));
+      load = () => this.loadUsers();
+    } else if (section.placeholder) {
       const empty = el('section', 'panel empty');
       empty.setAttribute('aria-labelledby', 'empty-title');
       const emptyTitle = el('h2', 'empty-title', section.placeholder.title);
       emptyTitle.id = 'empty-title';
       empty.append(icon(section.id, 20), emptyTitle, el('p', 'empty-text', section.placeholder.text));
-      page.append(empty);
-    } else {
-      page.append(this.buildOverview(header));
+      page.append(header, empty);
     }
     this.shell.content.replaceChildren(page);
-    if (focus) title.focus();
-    if (!section.placeholder) void this.loadDashboard();
+    // Back on the list, focus returns to the row of the user just viewed.
+    const restored = userId === null && section.id === 'users' ? this.returnFocus() : null;
+    if (focus) (restored ?? title).focus();
+    if (load) void load();
   }
 
   // Overview ----------------------------------------------------------------
@@ -738,6 +1093,411 @@ class AdminApp {
     } finally {
       if (current()) this.setRefreshing(view, false);
     }
+  }
+
+  // Users -------------------------------------------------------------------
+
+  private buildUsers(header: HTMLElement): HTMLElement {
+    const { actions, refresh, updated } = refreshActions(() => void this.loadUsers());
+    header.classList.add('has-actions');
+    header.append(actions);
+    const state = this.usersState;
+
+    const search = el('input', 'input search-input');
+    Object.assign(search, {
+      id: 'users-search', name: 'q', type: 'search', value: state.draft, autocomplete: 'off', spellcheck: false,
+      placeholder: 'Telegram ID, ID подписки или @username', maxLength: limits.queryBytes,
+    });
+    search.setAttribute('enterkeyhint', 'search');
+    const searchLabel = el('label', 'sr-only', 'Поиск пользователей');
+    searchLabel.htmlFor = search.id;
+    const clear = el('button', 'icon-button search-clear');
+    clear.type = 'button';
+    clear.setAttribute('aria-label', 'Очистить поиск');
+    clear.append(icon('close'));
+    clear.hidden = search.value === '';
+    const searchBox = el('div', 'search');
+    searchBox.append(icon('search'), search, clear);
+
+    const status = el('select', 'input select-input');
+    status.id = 'users-status';
+    status.append(option('', 'Все статусы'), ...STATUS_ROWS.map(row => option(row.key, row.label)));
+    status.value = state.query.status;
+    const statusCaption = el('label', 'sr-only', 'Статус подписки');
+    statusCaption.htmlFor = status.id;
+    const statusBox = el('div', 'select');
+    statusBox.append(status, icon('chevron'));
+
+    const summary = el('p', 'toolbar-meta');
+    summary.setAttribute('aria-live', 'polite');
+    const toolbar = el('div', 'toolbar');
+    toolbar.setAttribute('role', 'search');
+    toolbar.append(searchLabel, searchBox, statusCaption, statusBox, summary);
+
+    const error = el('p', 'field-error');
+    error.id = 'users-search-error';
+    const setSearchError = (text: string) => {
+      error.textContent = text;
+      if (text) {
+        search.setAttribute('aria-invalid', 'true');
+        search.setAttribute('aria-describedby', error.id);
+      } else {
+        search.removeAttribute('aria-invalid');
+        search.removeAttribute('aria-describedby');
+      }
+    };
+    const results = el('div', 'results');
+    const view: UsersView = { results, refresh, updated, summary, search, clear, status, setSearchError, pagerFocus: null };
+    this.usersView = view;
+
+    // Typing waits for a pause; Enter, clearing and the status filter apply at once.
+    const submit = (delay: number) => {
+      window.clearTimeout(this.searchTimer);
+      const run = () => this.applyUsersQuery(view, { q: search.value.trim(), status: parseStatus(status.value), offset: 0 });
+      if (delay > 0) this.searchTimer = window.setTimeout(run, delay);
+      else run();
+    };
+    search.addEventListener('input', () => {
+      this.usersState.draft = search.value;
+      clear.hidden = search.value === '';
+      submit(SEARCH_DEBOUNCE_MS);
+    });
+    search.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submit(0);
+      } else if (event.key === 'Escape' && search.value !== '') {
+        event.preventDefault();
+        this.clearSearch(view);
+        submit(0);
+      }
+    });
+    clear.addEventListener('click', () => {
+      this.clearSearch(view);
+      search.focus();
+      submit(0);
+    });
+    status.addEventListener('change', () => submit(0));
+
+    // A search typed but not applied before the list was left applies now.
+    const draft = state.draft.trim();
+    if (draft !== state.query.q && byteLength(draft) <= limits.queryBytes) state.query = { ...state.query, q: draft, offset: 0 };
+    if (state.page && state.pageQuery && state.at) this.paintUsers(view, state.page, state.pageQuery, state.at);
+    else this.paintUsersSkeleton(view);
+
+    const wrap = el('div', 'users');
+    wrap.append(toolbar, error, results);
+    return wrap;
+  }
+
+  /** Applies a search or filter change; it always restarts from the first page. */
+  private applyUsersQuery(view: UsersView, next: UsersQuery) {
+    if (this.usersView !== view) return;
+    if (byteLength(next.q) > limits.queryBytes) {
+      view.setSearchError('Запрос слишком длинный. Сократите его.');
+      return;
+    }
+    view.setSearchError('');
+    const current = this.usersState.query;
+    if (next.q === current.q && next.status === current.status) return;
+    this.usersState.query = next;
+    void this.loadUsers();
+  }
+
+  private clearSearch(view: UsersView) {
+    view.search.value = '';
+    view.clear.hidden = true;
+    this.usersState.draft = '';
+  }
+
+  private paintUsersSkeleton(view: UsersView) {
+    setLoading(view.results, 'Загружаем пользователей');
+    view.results.replaceChildren(usersSkeleton());
+    view.summary.textContent = '';
+    view.updated.textContent = '';
+  }
+
+  private paintUsersError(view: UsersView, error: unknown) {
+    setLoading(view.results, null);
+    view.results.replaceChildren(messagePanel('alert', 'Не удалось загрузить пользователей', errorText(error), 'alert',
+      retryButton(() => void this.loadUsers())));
+    view.summary.textContent = '';
+    view.updated.textContent = '';
+  }
+
+  private paintUsers(view: UsersView, page: UsersPage, query: UsersQuery, at: Date) {
+    setLoading(view.results, null);
+    const filtered = query.q !== '' || query.status !== '';
+    view.summary.textContent = page.total > 0 ? `${filtered ? 'Найдено' : 'Всего'}: ${formatCount(page.total)}` : '';
+    view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
+    if (page.users.length === 0) {
+      view.results.replaceChildren(this.usersEmpty(view, query));
+      return;
+    }
+    // Repainting replaces the rows; keep keyboard focus on the same user.
+    const active = document.activeElement;
+    const focused = active instanceof HTMLElement && view.results.contains(active) ? active.dataset.user : undefined;
+
+    const panel = el('section', 'panel users-panel');
+    panel.setAttribute('aria-label', 'Список пользователей');
+    const table = el('table', 'table table-cards users-table');
+    table.append(el('caption', 'sr-only', 'Пользователи'), headRow(USER_COLUMNS));
+    const body = el('tbody');
+    const now = Date.now();
+    for (const user of page.users) body.append(this.userRow(user, now));
+    table.append(body);
+    const wrap = el('div', 'table-wrap');
+    wrap.append(table);
+    panel.append(wrap, this.pager(view, page));
+    view.results.replaceChildren(panel);
+
+    if (focused) panel.querySelector<HTMLElement>(`a[data-user='${focused}']`)?.focus({ preventScroll: true });
+    const direction = view.pagerFocus;
+    view.pagerFocus = null;
+    if (direction) {
+      const [prev, next] = panel.querySelectorAll<HTMLButtonElement>('.pager-nav .btn');
+      const target = direction === 'prev' ? (prev?.disabled ? next : prev) : (next?.disabled ? prev : next);
+      view.results.scrollIntoView({ block: 'start' });
+      target?.focus({ preventScroll: true });
+    }
+  }
+
+  /** Tells an empty service apart from a search or filter with no match. */
+  private usersEmpty(view: UsersView, query: UsersQuery): HTMLElement {
+    if (query.q === '' && query.status === '') {
+      return messagePanel('users', 'Пользователей пока нет',
+        'Здесь появятся клиенты, которые привязали Telegram-аккаунт к подписке. Пробные подписки без привязки в список не входят.',
+        'status');
+    }
+    const parts: string[] = [];
+    if (query.q) parts.push(`по запросу «${query.q}»`);
+    if (query.status) parts.push(`со статусом «${statusLabel(query.status)}»`);
+    const hint = /^[0-9]+$/.test(query.q) ? ' Числовой запрос ищет точное совпадение Telegram ID или ID подписки.' : '';
+    const reset = button('Сбросить фильтры', 'btn btn-secondary btn-sm');
+    reset.addEventListener('click', () => {
+      this.clearSearch(view);
+      view.status.value = '';
+      this.applyUsersQuery(view, { q: '', status: '', offset: 0 });
+      view.search.focus();
+    });
+    return messagePanel('search', 'Пользователи не найдены', `Нет пользователей ${parts.join(' ')}.${hint}`, 'status', reset);
+  }
+
+  private userRow(user: AdminSubscription, now: number): HTMLTableRowElement {
+    const link = el('a', user.username ? 'user-link' : 'user-link is-anon', user.username ? handle(user.username) : 'Без имени');
+    link.href = `#/users/${user.telegram_id}`;
+    link.dataset.user = String(user.telegram_id);
+    link.addEventListener('click', () => { this.usersState.lastOpened = user.telegram_id; });
+    const expired = isActiveExpired(user, now);
+    const status = cell('Статус', statusBadge(user.status), 'col-status');
+    if (expired) status.append(el('span', 'flag', 'срок истёк'));
+    const expiry = cell('Действует до', user.expires_at ? formatDate(user.expires_at) : 'Бессрочно',
+      expired ? 'is-danger' : user.expires_at ? '' : 'muted');
+    if (user.expires_at) expiry.title = `${formatDateTime(user.expires_at)}, ${relativeTime(user.expires_at, now)}`;
+    const row = el('tr', 'row-link');
+    row.append(
+      cell('Пользователь', link, 'col-user'),
+      cell('Telegram ID', String(user.telegram_id), 'col-id'),
+      status,
+      cell('Тариф', planLabel(user), 'col-md'),
+      expiry,
+      cell('Последний запрос', user.last_request ? formatDateTime(user.last_request) : 'Не было', user.last_request ? 'col-lg' : 'col-lg muted'),
+      cell('Оплата', user.is_paid ? 'Платная' : 'Бесплатная', user.is_paid ? 'col-md' : 'col-md muted'),
+    );
+    // The whole row opens the user; the link inside keeps it reachable by keyboard.
+    row.addEventListener('click', event => {
+      if (event.target instanceof Element && event.target.closest('a')) return;
+      if (document.getSelection()?.type === 'Range') return;
+      link.click();
+    });
+    return row;
+  }
+
+  /** Page controls from the server's total, limit and offset. */
+  private pager(view: UsersView, page: UsersPage): HTMLElement {
+    const foot = el('div', 'pager');
+    const from = page.offset + 1;
+    const to = page.offset + page.users.length;
+    foot.append(el('p', 'pager-range', `С ${formatCount(from)} по ${formatCount(to)} из ${formatCount(page.total)}`));
+    const pages = Math.ceil(page.total / page.limit);
+    if (pages <= 1) return foot;
+    const nav = el('nav', 'pager-nav');
+    nav.setAttribute('aria-label', 'Страницы списка');
+    const prev = button('Предыдущая', 'btn btn-secondary btn-sm', 'prev');
+    const next = button('Следующая', 'btn btn-secondary btn-sm');
+    next.append(icon('next'));
+    prev.disabled = page.offset === 0;
+    next.disabled = page.offset + page.limit >= page.total;
+    const go = (offset: number, direction: 'prev' | 'next') => {
+      view.pagerFocus = direction;
+      this.usersState.query = { ...this.usersState.query, offset };
+      void this.loadUsers();
+    };
+    prev.addEventListener('click', () => go(Math.max(0, page.offset - page.limit), 'prev'));
+    next.addEventListener('click', () => go(page.offset + page.limit, 'next'));
+    const current = Math.floor(page.offset / page.limit) + 1;
+    nav.append(el('p', 'pager-page', `Страница ${formatCount(current)} из ${formatCount(pages)}`), prev, next);
+    foot.append(nav);
+    return foot;
+  }
+
+  /**
+   * Loads the current users query. A stale response (the administrator left
+   * the list or a newer query started) is dropped. A failed refresh of the
+   * list on screen keeps it and raises a toast; otherwise the error replaces
+   * the results and offers a retry.
+   */
+  private async loadUsers() {
+    const view = this.usersView;
+    if (!view) return;
+    const state = this.usersState;
+    const query = state.query;
+    const request = ++this.usersRequest;
+    const current = () => this.usersView === view && request === this.usersRequest;
+    setRefreshBusy(view.refresh, true);
+    if (state.page) view.results.setAttribute('aria-busy', 'true');
+    else this.paintUsersSkeleton(view);
+    try {
+      const page = await this.api.users(query);
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      // The list shrank below the requested page: step back to its last page.
+      // The offset strictly decreases, so this cannot loop.
+      const last = page.total > 0 ? Math.floor((page.total - 1) / page.limit) * page.limit : 0;
+      if (page.users.length === 0 && query.offset > last) {
+        state.query = { ...query, offset: last };
+        void this.loadUsers();
+        return;
+      }
+      state.page = page;
+      state.pageQuery = query;
+      state.at = new Date();
+      this.paintUsers(view, page, query, state.at);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      if (state.page && state.pageQuery && sameQuery(state.pageQuery, query)) {
+        view.results.removeAttribute('aria-busy');
+        this.toast(`Не удалось обновить список. ${errorText(error)}`);
+      } else {
+        this.paintUsersError(view, error);
+      }
+    } finally {
+      if (current()) setRefreshBusy(view.refresh, false);
+    }
+  }
+
+  /** Back on the list, the row of the user just viewed takes focus (and scrolls into view). */
+  private returnFocus(): HTMLElement | null {
+    const opened = this.usersState.lastOpened;
+    this.usersState.lastOpened = null;
+    if (opened === null || !this.usersView) return null;
+    return this.usersView.results.querySelector<HTMLElement>(`a[data-user='${opened}']`);
+  }
+
+  // User detail -------------------------------------------------------------
+
+  private buildUserDetail(id: number, header: HTMLElement, title: HTMLElement, desc: HTMLElement): HTMLElement {
+    const { actions, refresh, updated } = refreshActions(() => void this.loadUser());
+    header.classList.add('has-actions');
+    header.append(actions);
+    const cached = this.detailCache && this.detailCache.id === id ? this.detailCache : null;
+    // The list row, if any, names the user while the page loads.
+    const known = cached?.data.subscription ?? this.usersState.page?.users.find(user => user.telegram_id === id);
+    title.textContent = known ? displayName(known) : 'Пользователь';
+    desc.textContent = `Telegram ID ${id}`;
+    const body = el('div', 'detail');
+    const view: DetailView = { id, body, refresh, updated, title, desc };
+    this.detailView = view;
+    if (cached) this.paintDetail(view, cached.data, cached.at);
+    else this.paintDetailSkeleton(view);
+    return body;
+  }
+
+  private paintDetailSkeleton(view: DetailView) {
+    setLoading(view.body, 'Загружаем пользователя');
+    view.body.replaceChildren(...detailSkeleton());
+    view.updated.textContent = '';
+  }
+
+  private paintDetail(view: DetailView, data: UserDetail, at: Date) {
+    setLoading(view.body, null);
+    const user = data.subscription;
+    const name = displayName(user);
+    view.title.textContent = name;
+    view.desc.textContent = `Telegram ID ${user.telegram_id} · Подписка #${user.id}`;
+    document.title = `${name} · RS8 Admin`;
+    view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
+    const now = Date.now();
+    const grid = el('div', 'detail-grid');
+    grid.append(subscriptionPanel(user, data.plan, now), planPanel(user, data.plan));
+    view.body.replaceChildren(grid, nodesPanel(user, data.nodes));
+  }
+
+  private paintDetailMissing(view: DetailView) {
+    setLoading(view.body, null);
+    view.title.textContent = 'Пользователь';
+    view.updated.textContent = '';
+    const back = el('a', 'btn btn-secondary btn-sm', 'К списку пользователей');
+    back.href = '#/users';
+    view.body.replaceChildren(messagePanel('users', 'Пользователь не найден',
+      `Среди клиентов с привязанным Telegram-аккаунтом нет пользователя с Telegram ID ${view.id}.`, 'status', back));
+  }
+
+  private paintDetailError(view: DetailView, error: unknown) {
+    setLoading(view.body, null);
+    view.updated.textContent = '';
+    view.body.replaceChildren(messagePanel('alert', 'Не удалось загрузить пользователя', errorText(error), 'alert',
+      retryButton(() => void this.loadUser())));
+  }
+
+  /** Same policy as the list: stale responses are dropped, data on screen survives a failed refresh. */
+  private async loadUser() {
+    const view = this.detailView;
+    if (!view) return;
+    const request = ++this.detailRequest;
+    const current = () => this.detailView === view && request === this.detailRequest;
+    const shown = this.detailCache !== null && this.detailCache.id === view.id;
+    setRefreshBusy(view.refresh, true);
+    if (!shown) this.paintDetailSkeleton(view);
+    try {
+      const data = await this.api.user(view.id);
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      const at = new Date();
+      this.detailCache = { id: view.id, data, at };
+      this.paintDetail(view, data, at);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      if (error instanceof ApiError && error.status === 404) {
+        if (this.detailCache && this.detailCache.id === view.id) this.detailCache = null;
+        this.paintDetailMissing(view);
+      } else if (shown) {
+        this.toast(`Не удалось обновить данные пользователя. ${errorText(error)}`);
+      } else {
+        this.paintDetailError(view, error);
+      }
+    } finally {
+      if (current()) setRefreshBusy(view.refresh, false);
+    }
+  }
+
+  /**
+   * Confirms a 401 against /admin/session and signs out when the session is
+   * really gone; true when the caller must stop. Re-entering the app on a
+   * session the API still rejects would loop without end, so a live session
+   * leaves the error to the caller.
+   */
+  private async endIfSignedOut(error: unknown, current: () => boolean): Promise<boolean> {
+    if (!(error instanceof ApiError && error.code === 'unauthorized')) return false;
+    const session = await this.api.session().catch(() => null);
+    if (!current()) return true;
+    if (session && !session.authenticated) {
+      await this.signedOut('Сессия завершилась. Войдите снова.');
+      return true;
+    }
+    return false;
   }
 
   // Session lifecycle -------------------------------------------------------
