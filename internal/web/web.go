@@ -102,6 +102,7 @@ type Server struct {
 	subServer          *subserver.Service
 	subserverLogger    *subserver.AccessLogger
 	server             *http.Server
+	serveDone          chan struct{} // closed when the Serve goroutine exits
 	listenerAddr       string
 	mu                 sync.RWMutex
 	trialRateMu        sync.Mutex
@@ -283,7 +284,11 @@ func (s *Server) Start(ctx context.Context) error {
 	logger.Info("Web server started", zap.String("addr", s.listenerAddr))
 	s.initSubserverAccessLogger()
 
+	serveDone := make(chan struct{})
+	s.serveDone = serveDone
+
 	go func() {
+		defer close(serveDone)
 		defer logger.Recover("HTTP server")
 
 		err := s.server.Serve(listener)
@@ -338,6 +343,15 @@ func (s *Server) Stop(ctx context.Context) error {
 		serr := s.server.Shutdown(ctx)
 		if serr != nil {
 			errs = append(errs, serr)
+		}
+	}
+	// Shutdown does not wait for the Serve goroutine itself; wait for its final
+	// log so nothing outlives Stop.
+	if s.serveDone != nil {
+		select {
+		case <-s.serveDone:
+		case <-ctx.Done():
+			errs = append(errs, ctx.Err())
 		}
 	}
 
