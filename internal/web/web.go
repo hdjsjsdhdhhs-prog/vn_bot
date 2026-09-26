@@ -444,8 +444,7 @@ func (s *Server) handlePaymentCallback(w http.ResponseWriter, r *http.Request) {
 	// drop a confirmed payment or its alert.
 	notifyCtx := context.WithoutCancel(r.Context())
 	defer func() { _ = r.Body.Close() }()
-	// Read the authenticated callback once so DEBUG can preserve every field
-	// sent by the provider, including fields unknown to CallbackPayload.
+	// Read once for parsing and size diagnostics; never log provider payloads.
 	limitedBody := http.MaxBytesReader(w, r.Body, 256<<10)
 
 	rawBody, readErr := io.ReadAll(limitedBody)
@@ -455,16 +454,12 @@ func (s *Server) handlePaymentCallback(w http.ResponseWriter, r *http.Request) {
 			zap.String("reason", "body_read_failed"),
 			zap.Int("body_bytes", len(rawBody)),
 			zap.Error(readErr))
-		logger.Debug("Payment callback raw payload",
-			zap.ByteString("body", rawBody))
+
 		s.notifyPaymentCallbackIssue(r.Context(), platega.CallbackPayload{}, "malformed_callback", readErr.Error(), "send a corrected callback and verify the provider payload")
 		http.Error(w, "invalid callback", http.StatusBadRequest)
 
 		return
 	}
-
-	logger.Debug("Payment callback raw payload",
-		zap.ByteString("body", rawBody))
 
 	decoder := json.NewDecoder(bytes.NewReader(rawBody))
 	decoder.UseNumber()

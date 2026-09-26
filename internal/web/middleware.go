@@ -39,6 +39,22 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// safeRequestPath accepts the decoded URL.Path, not a full URL. Keep ordinary
+// route diagnostics, but hide everything after a bearer-bearing route segment.
+// Inspect before path.Clean so dot segments cannot expose a discarded token.
+func safeRequestPath(requestPath string) string {
+	segments := strings.Split(requestPath, "/")
+	for i, segment := range segments {
+		switch segment {
+		case "sub", "connect", "i", "subscription-info":
+			if i+1 < len(segments) && strings.Join(segments[i+1:], "/") != "" {
+				return logger.Sanitize(strings.Join(segments[:i+1], "/") + "/[redacted]")
+			}
+		}
+	}
+	return logger.Sanitize(requestPath)
+}
+
 // BearerAuthMiddleware returns an HTTP middleware that enforces a Bearer token equal to expectedToken.
 // It bypasses authentication for OPTIONS requests. If the Authorization header is missing, does not start
 // with "Bearer ", or the extracted token does not match expectedToken, the middleware logs a warning with
@@ -50,7 +66,7 @@ func BearerAuthMiddleware(expectedToken string) func(http.Handler) http.Handler 
 			// Fail closed: reject all requests if expectedToken is empty/whitespace (misconfiguration)
 			if strings.TrimSpace(expectedToken) == "" {
 				logger.Error("BearerAuthMiddleware misconfigured: empty expectedToken",
-					zap.String("path", r.URL.Path),
+					zap.String("path", safeRequestPath(r.URL.Path)),
 					zap.String("method", r.Method))
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 
@@ -68,7 +84,7 @@ func BearerAuthMiddleware(expectedToken string) func(http.Handler) http.Handler 
 			// with an empty Bearer token would be a security hole.
 			if expectedToken == "" {
 				logger.Warn("No auth token configured, rejecting request",
-					zap.String("path", r.URL.Path),
+					zap.String("path", safeRequestPath(r.URL.Path)),
 					zap.String("method", r.Method))
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 
@@ -79,7 +95,7 @@ func BearerAuthMiddleware(expectedToken string) func(http.Handler) http.Handler 
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" {
 				logger.Warn("Missing Authorization header",
-					zap.String("path", r.URL.Path),
+					zap.String("path", safeRequestPath(r.URL.Path)),
 					zap.String("method", r.Method))
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 
@@ -89,7 +105,7 @@ func BearerAuthMiddleware(expectedToken string) func(http.Handler) http.Handler 
 			// Check Bearer prefix
 			if !strings.HasPrefix(authHeader, "Bearer ") {
 				logger.Warn("Invalid Authorization header format",
-					zap.String("path", r.URL.Path),
+					zap.String("path", safeRequestPath(r.URL.Path)),
 					zap.String("method", r.Method))
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 
@@ -101,7 +117,7 @@ func BearerAuthMiddleware(expectedToken string) func(http.Handler) http.Handler 
 			// Use constant-time comparison to prevent timing attacks
 			if subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) != 1 {
 				logger.Warn("Invalid Bearer token",
-					zap.String("path", r.URL.Path),
+					zap.String("path", safeRequestPath(r.URL.Path)),
 					zap.String("method", r.Method))
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 

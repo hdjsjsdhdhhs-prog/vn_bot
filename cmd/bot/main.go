@@ -208,7 +208,7 @@ func initBot(cfg *config.Config) (*tgbotapi.BotAPI, *bot.BotConfig, error) {
 			break
 		}
 
-		logger.Warn("Telegram bot init failed, retrying...", zap.Int("attempt", i+1), zap.Int("max_attempts", botInitMaxAttempts), zap.Error(err))
+		logger.Warn("Telegram bot init failed, retrying...", zap.Int("attempt", i+1), zap.Int("max_attempts", botInitMaxAttempts), logger.SafeError(err, cfg.TelegramBotToken))
 
 		jitter := time.Duration(0)
 
@@ -498,7 +498,7 @@ func main() {
 
 	api, bc, err := initBot(cfg)
 	if err != nil {
-		logger.Fatal("Telegram bot initialization failed", zap.Error(err))
+		logger.Fatal("Telegram bot initialization failed", logger.SafeError(err, cfg.TelegramBotToken))
 	}
 
 	svc.handler.SetBot(api)
@@ -565,7 +565,8 @@ func recoverAndReport(component string) {
 		sentry.CurrentHub().Recover(r)
 		sentry.Flush(logger.SentryPanicFlushTimeout)
 		logger.Error(component+" panicked",
-			zap.Any("panic", r),
+			// Only the log representation is a string; Sentry received r above.
+			zap.String("panic", logger.Sanitize(fmt.Sprint(r))),
 			zap.String("stack", string(stack)),
 		)
 	}

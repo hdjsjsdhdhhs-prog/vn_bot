@@ -320,8 +320,8 @@ func fetchSource(ctx context.Context, subID string, src database.Node) sourceRes
 		logger.Error("Failed to fetch from node",
 			zap.String("sub_id", subID),
 			zap.String("source", src.Name),
-			zap.String("node_url", sourceURL),
-			zap.Error(err))
+			zap.String("node_url", logger.SafeURL(sourceURL)),
+			logger.SafeError(err, sourceURL, subID))
 
 		return sourceResult{}
 	}

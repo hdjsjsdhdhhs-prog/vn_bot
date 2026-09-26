@@ -25,6 +25,7 @@ import (
 
 // initSentry initializes Sentry error tracking if DSN is configured.
 func initSentry(cfg *config.Config) {
+	logger.RegisterSecrets(cfg.TelegramBotToken, cfg.PlategaSecret)
 	if cfg.SentryDSN == "" {
 		return
 	}
@@ -34,6 +35,7 @@ func initSentry(cfg *config.Config) {
 		Environment:      "production",
 		Release:          getVersion(),
 		TracesSampleRate: logger.SentryTracesSampleRate,
+		BeforeSend:       logger.SanitizeSentryEvent,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize Sentry: %v\n", err)
@@ -46,6 +48,7 @@ func initSentry(cfg *config.Config) {
 // initLogger initializes the logger and redirects stdlib log output.
 // Returns the log service for deferred cleanup.
 func initLogger(cfg *config.Config) (*logger.Service, error) {
+	logger.RegisterSecrets(cfg.TelegramBotToken, cfg.PlategaSecret)
 	logService, err := logger.Init(cfg.LogFilePath, cfg.LogLevel)
 	if err != nil {
 		return nil, fmt.Errorf("initialize logger: %w", err)
@@ -86,6 +89,10 @@ func initDatabase(cfg *config.Config) (dbService *database.Service, deps *runtim
 	if len(nodes) == 0 {
 		_ = dbService.Close()
 		return nil, nil, fmt.Errorf("no nodes configured")
+	}
+
+	for _, node := range nodes {
+		logger.RegisterSecrets(node.APIToken)
 	}
 
 	runtimeNodes, xuiClients, vpnClients, err := buildRuntimeNodeClients(nodes, defaultOptions())

@@ -117,40 +117,7 @@ func sendHeartbeat(url string) {
 	}
 }
 
-// maskURL masks a URL for logging purposes.
-// Shows only scheme and host, hides the path.
+// maskURL hides the complete heartbeat URL, including userinfo and query.
 func maskURL(urlStr string) string {
-	if len(urlStr) == 0 {
-		return "(empty)"
-	}
-
-	// Find the scheme separator
-	schemeEnd := 0
-
-	for i := 0; i < len(urlStr)-2; i++ {
-		if urlStr[i] == ':' && urlStr[i+1] == '/' && urlStr[i+2] == '/' {
-			schemeEnd = i
-			break
-		}
-	}
-
-	if schemeEnd == 0 {
-		// No scheme found, just mask everything
-		if len(urlStr) > 10 {
-			return urlStr[:10] + "..."
-		}
-
-		return "***"
-	}
-
-	// Find the first slash after scheme://
-	hostEnd := len(urlStr)
-	for i := schemeEnd + 3; i < len(urlStr); i++ {
-		if urlStr[i] == '/' {
-			hostEnd = i
-			break
-		}
-	}
-
-	return urlStr[:hostEnd] + "/***"
+	return logger.SafeURL(urlStr)
 }

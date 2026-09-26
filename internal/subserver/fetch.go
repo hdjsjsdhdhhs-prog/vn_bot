@@ -52,8 +52,8 @@ func FetchFromNode(ctx context.Context, url string) (*NodeResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		logger.Error("Failed to create HTTP request for source fetch",
-			zap.String("url", url),
-			zap.Error(err))
+			zap.String("url", logger.SafeURL(url)),
+			logger.SafeError(err, url))
 
 		return nil, fmt.Errorf("create source fetch request: %w", err)
 	}
@@ -63,15 +63,15 @@ func FetchFromNode(ctx context.Context, url string) (*NodeResponse, error) {
 	resp, err := fetchHTTPClient.Do(req)
 	if err != nil {
 		logger.Error("Source fetch request failed",
-			zap.String("url", url),
-			zap.Error(err))
+			zap.String("url", logger.SafeURL(url)),
+			logger.SafeError(err, url))
 
 		return nil, fmt.Errorf("execute source fetch request: %w", err)
 	}
 
 	if resp == nil || resp.Body == nil {
 		logger.Error("Source fetch returned no response body",
-			zap.String("url", url))
+			zap.String("url", logger.SafeURL(url)))
 
 		return nil, fmt.Errorf("source fetch returned no body: %s", url)
 	}
@@ -79,7 +79,7 @@ func FetchFromNode(ctx context.Context, url string) (*NodeResponse, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_ = resp.Body.Close()
 		logger.Error("Source fetch returned non-2xx status",
-			zap.String("url", url),
+			zap.String("url", logger.SafeURL(url)),
 			zap.Int("status", resp.StatusCode))
 
 		return nil, fmt.Errorf("source fetch %s returned status %d", url, resp.StatusCode)
@@ -89,23 +89,23 @@ func FetchFromNode(ctx context.Context, url string) (*NodeResponse, error) {
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
 			logger.Error("Failed to close source response body",
-				zap.String("url", url),
-				zap.Error(closeErr))
+				zap.String("url", logger.SafeURL(url)),
+				logger.SafeError(closeErr, url))
 		}
 	}()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseSize+1))
 	if err != nil {
 		logger.Error("Failed to read source response body",
-			zap.String("url", url),
-			zap.Error(err))
+			zap.String("url", logger.SafeURL(url)),
+			logger.SafeError(err, url))
 
 		return nil, fmt.Errorf("read source response body: %w", err)
 	}
 
 	if len(body) > config.MaxResponseSize {
 		logger.Error("Source response body exceeds size limit",
-			zap.String("url", url),
+			zap.String("url", logger.SafeURL(url)),
 			zap.Int("limit", config.MaxResponseSize))
 
 		return nil, fmt.Errorf("source response body exceeds %d bytes", config.MaxResponseSize)

@@ -73,7 +73,7 @@ func (w *stdLogWriter) Write(p []byte) (n int, err error) {
 		return len(p), nil
 	}
 
-	Log.Info(msg)
+	Info(msg)
 
 	return len(p), nil
 }
@@ -82,11 +82,11 @@ func (w *stdLogWriter) Write(p []byte) (n int, err error) {
 type tgbotapiLogger struct{}
 
 func (l *tgbotapiLogger) Println(v ...any) {
-	Log.Warn(fmt.Sprint(v...))
+	Warn(fmt.Sprint(v...))
 }
 
 func (l *tgbotapiLogger) Printf(format string, v ...any) {
-	Log.Warn(fmt.Sprintf(format, v...))
+	Warn(fmt.Sprintf(format, v...))
 }
 
 // RedirectStdLog redirects standard Go log output to our zap logger.
@@ -117,30 +117,30 @@ func SetSentryHub(hub *sentry.Hub) {
 
 // Info logs at INFO level.
 func Info(msg string, fields ...zap.Field) {
-	Log.Info(msg, fields...)
+	Log.Info(Sanitize(msg), sanitizeFields(fields)...)
 }
 
 // Error logs at ERROR level and sends to Sentry.
 func Error(msg string, fields ...zap.Field) {
-	Log.Error(msg, fields...)
-	captureToSentry(msg, "error")
+	Log.Error(Sanitize(msg), sanitizeFields(fields)...)
+	captureToSentry(Sanitize(msg), "error")
 }
 
 // Debug logs at DEBUG level.
 func Debug(msg string, fields ...zap.Field) {
-	Log.Debug(msg, fields...)
+	Log.Debug(Sanitize(msg), sanitizeFields(fields)...)
 }
 
 // Warn logs at WARN level.
 func Warn(msg string, fields ...zap.Field) {
-	Log.Warn(msg, fields...)
+	Log.Warn(Sanitize(msg), sanitizeFields(fields)...)
 }
 
 // Fatal logs at FATAL level, sends to Sentry, and exits.
 func Fatal(msg string, fields ...zap.Field) {
-	captureToSentry("[FATAL] "+msg, "fatal")
+	captureToSentry("[FATAL] "+Sanitize(msg), "fatal")
 	flushSentry(SentryFlushTimeout)
-	Log.Fatal(msg, fields...)
+	Log.Fatal(Sanitize(msg), sanitizeFields(fields)...)
 }
 
 // Sync flushes any buffered log entries.
@@ -337,48 +337,51 @@ func Recover(component string) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
 
+		// Sentry must receive the original value to retain exception types and chains.
+		// BeforeSend redacts the resulting event, not the panic object.
 		sentry.CurrentHub().Recover(r)
 		sentry.Flush(SentryPanicFlushTimeout)
-		Log.Error(component+" panicked",
-			zap.Any("panic", r),
-			zap.String("stack", string(stack)),
+		// Log directly: Error would capture a second Sentry event.
+		Log.Error(Sanitize(component+" panicked"),
+			zap.String("panic", Sanitize(fmt.Sprint(r))),
+			zap.String("stack", Sanitize(string(stack))),
 		)
 	}
 }
 
 // Info logs at INFO level.
 func (s *Service) Info(msg string, fields ...zap.Field) {
-	s.log.Info(msg, fields...)
+	s.log.Info(Sanitize(msg), sanitizeFields(fields)...)
 }
 
 // Debug logs at DEBUG level.
 func (s *Service) Debug(msg string, fields ...zap.Field) {
-	s.log.Debug(msg, fields...)
+	s.log.Debug(Sanitize(msg), sanitizeFields(fields)...)
 }
 
 // Warn logs at WARN level.
 func (s *Service) Warn(msg string, fields ...zap.Field) {
-	s.log.Warn(msg, fields...)
+	s.log.Warn(Sanitize(msg), sanitizeFields(fields)...)
 }
 
 // Error logs at ERROR level and sends to Sentry.
 func (s *Service) Error(msg string, fields ...zap.Field) {
-	s.log.Error(msg, fields...)
-	s.captureSentry(msg, sentry.LevelError)
+	s.log.Error(Sanitize(msg), sanitizeFields(fields)...)
+	s.captureSentry(Sanitize(msg), sentry.LevelError)
 }
 
 // Fatal logs at FATAL level, sends to Sentry, and exits.
 func (s *Service) Fatal(msg string, fields ...zap.Field) {
-	s.captureSentry("[FATAL] "+msg, sentry.LevelFatal)
+	s.captureSentry("[FATAL] "+Sanitize(msg), sentry.LevelFatal)
 	s.flushSentry(SentryFlushTimeout)
-	s.log.Fatal(msg, fields...)
+	s.log.Fatal(Sanitize(msg), sanitizeFields(fields)...)
 }
 
 // WithError returns a logger with error context for Sentry.
 func (s *Service) WithError(err error) *Service {
 	if s.sentryHub != nil {
 		s.sentryHub.ConfigureScope(func(scope *sentry.Scope) {
-			scope.SetTag("error", err.Error())
+			scope.SetTag("error", Sanitize(err.Error()))
 		})
 	}
 
@@ -388,7 +391,7 @@ func (s *Service) WithError(err error) *Service {
 // With returns a logger with additional fields.
 func (s *Service) With(fields ...zap.Field) *Service {
 	return &Service{
-		log:       s.log.With(fields...),
+		log:       s.log.With(sanitizeFields(fields)...),
 		file:      s.file,
 		sentryHub: s.sentryHub,
 	}
