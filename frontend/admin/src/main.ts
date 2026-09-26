@@ -1,8 +1,8 @@
 import './style.css';
 import {
-  AdminApi, ApiError, errorText, limits,
-  type AdminNode, type AdminPlan, type AdminSubscription, type Dashboard, type SubscriptionStatus,
-  type UserDetail, type UsersPage, type UsersQuery,
+  AdminApi, ApiError, errorText, limits, newRequestKey, RENEW_MAX_DAYS,
+  type AdminNode, type AdminPlan, type AdminSubscription, type Dashboard, type Mutation, type MutationAction,
+  type MutationOutcome, type SubscriptionStatus, type UserDetail, type UsersPage, type UsersQuery,
 } from './api';
 
 // ---------------------------------------------------------------------------
@@ -10,7 +10,7 @@ import {
 // handful of glyphs does not add a runtime dependency. One family, one stroke.
 
 type IconName = 'overview' | 'users' | 'audit' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
-  | 'search' | 'back' | 'prev' | 'next' | 'chevron';
+  | 'search' | 'back' | 'prev' | 'next' | 'chevron' | 'check';
 type Shape = readonly ['path' | 'circle' | 'rect', Readonly<Record<string, string>>];
 
 const ICONS: Record<IconName, readonly Shape[]> = {
@@ -53,6 +53,7 @@ const ICONS: Record<IconName, readonly Shape[]> = {
   prev: [['path', { d: 'm15 18-6-6 6-6' }]],
   next: [['path', { d: 'm9 18 6-6-6-6' }]],
   chevron: [['path', { d: 'm6 9 6 6 6-6' }]],
+  check: [['circle', { cx: '12', cy: '12', r: '10' }], ['path', { d: 'm9 12 2 2 4-4' }]],
 };
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -102,12 +103,12 @@ function brand(): HTMLElement {
   return node;
 }
 
-type Tone = 'error' | 'info';
+type Tone = 'error' | 'info' | 'success';
 interface Notice { tone: Tone; text: string }
 
 function notice({ tone, text }: Notice): HTMLElement {
   const node = el('div', `notice notice-${tone}`);
-  node.append(icon(tone === 'error' ? 'alert' : 'info'), el('p', '', text));
+  node.append(icon(tone === 'error' ? 'alert' : tone === 'success' ? 'check' : 'info'), el('p', '', text));
   return node;
 }
 
@@ -636,6 +637,172 @@ function detailSkeleton(): HTMLElement[] {
 }
 
 // ---------------------------------------------------------------------------
+// Subscription management. Availability mirrors database.applyAdminAction so
+// only meaningful actions are offered; the backend stays the authority and
+// its rejections are reported, never second-guessed. disable is a pause:
+// active|expired → paused, reversible by enable while the expiry has not passed.
+
+type ManageTone = 'primary' | 'secondary' | 'danger';
+
+interface ManageItem {
+  action: MutationAction;
+  title: string;
+  text: string;
+  label: string;
+  tone: ManageTone;
+  /** Set when the action is shown but cannot be applied in the current state. */
+  blocked?: string;
+}
+
+const hasExpired = (sub: AdminSubscription, now: number) => sub.expires_at !== null && Date.parse(sub.expires_at) <= now;
+
+function manageItems(sub: AdminSubscription, now: number): ManageItem[] {
+  const { status } = sub;
+  if (status !== 'active' && status !== 'expired' && status !== 'paused') return [];
+  const perpetual = sub.expires_at === null;
+  const lapsed = hasExpired(sub, now);
+  const canEnable = status === 'paused' && !lapsed;
+  const items: ManageItem[] = [];
+  if (status === 'paused') {
+    items.push({
+      action: 'enable', title: 'Возобновление', label: 'Возобновить', tone: canEnable ? 'primary' : 'secondary',
+      text: 'Вернуть подписку в активное состояние и восстановить доступ к VPN.',
+      blocked: canEnable ? undefined : 'Срок уже истёк: сначала продлите подписку или измените срок.',
+    });
+  }
+  items.push({
+    action: 'renew', title: 'Продление', label: 'Продлить', tone: perpetual || canEnable ? 'secondary' : 'primary',
+    text: lapsed ? 'Добавить дни от текущего момента: срок уже истёк.' : 'Добавить дни к текущему сроку.',
+    blocked: perpetual ? 'Подписка бессрочная, продлевать нечего.' : undefined,
+  });
+  items.push({
+    action: 'expiry', title: 'Срок действия', label: 'Изменить срок', tone: 'secondary',
+    text: perpetual ? 'Установить дату окончания. Сейчас подписка бессрочная.' : 'Установить конкретную дату окончания.',
+  });
+  if (status === 'active' || status === 'expired') {
+    items.push({
+      action: 'disable', title: 'Приостановка', label: 'Приостановить', tone: 'danger',
+      text: 'Временно отключить доступ к VPN. Срок действия не изменится.',
+    });
+  }
+  return items;
+}
+
+function unmanageableText(status: string): string {
+  if (status === 'revoked' || status === 'canceled') {
+    return `Подписка со статусом «${statusLabel(status)}» не продлевается, не приостанавливается и не возобновляется из панели.`;
+  }
+  return `Статус «${status}» панели неизвестен, поэтому действия с подпиской недоступны.`;
+}
+
+const btnClass = (tone: ManageTone) => (tone === 'primary' ? 'btn btn-primary' : tone === 'danger' ? 'btn btn-danger' : 'btn btn-secondary');
+
+/** Go time.AddDate(0, 0, days) in UTC, from max(now, expiry) like applyAdminAction. */
+function renewedExpiry(sub: AdminSubscription, days: number, now: number): string | null {
+  if (sub.expires_at === null) return null;
+  const current = Date.parse(sub.expires_at);
+  const next = new Date(current > now ? current : now);
+  next.setUTCDate(next.getUTCDate() + days);
+  return next.toISOString();
+}
+
+/** Status after a successful mutation, as applyAdminAction would set it. */
+function nextStatus(sub: AdminSubscription, action: MutationAction, expiresAt: string | null, now: number): string {
+  switch (action) {
+    case 'renew': return sub.status === 'expired' ? 'active' : sub.status;
+    case 'expiry': return sub.status === 'expired' && expiresAt !== null && Date.parse(expiresAt) > now ? 'active' : sub.status;
+    case 'disable': return 'paused';
+    case 'enable': return 'active';
+  }
+}
+
+const expiryLabel = (iso: string | null) => (iso ? formatDateTime(iso) : 'Бессрочно');
+
+const pad2 = (value: number) => String(value).padStart(2, '0');
+
+/** A local Date as the value of <input type="datetime-local"> (minute precision). */
+function localInputValue(date: Date): string {
+  return `${String(date.getFullYear()).padStart(4, '0')}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}T${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+}
+
+/** Parses a datetime-local value; null for malformed or non-existent local times (DST gaps). */
+function parseLocalInput(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  const [year, month, day, hour, minute] = match.slice(1).map(Number);
+  const date = new Date(year, month - 1, day, hour, minute);
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day ||
+    date.getHours() !== hour || date.getMinutes() !== minute) return null;
+  return date;
+}
+
+/** RFC 3339 UTC without fractional seconds, as time.Parse(time.RFC3339) expects. */
+const toRFC3339 = (date: Date) => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+function timeZoneLabel(): string {
+  const offset = -new Date().getTimezoneOffset();
+  const sign = offset >= 0 ? '+' : '−';
+  return `UTC${sign}${pad2(Math.floor(Math.abs(offset) / 60))}:${pad2(Math.abs(offset) % 60)}`;
+}
+
+const ACTION_FAILED: Readonly<Record<MutationAction, string>> = {
+  renew: 'Подписка не продлена.',
+  expiry: 'Срок не изменён.',
+  disable: 'Подписка не приостановлена.',
+  enable: 'Подписка не возобновлена.',
+};
+
+/** Recorded domain rejections (HTTP 409): nothing changed; the page is refreshed. */
+const REJECTIONS: Readonly<Record<string, string>> = {
+  invalid_state: 'Текущий статус подписки не позволяет это действие. Данные подписки обновлены.',
+  subscription_expired: 'Срок подписки уже истёк, поэтому её нельзя возобновить. Сначала продлите подписку или измените срок.',
+  perpetual_subscription: 'Подписка бессрочная, продлевать нечего. Чтобы задать дату окончания, используйте «Изменить срок».',
+  invalid_expiry: 'Итоговый срок выходит за допустимый диапазон.',
+  request_key_conflict: 'Запрос конфликтует с ранее отправленным. Данные подписки обновлены, повторите действие.',
+};
+
+function successText(action: MutationAction, before: AdminSubscription, outcome: MutationOutcome): string {
+  const after = outcome.subscription;
+  const parts: string[] = [];
+  switch (action) {
+    case 'renew': parts.push(`Подписка продлена до ${expiryLabel(after.expires_at)} (было: ${expiryLabel(before.expires_at)}).`); break;
+    case 'expiry': parts.push(`Срок изменён: ${expiryLabel(before.expires_at)} → ${expiryLabel(after.expires_at)}.`); break;
+    case 'disable': parts.push('Подписка приостановлена, доступ к VPN отключается.'); break;
+    case 'enable': parts.push('Подписка возобновлена, доступ к VPN восстанавливается.'); break;
+  }
+  if (action !== 'disable' && action !== 'enable' && before.status !== after.status) {
+    parts.push(`Статус: ${statusLabel(before.status)} → ${statusLabel(after.status)}.`);
+  }
+  if (after.status === 'paused' && (action === 'renew' || action === 'expiry')) {
+    parts.push('Подписка остаётся приостановленной.');
+  }
+  if (outcome.replayed) parts.push('Этот запрос уже был выполнен ранее, повторно изменение не применялось.');
+  return parts.join(' ');
+}
+
+/** "old → new" for the confirmation summary; unchanged values say so. */
+function change(before: string, after: string | null): HTMLElement {
+  const node = el('span', 'change');
+  if (after === before) {
+    node.append(el('span', '', before), el('span', 'change-same', 'не изменится'));
+    return node;
+  }
+  const arrow = el('span', 'change-arrow', '→');
+  arrow.setAttribute('aria-hidden', 'true');
+  node.append(el('span', 'change-old', before), arrow, el('span', 'sr-only', ' станет '),
+    el('span', 'change-new', after ?? '—'));
+  return node;
+}
+
+function summaryRow(label: string, value: string | Node): HTMLElement {
+  const row = el('div', 'summary-row');
+  const data = el('dd');
+  data.append(value);
+  row.append(el('dt', '', label), data);
+  return row;
+}
+
+// ---------------------------------------------------------------------------
 // Application
 
 const SESSION_CHECK_INTERVAL_MS = 60_000;
@@ -677,6 +844,10 @@ class AdminApp {
   private detailCache: { id: number; data: UserDetail; at: Date } | null = null;
   private detailView: DetailView | null = null;
   private detailRequest = 0;
+  // The open confirmation dialog, if any, and the outcome of the last
+  // management action shown on the subscription page it belongs to.
+  private dialog: { dismiss: () => void } | null = null;
+  private manageNotice: { subscriptionId: number; notice: Notice } | null = null;
 
   constructor(private readonly root: HTMLElement, private readonly api: AdminApi) {
     this.toasts.setAttribute('aria-live', 'polite');
@@ -702,6 +873,7 @@ class AdminApp {
   }
 
   private mount(...nodes: HTMLElement[]) {
+    this.closeDialog();
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
@@ -761,6 +933,7 @@ class AdminApp {
     this.dashboard = null;
     this.usersState = initialUsersState();
     this.detailCache = null;
+    this.manageNotice = null;
 
     const card = el('section', 'auth-card');
     card.setAttribute('aria-labelledby', 'login-title');
@@ -957,7 +1130,10 @@ class AdminApp {
     }
     document.title = `${section.label} · RS8 Admin`;
 
-    // Leaving a screen invalidates every request still in flight for it.
+    // Leaving a screen invalidates every request still in flight for it. A
+    // mutation already sent still completes on the server; its dialog closes.
+    this.closeDialog();
+    this.manageNotice = null;
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
@@ -1428,10 +1604,406 @@ class AdminApp {
     view.desc.textContent = `Telegram ID ${user.telegram_id} · Подписка #${user.id}`;
     document.title = `${name} · RS8 Admin`;
     view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
+    // Repainting replaces every node; keep keyboard focus on the same control.
+    const active = document.activeElement;
+    const focusKey = active instanceof HTMLElement && view.body.contains(active) ? active.dataset.focusKey : undefined;
     const now = Date.now();
     const grid = el('div', 'detail-grid');
     grid.append(subscriptionPanel(user, data.plan, now), planPanel(user, data.plan));
-    view.body.replaceChildren(grid, nodesPanel(user, data.nodes));
+    view.body.replaceChildren(grid, this.managePanel(data, now), nodesPanel(user, data.nodes));
+    if (focusKey) this.focusManage(focusKey);
+  }
+
+  /** The "Управление подпиской" panel: actions valid for the current status plus the last outcome. */
+  private managePanel(data: UserDetail, now: number): HTMLElement {
+    const sub = data.subscription;
+    const panel = el('section', 'panel manage');
+    panel.setAttribute('aria-labelledby', 'manage-title');
+    const head = panelHead('manage-title', 'Управление подпиской', `#${sub.id}`);
+    const heading = head.querySelector<HTMLElement>('.panel-title');
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.dataset.focusKey = 'manage-title';
+    }
+    panel.append(head);
+    const shown = this.manageNotice?.subscriptionId === sub.id ? this.manageNotice.notice : null;
+    if (shown) {
+      const slot = el('div', 'manage-notice');
+      const node = notice(shown);
+      node.tabIndex = -1;
+      node.dataset.focusKey = 'manage-notice';
+      node.setAttribute('role', shown.tone === 'error' ? 'alert' : 'status');
+      slot.append(node);
+      panel.append(slot);
+    }
+    const items = manageItems(sub, now);
+    if (items.length === 0) {
+      panel.append(el('p', 'panel-note', unmanageableText(sub.status)));
+      return panel;
+    }
+    const list = el('ul', 'manage-list');
+    for (const item of items) {
+      const entry = el('li', 'manage-item');
+      const textId = `manage-${item.action}-text`;
+      const text = el('p', item.blocked ? 'manage-text is-blocked' : 'manage-text', item.blocked ?? item.text);
+      text.id = textId;
+      const trigger = button(item.label, `${btnClass(item.tone)} btn-sm`);
+      trigger.dataset.focusKey = `manage-${item.action}`;
+      trigger.setAttribute('aria-describedby', textId);
+      trigger.disabled = item.blocked !== undefined;
+      trigger.addEventListener('click', () => this.openManage(item.action, data));
+      entry.append(el('p', 'manage-title', item.title), text, trigger);
+      list.append(entry);
+    }
+    panel.append(list);
+    return panel;
+  }
+
+  /** Focuses a management control by key; a vanished or disabled one falls back to the panel title. */
+  private focusManage(key: string) {
+    const body = this.detailView?.body;
+    if (!body) return;
+    const target = body.querySelector<HTMLElement>(`[data-focus-key='${key}']`);
+    const usable = target && !(target instanceof HTMLButtonElement && target.disabled) ? target : null;
+    const fallback = key.startsWith('manage-') ? body.querySelector<HTMLElement>("[data-focus-key='manage-title']") : null;
+    (usable ?? fallback)?.focus({ preventScroll: usable === null });
+  }
+
+  private closeDialog() {
+    const open = this.dialog;
+    this.dialog = null;
+    open?.dismiss();
+  }
+
+  /** Keeps the users list snapshot in step with a subscription changed here. */
+  private patchUsersRow(sub: AdminSubscription) {
+    const page = this.usersState.page;
+    if (!page || !page.users.some(user => user.id === sub.id)) return;
+    this.usersState.page = { ...page, users: page.users.map(user => (user.id === sub.id ? sub : user)) };
+  }
+
+  /**
+   * Confirmation dialog for one mutation: idle → confirmation → submitting →
+   * success | error. The request key is fixed per confirmed payload: an
+   * uncertain outcome (network, timeout, 5xx) freezes the parameters so the
+   * retry replays instead of applying twice. Nothing is retried automatically.
+   */
+  private openManage(action: MutationAction, data: UserDetail) {
+    const view = this.detailView;
+    if (!view || this.dialog || this.view !== 'app') return;
+    const before = data.subscription;
+    const telegramId = before.telegram_id;
+    const opened = Date.now();
+
+    const spec: Readonly<Record<MutationAction, { title: string; text: string; confirm: string; tone: ManageTone }>> = {
+      renew: {
+        title: 'Продлить подписку?', confirm: 'Продлить', tone: 'primary',
+        text: 'Дни добавляются к текущему сроку, а если он уже истёк — к текущему моменту. Счётчик напоминаний об окончании сбрасывается.',
+      },
+      expiry: {
+        title: 'Изменить срок подписки?', confirm: 'Изменить срок', tone: 'primary',
+        text: 'Новая дата окончания заменит текущую. Счётчик напоминаний об окончании сбрасывается.',
+      },
+      disable: {
+        title: 'Приостановить подписку?', confirm: 'Приостановить', tone: 'danger',
+        text: 'Доступ к VPN будет отключён. Срок действия не изменится, подписку можно возобновить, пока он не истёк.',
+      },
+      enable: {
+        title: 'Возобновить подписку?', confirm: 'Возобновить', tone: 'primary',
+        text: 'Подписка станет активной, доступ к VPN будет восстановлен.',
+      },
+    };
+    const { title: titleText, text: explanation, confirm: confirmText, tone } = spec[action];
+
+    const dialog = el('dialog', 'modal');
+    dialog.setAttribute('aria-labelledby', 'manage-dialog-title');
+    dialog.setAttribute('aria-describedby', 'manage-dialog-text');
+    const title = el('h2', 'modal-title', titleText);
+    title.id = 'manage-dialog-title';
+    const text = el('p', 'modal-text', explanation);
+    text.id = 'manage-dialog-text';
+
+    const statusValue = el('span');
+    const expiryValue = el('span');
+    const summary = el('dl', 'summary');
+    summary.append(
+      summaryRow('Пользователь', `${displayName(before)} · ${telegramId}`),
+      summaryRow('Подписка', `#${before.id}`),
+      summaryRow('Статус', statusValue),
+      summaryRow('Действует до', expiryValue),
+    );
+
+    // Parameters: days for renew, a local date and time for expiry.
+    const controls = el('div', 'modal-controls');
+    let input: HTMLInputElement | null = null;
+    let setFieldError: (message: string) => void = () => undefined;
+    const presets: HTMLButtonElement[] = [];
+    if (action === 'renew') {
+      input = el('input', 'input');
+      Object.assign(input, { id: 'manage-days', name: 'days', type: 'number', min: '1', max: String(RENEW_MAX_DAYS), step: '1', value: '30' });
+      input.inputMode = 'numeric';
+      const days = field('Количество дней', input);
+      setFieldError = days.setError;
+      const chips = el('div', 'chips');
+      chips.setAttribute('role', 'group');
+      chips.setAttribute('aria-label', 'Быстрый выбор');
+      for (const preset of [7, 30, 90, 365]) {
+        const chip = button(`${preset} дн.`, 'chip');
+        chip.dataset.days = String(preset);
+        chip.addEventListener('click', () => {
+          if (!input || input.readOnly) return;
+          input.value = String(preset);
+          input.dispatchEvent(new Event('input'));
+        });
+        presets.push(chip);
+        chips.append(chip);
+      }
+      controls.append(days.root, chips, el('p', 'field-hint', `От 1 до ${formatCount(RENEW_MAX_DAYS)} дней.`));
+    } else if (action === 'expiry') {
+      input = el('input', 'input');
+      const current = before.expires_at ? new Date(before.expires_at) : null;
+      const initial = current && current.getTime() > opened ? current : new Date(opened + 30 * DAY_MS);
+      Object.assign(input, { id: 'manage-expiry', name: 'expires_at', type: 'datetime-local', step: '60', value: localInputValue(initial), max: '9999-12-31T23:59' });
+      input.min = localInputValue(new Date(opened + MINUTE_MS));
+      const date = field('Новый срок', input);
+      setFieldError = date.setError;
+      controls.append(date.root, el('p', 'field-hint', `Дата и время в часовом поясе браузера (${timeZoneLabel()}).`));
+    }
+
+    /** The mutation for the current parameters, or an error message. */
+    const read = (): Mutation | string => {
+      if (action === 'renew') {
+        const raw = input?.value.trim() ?? '';
+        const days = /^\d{1,4}$/.test(raw) ? Number(raw) : NaN;
+        if (!Number.isInteger(days) || days < 1 || days > RENEW_MAX_DAYS) return `Укажите целое число дней от 1 до ${formatCount(RENEW_MAX_DAYS)}.`;
+        return { action, days };
+      }
+      if (action === 'expiry') {
+        const date = parseLocalInput(input?.value ?? '');
+        if (!date) return 'Укажите корректные дату и время.';
+        if (date.getFullYear() > 9999) return 'Год не может быть больше 9999.';
+        if (date.getTime() <= Date.now()) return 'Новый срок должен быть в будущем.';
+        if (before.expires_at && Math.floor(date.getTime() / MINUTE_MS) === Math.floor(Date.parse(before.expires_at) / MINUTE_MS)) {
+          return 'Новый срок совпадает с текущим.';
+        }
+        return { action, expiresAt: toRFC3339(date) };
+      }
+      return { action };
+    };
+
+    const preview = () => {
+      const mutation = read();
+      const valid = typeof mutation !== 'string';
+      const now = Date.now();
+      let expiresAt: string | null = before.expires_at;
+      if (valid && mutation.action === 'renew') expiresAt = renewedExpiry(before, mutation.days, now);
+      if (valid && mutation.action === 'expiry') expiresAt = mutation.expiresAt;
+      const parametric = action === 'renew' || action === 'expiry';
+      const nextExpiry = parametric && !valid ? null : expiryLabel(expiresAt);
+      statusValue.replaceChildren(change(statusLabel(before.status), parametric && !valid ? null : statusLabel(nextStatus(before, action, expiresAt, now))));
+      expiryValue.replaceChildren(change(expiryLabel(before.expires_at), nextExpiry));
+      for (const chip of presets) chip.setAttribute('aria-pressed', String(valid && mutation.action === 'renew' && chip.dataset.days === String(mutation.days)));
+    };
+
+    const status = el('div', 'modal-status');
+    status.setAttribute('role', 'alert');
+    const show = (value: Notice | null) => status.replaceChildren(...(value ? [notice(value)] : []));
+    const cancel = button('Отмена', 'btn btn-secondary');
+    const confirm = button(confirmText, btnClass(tone));
+    const actions = el('div', 'modal-actions');
+    actions.append(cancel, confirm);
+    const body = el('div', 'modal-body');
+    body.append(title, text, summary);
+    if (input) body.append(controls);
+    if (action === 'renew') body.append(el('p', 'field-hint', 'Новый срок рассчитан предварительно: точное значение сервер вычисляет в момент выполнения.'));
+    body.append(status, actions);
+    dialog.append(body);
+
+    let key = newRequestKey();
+    let submitting = false;
+    // An uncertain or committed attempt freezes the payload under its key.
+    let frozen = false;
+    // The page may no longer match the server: refresh it when the dialog closes.
+    let stale = false;
+    // A final answer (404): the dialog can only be closed.
+    let settled = false;
+    let confirmLabel = confirmText;
+    let retryAt = 0;
+    let cooldown = 0;
+
+    const sync = () => {
+      const waiting = Date.now() < retryAt;
+      confirm.disabled = submitting || settled || waiting;
+      confirm.setAttribute('aria-busy', String(submitting));
+      cancel.disabled = submitting;
+      if (input) input.readOnly = submitting || frozen;
+      for (const chip of presets) chip.disabled = submitting || frozen;
+      if (submitting) setLabel(confirm, 'Выполняем…');
+      else if (waiting) setLabel(confirm, `Повторить через ${Math.ceil((retryAt - Date.now()) / 1000)} с`);
+      else setLabel(confirm, confirmLabel);
+    };
+
+    const handle = {
+      dismiss: () => {
+        window.clearInterval(cooldown);
+        if (dialog.open) dialog.close();
+        dialog.remove();
+      },
+    };
+    const isOpen = () => this.dialog === handle;
+
+    const close = (focusKey: string) => {
+      if (!isOpen()) return;
+      this.dialog = null;
+      handle.dismiss();
+      this.focusManage(focusKey);
+      if (stale) void this.loadUser(before.id);
+    };
+    /** Ends the dialog with an outcome shown on the page. */
+    const finish = (value: Notice) => {
+      this.manageNotice = { subscriptionId: before.id, notice: value };
+      stale = true;
+      const detail = this.detailView;
+      const cached = this.detailCache;
+      if (detail && cached && cached.id === telegramId) this.paintDetail(detail, cached.data, cached.at);
+      close('manage-notice');
+    };
+
+    input?.addEventListener('input', () => {
+      // A changed payload is a new request; a frozen one keeps its key.
+      if (frozen) return;
+      key = newRequestKey();
+      setFieldError('');
+      if (!submitting) show(null);
+      preview();
+    });
+    input?.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        confirm.click();
+      }
+    });
+    cancel.addEventListener('click', () => close(`manage-${action}`));
+    // Escape closes only while nothing is in flight. The keydown is handled
+    // here so the browser cannot close the dialog mid-request on its own.
+    dialog.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      if (!submitting) close(`manage-${action}`);
+    });
+    dialog.addEventListener('cancel', event => {
+      event.preventDefault();
+      if (!submitting) close(`manage-${action}`);
+    });
+    // Closed by the browser anyway: forget it; an in-flight answer is dropped.
+    dialog.addEventListener('close', () => {
+      if (!isOpen()) return;
+      this.dialog = null;
+      handle.dismiss();
+      this.focusManage(`manage-${action}`);
+      if (stale || submitting) void this.loadUser(before.id);
+    });
+
+    confirm.addEventListener('click', () => {
+      if (submitting || settled || Date.now() < retryAt) return;
+      const mutation = read();
+      if (typeof mutation === 'string') {
+        setFieldError(mutation);
+        input?.focus();
+        return;
+      }
+      submitting = true;
+      show(null);
+      sync();
+      void this.api.mutate(before.id, mutation, key).then(
+        outcome => {
+          submitting = false;
+          if (!isOpen()) {
+            // The page moved on; drop cached copies that are now outdated.
+            if (this.detailCache?.id === telegramId) this.detailCache = null;
+            return;
+          }
+          this.lastSessionCheck = Date.now();
+          const cached = this.detailCache;
+          if (cached && cached.id === telegramId) {
+            // The mutation response carries no plan name; the plan is unchanged.
+            const subscription = { ...outcome.subscription, plan_name: outcome.subscription.plan_name || cached.data.subscription.plan_name };
+            this.detailCache = { ...cached, data: { ...cached.data, subscription }, at: new Date() };
+            this.patchUsersRow(subscription);
+          }
+          finish({ tone: 'success', text: successText(action, before, outcome) });
+        },
+        async (error: unknown) => {
+          submitting = false;
+          if (!isOpen()) {
+            if (this.detailCache?.id === telegramId) this.detailCache = null;
+            return;
+          }
+          if (await this.endIfSignedOut(error, isOpen)) return;
+          if (!isOpen()) return;
+          const code = error instanceof ApiError ? error.code : '';
+          const httpStatus = error instanceof ApiError ? error.status : 0;
+          if (httpStatus === 409 && code in REJECTIONS) {
+            finish({ tone: 'error', text: `${ACTION_FAILED[action]} ${REJECTIONS[code]}` });
+            return;
+          }
+          if (httpStatus === 404) {
+            settled = true;
+            stale = true;
+            show({ tone: 'error', text: 'Подписка не найдена. Возможно, она удалена. Закройте окно, чтобы обновить страницу.' });
+          } else if (code === 'sync_failed') {
+            // Committed and audited; only the node sync setup failed. The
+            // same key replays the change and re-runs the sync.
+            frozen = true;
+            stale = true;
+            confirmLabel = 'Повторить синхронизацию';
+            show({ tone: 'error', text: 'Изменение сохранено, но синхронизация с узлами не запущена. Повторите: изменение не применится второй раз.' });
+            void this.loadUser(before.id);
+          } else if (httpStatus === 401) {
+            // Rejected before the service; the session check above found it alive.
+            show({ tone: 'error', text: `${ACTION_FAILED[action]} ${errorText(error)}` });
+          } else if (httpStatus === 400) {
+            show({ tone: 'error', text: `${ACTION_FAILED[action]} Сервер отклонил параметры запроса. Проверьте значения.` });
+          } else if (httpStatus === 403) {
+            show({ tone: 'error', text: `${ACTION_FAILED[action]} Сервер отклонил запрос: нет доступа или устарел ключ защиты сессии. Повторите попытку.` });
+            // Refresh the session's CSRF token for a manual retry; sign out only
+            // if the session is really gone (no logout loop on a live session).
+            void this.api.session().then(
+              session => { if (!session.authenticated && this.view === 'app') void this.signedOut('Сессия завершилась. Войдите снова.'); },
+              () => undefined,
+            );
+          } else if (httpStatus === 429 && error instanceof ApiError) {
+            retryAt = Date.now() + error.retryAfter * 1000;
+            show({ tone: 'error', text: `${ACTION_FAILED[action]} ${errorText(error)}` });
+            window.clearInterval(cooldown);
+            cooldown = window.setInterval(() => {
+              sync();
+              if (Date.now() >= retryAt) window.clearInterval(cooldown);
+            }, 1000);
+          } else {
+            // Network, timeout, 5xx or an unreadable answer: the change may
+            // or may not have been applied. Retrying with this key is safe.
+            frozen = true;
+            stale = true;
+            confirmLabel = 'Повторить';
+            show({ tone: 'error', text: `Не удалось подтвердить результат. ${errorText(error)} Повтор безопасен: изменение не применится дважды.` });
+          }
+          sync();
+          if (!settled && !confirm.disabled) confirm.focus();
+          else cancel.focus();
+        },
+      );
+    });
+
+    preview();
+    sync();
+    this.dialog = handle;
+    this.manageNotice = null;
+    const panelNotice = view.body.querySelector('.manage-notice');
+    panelNotice?.remove();
+    this.root.append(dialog);
+    dialog.showModal();
+    (input ?? cancel).focus();
   }
 
   private paintDetailMissing(view: DetailView) {
@@ -1451,8 +2023,12 @@ class AdminApp {
       retryButton(() => void this.loadUser())));
   }
 
-  /** Same policy as the list: stale responses are dropped, data on screen survives a failed refresh. */
-  private async loadUser() {
+  /**
+   * Same policy as the list: stale responses are dropped, data on screen
+   * survives a failed refresh. After a management action the page is re-read
+   * by subscription ID (GET /admin/api/subscriptions/{id}).
+   */
+  private async loadUser(subscriptionId?: number) {
     const view = this.detailView;
     if (!view) return;
     const request = ++this.detailRequest;
@@ -1461,11 +2037,12 @@ class AdminApp {
     setRefreshBusy(view.refresh, true);
     if (!shown) this.paintDetailSkeleton(view);
     try {
-      const data = await this.api.user(view.id);
+      const data = subscriptionId === undefined ? await this.api.user(view.id) : await this.api.subscription(subscriptionId, view.id);
       if (!current()) return;
       this.lastSessionCheck = Date.now();
       const at = new Date();
       this.detailCache = { id: view.id, data, at };
+      this.patchUsersRow(data.subscription);
       this.paintDetail(view, data, at);
     } catch (error) {
       if (!current()) return;

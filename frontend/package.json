@@ -10,7 +10,8 @@
     "build": "vite build",
     "build:admin": "vite build --mode admin",
     "test": "vitest run",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "test:browser:admin": "playwright test -c playwright.admin.config.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.0",

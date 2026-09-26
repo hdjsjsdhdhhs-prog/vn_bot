@@ -134,6 +134,63 @@ export interface UserDetail {
  */
 export const limits = { usernameBytes: 64, passwordBytes: 72, queryBytes: 128 } as const;
 
+// POST /admin/api/subscriptions/{id}/{renew|disable|enable|expiry}
+// (web.adminAPI.mutate → service.AdminService.Mutate → database.applyAdminAction).
+// Body: {request_key, days?, expires_at?}, unknown fields rejected, at most 4 KiB.
+//   renew    days 1..3650 added to max(now, expires_at); expired → active,
+//            paused stays paused; revoked/canceled and perpetual are rejected.
+//   expiry   expires_at (RFC 3339) replaces the expiry; expired + future → active,
+//            paused stays paused; revoked/canceled are rejected.
+//   disable  active|expired → paused (VPN access removed on the nodes).
+//   enable   paused → active, only while the expiry has not passed.
+// A request key replays the recorded outcome for the same payload, so an
+// uncertain request is retried with the SAME key and payload.
+
+/** database.AdminMaxRenewalDays (MaxSubscriptionRenewalDays). */
+export const RENEW_MAX_DAYS = 3650;
+
+export type Mutation =
+  | { readonly action: 'renew'; readonly days: number }
+  | { readonly action: 'expiry'; readonly expiresAt: string }
+  | { readonly action: 'disable' }
+  | { readonly action: 'enable' };
+
+export type MutationAction = Mutation['action'];
+
+/** service.AdminMutationOutcome; the audit entry belongs to the audit screen. */
+export interface MutationOutcome {
+  /** As committed. plan_name is not part of the mutation response ('' here). */
+  readonly subscription: AdminSubscription;
+  /** true when the request key had already been applied. */
+  readonly replayed: boolean;
+}
+
+/** RFC 3339 in UTC without fractional seconds, the form sent as expires_at. */
+const EXPIRES_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+/**
+ * A fresh idempotency key: printable ASCII, well under AdminMaxRequestKey.
+ * getRandomValues works outside secure contexts, unlike randomUUID.
+ */
+export function newRequestKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return `ui-${Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function mutationBody(mutation: Mutation, requestKey: string): string | null {
+  switch (mutation.action) {
+    case 'renew':
+      if (!Number.isSafeInteger(mutation.days) || mutation.days < 1 || mutation.days > RENEW_MAX_DAYS) return null;
+      return JSON.stringify({ request_key: requestKey, days: mutation.days });
+    case 'expiry':
+      if (!EXPIRES_AT_PATTERN.test(mutation.expiresAt) || Number.isNaN(Date.parse(mutation.expiresAt))) return null;
+      return JSON.stringify({ request_key: requestKey, expires_at: mutation.expiresAt });
+    case 'disable':
+    case 'enable':
+      return JSON.stringify({ request_key: requestKey });
+  }
+}
+
 const CSRF_HEADER = 'X-CSRF-Token';
 const REQUEST_TIMEOUT_MS = 12_000;
 const DEFAULT_RETRY_AFTER_S = 60;
@@ -253,6 +310,13 @@ function parseUserDetail(value: unknown, telegramId: number): UserDetail | null 
   return { subscription, plan, nodes };
 }
 
+function parseOutcome(value: unknown, id: number): MutationOutcome | null {
+  if (!isRecord(value) || typeof value.replayed !== 'boolean' || !isRecord(value.audit)) return null;
+  const subscription = parseSubscription(value.subscription);
+  if (!subscription || subscription.id !== id) return null;
+  return { subscription, replayed: value.replayed };
+}
+
 function errorCode(data: unknown, status: number): string {
   if (isRecord(data) && typeof data.error === 'string' && /^[a-z_]{1,40}$/.test(data.error)) return data.error;
   // Non-JSON failures come from the proxy in front of the bot, not adminauth.
@@ -359,6 +423,33 @@ export class AdminApi {
     const detail = parseUserDetail(await this.#send('GET', `/admin/api/users/${telegramId}`), telegramId);
     if (!detail) throw new ApiError('invalid_response');
     return detail;
+  }
+
+  /**
+   * GET /admin/api/subscriptions/{id}: the same page as user(), addressed by
+   * subscription. The row must still belong to the expected Telegram ID.
+   */
+  async subscription(id: number, telegramId: number): Promise<UserDetail> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
+    const detail = parseUserDetail(await this.#send('GET', `/admin/api/subscriptions/${id}`), telegramId);
+    if (!detail || detail.subscription.id !== id) throw new ApiError('invalid_response');
+    return detail;
+  }
+
+  /**
+   * One audited lifecycle mutation. Rejections surface as ApiError with the
+   * backend code: 409 invalid_state, subscription_expired,
+   * perpetual_subscription, invalid_expiry (recorded, nothing changed) or
+   * request_key_conflict; 500 sync_failed means the change IS committed but
+   * node sync setup failed — retry with the same key. Never retried here.
+   */
+  async mutate(id: number, mutation: Mutation, requestKey: string): Promise<MutationOutcome> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
+    const body = mutationBody(mutation, requestKey);
+    if (body === null) throw new ApiError('invalid_request', 400);
+    const outcome = parseOutcome(await this.#send('POST', `/admin/api/subscriptions/${id}/${mutation.action}`, body), id);
+    if (!outcome) throw new ApiError('invalid_response');
+    return outcome;
   }
 
   #adopt(payload: unknown): Session {
