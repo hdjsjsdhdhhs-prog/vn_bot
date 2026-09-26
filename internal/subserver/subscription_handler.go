@@ -41,6 +41,17 @@ func HandleSubscription(ctx context.Context, db interfaces.SubscriptionRepositor
 		profileTitleSuffix = " Premium"
 	}
 
+	if loaded.builder != nil {
+		built, success, total, buildErr := fetchAndAggregateBuilder(ctx, db, subID, loaded.builder)
+		if buildErr != nil {
+			return nil, success, total, buildErr
+		}
+
+		res, respErr := buildResponse(subSvc, loaded.cacheKey, built.agg, built.trafficLimit, profileTitleSuffix)
+
+		return res, success, total, respErr
+	}
+
 	if loaded.providerSource != nil {
 		agg, success, total, fetchErr := fetchAndAggregateProviderSource(ctx, subID, *loaded.providerSource)
 		if fetchErr != nil {

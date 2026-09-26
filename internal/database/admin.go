@@ -85,7 +85,20 @@ type AdminAuditLog struct {
 	ErrorCode      string    `gorm:"not null;default:'';column:error_code" json:"error_code"`
 	RequestKey     string    `gorm:"not null;column:request_key" json:"request_key"`
 	RequestHash    string    `gorm:"not null;column:request_hash" json:"-"`
+	// TargetType/TargetID (migration 045) identify what was changed. For
+	// subscription mutations TargetID equals SubscriptionID; configuration
+	// targets (sources, builders, plans) keep SubscriptionID = 0.
+	TargetType string `gorm:"not null;default:subscription;column:target_type" json:"target_type"`
+	TargetID   uint   `gorm:"not null;default:0;column:target_id" json:"target_id"`
 }
+
+// Audit target types.
+const (
+	AdminTargetSubscription = "subscription"
+	AdminTargetSource       = "source"
+	AdminTargetBuilder      = "builder"
+	AdminTargetPlan         = "plan"
+)
 
 func (AdminAuditLog) TableName() string {
 	return "admin_audit_log"
@@ -262,6 +275,7 @@ func (s *Service) AdminMutateSubscription(ctx context.Context, m AdminMutation) 
 		}
 		entry := AdminAuditLog{
 			Actor: m.Actor, Action: string(m.Action), SubscriptionID: sub.ID, CreatedAt: now,
+			TargetType: AdminTargetSubscription, TargetID: sub.ID,
 			OldValue: string(oldJSON), NewValue: string(newJSON),
 			Success: applyErr == nil, ErrorCode: AdminErrorCode(applyErr),
 			RequestKey: m.RequestKey, RequestHash: hash,

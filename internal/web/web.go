@@ -98,6 +98,7 @@ type Server struct {
 	orderService       *service.OrderService
 	starsService       *service.StarsPaymentService
 	adminService       *service.AdminService
+	builderService     *service.BuilderService
 	paymentConfig      *PaymentConfig
 	subServer          *subserver.Service
 	subserverLogger    *subserver.AccessLogger
@@ -151,6 +152,15 @@ func (s *Server) SetAdminService(adminService *service.AdminService) {
 	defer s.mu.Unlock()
 
 	s.adminService = adminService
+}
+
+// SetBuilderService wires the Subscription Builder JSON API under /admin/api/builder.
+// Without it the (still session-protected) API answers 503. Set before Start.
+func (s *Server) SetBuilderService(builderService *service.BuilderService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.builderService = builderService
 }
 
 // SetPaymentConfig configures runtime payment settings used by the callback
@@ -232,7 +242,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cfg != nil {
 		actor = s.cfg.AdminUsername
 	}
-	adminHandler := admin.Routes(newAdminAPI(s.adminService, actor))
+	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, actor))
 
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)

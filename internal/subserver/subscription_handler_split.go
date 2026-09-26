@@ -22,6 +22,7 @@ import (
 type loadedSubscription struct {
 	full           *database.SubscriptionFull
 	providerSource *database.ProviderSource
+	builder        *database.SubscriptionBuilder
 	cacheKey       string
 	cachedResult   *SubscriptionResult
 }
@@ -76,7 +77,26 @@ func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository,
 	}
 
 	loaded := &loadedSubscription{cacheKey: subID}
-	if sub.ProviderSourceID != nil {
+
+	// Builder selection: subscription override > plan default > existing
+	// pipeline (ProviderSource or legacy plan nodes), which stays untouched.
+	resolved, err := db.ResolveSubscriptionBuilder(ctx, sub)
+	if err != nil {
+		logger.Error("Failed to resolve subscription builder",
+			zap.String("sub_id", subID),
+			zap.Error(err))
+
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+
+	if resolved != nil {
+		loaded.builder = &resolved.Builder
+		loaded.cacheKey = builderCacheKey(subID, &resolved.Builder)
+		logger.Debug("Subscription served by builder",
+			zap.String("sub_id", subID),
+			zap.Uint("builder_id", resolved.Builder.ID),
+			zap.String("selection", string(resolved.Selection)))
+	} else if sub.ProviderSourceID != nil {
 		if sub.ProviderSource == nil {
 			subSvc.InvalidateCache(subID)
 			logger.Warn("Linked provider source is missing",
@@ -108,7 +128,7 @@ func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository,
 	}
 
 	var subFull *database.SubscriptionFull
-	if loaded.providerSource == nil {
+	if loaded.providerSource == nil && loaded.builder == nil {
 		subFull, err = db.GetWithPlanAndNodes(ctx, subID)
 		if err != nil {
 			if errors.Is(err, database.ErrSubscriptionNotFound) {
@@ -135,6 +155,7 @@ func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository,
 		zap.String("status", subFull.Subscription.Status),
 		zap.Timep("expires_at", subFull.Subscription.ExpiresAt),
 		zap.Bool("provider_source", loaded.providerSource != nil),
+		zap.Bool("builder", loaded.builder != nil),
 	)
 
 	UpdateDevices(ctx, db, subFull, requestHeaders)

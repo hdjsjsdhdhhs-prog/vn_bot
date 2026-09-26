@@ -46,26 +46,27 @@ func NewAdminService(repo AdminRepository, subs *SubscriptionService, sync *Sync
 // deliberately omits bearer material (token, subscription_id, client_id) and
 // raw device/IP payloads.
 type AdminSubscriptionView struct {
-	ID               uint       `json:"id"`
-	TelegramID       int64      `json:"telegram_id"`
-	Username         string     `json:"username"`
-	Status           string     `json:"status"`
-	ExpiresAt        *time.Time `json:"expires_at"`
-	PlanID           uint       `json:"plan_id"`
-	PlanName         string     `json:"plan_name,omitempty"`
-	ProviderSourceID *uint      `json:"provider_source_id"`
-	ProductID        *uint      `json:"product_id"`
-	IsPaid           bool       `json:"is_paid"`
-	PricePaidCents   int64      `json:"price_paid_cents"`
-	Currency         *string    `json:"currency"`
-	ReferredBy       *int64     `json:"referred_by"`
-	StartedAt        *time.Time `json:"started_at"`
-	LastRequest      *time.Time `json:"last_request"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
-	RemindersSent    int        `json:"reminders_sent"`
-	Devices          int        `json:"devices"`
-	IPs              int        `json:"ips"`
+	ID                    uint       `json:"id"`
+	TelegramID            int64      `json:"telegram_id"`
+	Username              string     `json:"username"`
+	Status                string     `json:"status"`
+	ExpiresAt             *time.Time `json:"expires_at"`
+	PlanID                uint       `json:"plan_id"`
+	PlanName              string     `json:"plan_name,omitempty"`
+	ProviderSourceID      *uint      `json:"provider_source_id"`
+	ProductID             *uint      `json:"product_id"`
+	IsPaid                bool       `json:"is_paid"`
+	PricePaidCents        int64      `json:"price_paid_cents"`
+	Currency              *string    `json:"currency"`
+	ReferredBy            *int64     `json:"referred_by"`
+	StartedAt             *time.Time `json:"started_at"`
+	LastRequest           *time.Time `json:"last_request"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
+	RemindersSent         int        `json:"reminders_sent"`
+	Devices               int        `json:"devices"`
+	IPs                   int        `json:"ips"`
+	SubscriptionBuilderID *uint      `json:"subscription_builder_id"`
 }
 
 func adminViewOf(sub *database.Subscription, planName string) AdminSubscriptionView {
@@ -76,6 +77,7 @@ func adminViewOf(sub *database.Subscription, planName string) AdminSubscriptionV
 		PricePaidCents: sub.PricePaidCents, Currency: sub.Currency, ReferredBy: sub.ReferredBy,
 		StartedAt: sub.StartedAt, LastRequest: sub.LastRequest, CreatedAt: sub.CreatedAt,
 		UpdatedAt: sub.UpdatedAt, RemindersSent: sub.RemindersSent,
+		SubscriptionBuilderID: sub.SubscriptionBuilderID,
 	}
 	if devices, err := sub.ParseDevices(); err == nil {
 		view.Devices = len(devices)
@@ -88,11 +90,12 @@ func adminViewOf(sub *database.Subscription, planName string) AdminSubscriptionV
 
 // AdminPlanView is the plan summary shown next to a subscription.
 type AdminPlanView struct {
-	ID           uint   `json:"id"`
-	Name         string `json:"name"`
-	IsActive     bool   `json:"is_active"`
-	DevicesLimit int    `json:"devices_limit"`
-	TrafficLimit int64  `json:"traffic_limit"`
+	ID                    uint   `json:"id"`
+	Name                  string `json:"name"`
+	IsActive              bool   `json:"is_active"`
+	DevicesLimit          int    `json:"devices_limit"`
+	TrafficLimit          int64  `json:"traffic_limit"`
+	SubscriptionBuilderID *uint  `json:"subscription_builder_id"`
 }
 
 // AdminSubscriptionPage is the subscription detail response.
@@ -166,7 +169,7 @@ func (s *AdminService) GetSubscription(ctx context.Context, id uint) (*AdminSubs
 	var plan *AdminPlanView
 	if detail.Plan != nil {
 		planName = detail.Plan.Name
-		plan = &AdminPlanView{ID: detail.Plan.ID, Name: detail.Plan.Name, IsActive: detail.Plan.IsActive, DevicesLimit: detail.Plan.DevicesLimit, TrafficLimit: detail.Plan.TrafficLimit}
+		plan = &AdminPlanView{ID: detail.Plan.ID, Name: detail.Plan.Name, IsActive: detail.Plan.IsActive, DevicesLimit: detail.Plan.DevicesLimit, TrafficLimit: detail.Plan.TrafficLimit, SubscriptionBuilderID: detail.Plan.SubscriptionBuilderID}
 	}
 	return &AdminSubscriptionPage{Subscription: adminViewOf(&detail.Subscription, planName), Plan: plan, Nodes: detail.Nodes, Audit: detail.Audit}, nil
 }

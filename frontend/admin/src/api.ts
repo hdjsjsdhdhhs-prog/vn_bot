@@ -75,6 +75,8 @@ export interface AdminSubscription {
   readonly devices: number;
   /** Recorded IP address entries. */
   readonly ips: number;
+  /** Per-subscription builder override; null means use the plan's default. */
+  readonly subscription_builder_id: number | null;
 }
 
 /** service.AdminUsersPage, newest first; limit is the page size the server applied. */
@@ -103,6 +105,8 @@ export interface AdminPlan {
   readonly is_active: boolean;
   readonly devices_limit: number;
   readonly traffic_limit: number;
+  /** Default builder for this plan; null means no builder assigned. */
+  readonly subscription_builder_id: number | null;
 }
 
 /** database.AdminSubscriptionNode: sync state of the subscription on one VPN node. */
@@ -248,18 +252,19 @@ function parseSubscription(value: unknown): AdminSubscription | null {
   const {
     id, telegram_id, username, status, expires_at, plan_id, plan_name = '', provider_source_id, product_id,
     is_paid, price_paid_cents, currency, referred_by, started_at, last_request, created_at, updated_at,
-    reminders_sent, devices, ips,
+    reminders_sent, devices, ips, subscription_builder_id = null,
   } = value;
   if (!isPositive(id) || !isInteger(telegram_id) || !isText(username) || !isText(status) || status === '' ||
     !isNullable(expires_at, isTime) || !isCount(plan_id) || !isText(plan_name) ||
     !isNullable(provider_source_id, isPositive) || !isNullable(product_id, isPositive) ||
     typeof is_paid !== 'boolean' || !isCount(price_paid_cents) || !isNullable(currency, isCurrency) ||
     !isNullable(referred_by, isInteger) || !isNullable(started_at, isTime) || !isNullable(last_request, isTime) ||
-    !isTime(created_at) || !isTime(updated_at) || !isCount(reminders_sent) || !isCount(devices) || !isCount(ips)) return null;
+    !isTime(created_at) || !isTime(updated_at) || !isCount(reminders_sent) || !isCount(devices) || !isCount(ips) ||
+    !isNullable(subscription_builder_id, isPositive)) return null;
   return {
     id, telegram_id, username, status, expires_at, plan_id, plan_name, provider_source_id, product_id,
     is_paid, price_paid_cents, currency, referred_by, started_at, last_request, created_at, updated_at,
-    reminders_sent, devices, ips,
+    reminders_sent, devices, ips, subscription_builder_id,
   };
 }
 
@@ -280,10 +285,10 @@ function parseUsersPage(value: unknown): UsersPage | null {
 
 function parsePlan(value: unknown): AdminPlan | undefined {
   if (!isRecord(value)) return undefined;
-  const { id, name, is_active, devices_limit, traffic_limit } = value;
+  const { id, name, is_active, devices_limit, traffic_limit, subscription_builder_id = null } = value;
   if (!isPositive(id) || !isText(name) || typeof is_active !== 'boolean' || !isCount(devices_limit) ||
-    !isCount(traffic_limit)) return undefined;
-  return { id, name, is_active, devices_limit, traffic_limit };
+    !isCount(traffic_limit) || !isNullable(subscription_builder_id, isPositive)) return undefined;
+  return { id, name, is_active, devices_limit, traffic_limit, subscription_builder_id };
 }
 
 function parseNode(value: unknown): AdminNode | null {
@@ -458,7 +463,7 @@ export class AdminApi {
     return { authenticated: payload.authenticated };
   }
 
-  async #send(method: 'GET' | 'POST', path: string, body?: string): Promise<unknown> {
+  async #send(method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE', path: string, body?: string): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     const headers: Record<string, string> = { Accept: 'application/json' };
@@ -485,4 +490,297 @@ export class AdminApi {
       clearTimeout(timer);
     }
   }
+  // ---------------------------------------------------------------------------
+  // Sources
+  // ---------------------------------------------------------------------------
+
+  async listSources(): Promise<readonly AdminSource[]> {
+    const data = await this.#send('GET', '/admin/api/sources');
+    if (!isRecord(data) || !Array.isArray(data.sources)) throw new ApiError('invalid_response');
+    return data.sources as AdminSource[];
+  }
+
+  async getSource(id: number): Promise<AdminSource> {
+    const data = await this.#send('GET', `/admin/api/sources/${id}`);
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminSource;
+  }
+
+  async createSource(input: CreateSourceInput): Promise<AdminSource> {
+    const data = await this.#send('POST', '/admin/api/sources', JSON.stringify(input));
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminSource;
+  }
+
+  async updateSource(id: number, input: UpdateSourceInput): Promise<AdminSource> {
+    const data = await this.#send('PATCH', `/admin/api/sources/${id}`, JSON.stringify(input));
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminSource;
+  }
+
+  async enableSource(id: number): Promise<AdminSource> {
+    const data = await this.#send('POST', `/admin/api/sources/${id}/enable`);
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminSource;
+  }
+
+  async disableSource(id: number): Promise<AdminSource> {
+    const data = await this.#send('POST', `/admin/api/sources/${id}/disable`);
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminSource;
+  }
+
+  async listSourceEntries(id: number, country = '*'): Promise<readonly SourceEntry[]> {
+    const params = `?country=${encodeURIComponent(country)}`;
+    const data = await this.#send('GET', `/admin/api/sources/${id}/entries${params}`);
+    if (!isRecord(data) || !Array.isArray(data.entries)) throw new ApiError('invalid_response');
+    return data.entries as SourceEntry[];
+  }
+
+  async refreshSource(id: number, input: RefreshSourceInput): Promise<AdminSource> {
+    const data = await this.#send('POST', `/admin/api/sources/${id}/refresh`, JSON.stringify(input));
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminSource;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Builders
+  // ---------------------------------------------------------------------------
+
+  async listBuilders(): Promise<readonly AdminBuilder[]> {
+    const data = await this.#send('GET', '/admin/api/builders');
+    if (!isRecord(data) || !Array.isArray(data.builders)) throw new ApiError('invalid_response');
+    return data.builders as AdminBuilder[];
+  }
+
+  async getBuilder(id: number): Promise<AdminBuilder> {
+    const data = await this.#send('GET', `/admin/api/builders/${id}`);
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminBuilder;
+  }
+
+  async createBuilder(input: CreateBuilderInput): Promise<{ builder: AdminBuilder; audit: unknown }> {
+    const data = await this.#send('POST', '/admin/api/builders', JSON.stringify(input));
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as { builder: AdminBuilder; audit: unknown };
+  }
+
+  async updateBuilder(id: number, input: UpdateBuilderInput): Promise<{ builder: AdminBuilder; audit: unknown }> {
+    const data = await this.#send('PATCH', `/admin/api/builders/${id}`, JSON.stringify(input));
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as { builder: AdminBuilder; audit: unknown };
+  }
+
+  async enableBuilder(id: number): Promise<AdminBuilder> {
+    const data = await this.#send('POST', `/admin/api/builders/${id}/enable`);
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminBuilder;
+  }
+
+  async disableBuilder(id: number): Promise<AdminBuilder> {
+    const data = await this.#send('POST', `/admin/api/builders/${id}/disable`);
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminBuilder;
+  }
+
+  async setBuilderSources(id: number, sourceIds: number[]): Promise<AdminBuilder> {
+    const data = await this.#send('PUT', `/admin/api/builders/${id}/sources`, JSON.stringify({ source_ids: sourceIds }));
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AdminBuilder;
+  }
+
+  async upsertBuilderItem(id: number, input: UpsertBuilderItemInput): Promise<BuilderItem> {
+    const data = await this.#send('POST', `/admin/api/builders/${id}/items`, JSON.stringify(input));
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as BuilderItem;
+  }
+
+  async deleteBuilderItem(builderId: number, itemId: number): Promise<void> {
+    await this.#send('DELETE', `/admin/api/builders/${builderId}/items/${itemId}`);
+  }
+
+  async reorderBuilderItems(id: number, itemIds: number[]): Promise<void> {
+    await this.#send('POST', `/admin/api/builders/${id}/reorder`, JSON.stringify({ item_ids: itemIds }));
+  }
+
+  async previewBuilder(id: number): Promise<BuilderPreview> {
+    const data = await this.#send('POST', `/admin/api/builders/${id}/preview`);
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as BuilderPreview;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Assignments
+  // ---------------------------------------------------------------------------
+
+  async setPlanBuilder(planId: number, input: SetBuilderInput): Promise<AssignmentAudit> {
+    const data = await this.#send('POST', `/admin/api/plans/${planId}/builder`, JSON.stringify(input));
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AssignmentAudit;
+  }
+
+  async setSubscriptionBuilder(subscriptionId: number, input: SetBuilderInput): Promise<AssignmentAudit> {
+    const data = await this.#send('POST', `/admin/api/subscriptions/${subscriptionId}/builder`, JSON.stringify(input));
+    if (!isRecord(data)) throw new ApiError('invalid_response');
+    return data as unknown as AssignmentAudit;
+  }
+
+}
+
+// =============================================================================
+// Builder / Source types (used by api methods above)
+// =============================================================================
+
+export interface AdminSource {
+  readonly id: number;
+  readonly name: string;
+  readonly type: string;
+  readonly description: string;
+  readonly enabled: boolean;
+  readonly last_sync_at: string | null;
+  readonly last_sync_status: string;
+  readonly last_sync_error: string;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface SourceEntry {
+  readonly id: number;
+  readonly source_id: number;
+  readonly fingerprint: string;
+  readonly original_name: string;
+  readonly protocol: string;
+  readonly country_code: string;
+  readonly upstream_position: number;
+  readonly present: boolean;
+  readonly last_seen_at: string;
+}
+
+export interface CreateSourceInput {
+  readonly name: string;
+  readonly description: string;
+  readonly type: string;
+  readonly subscription_url: string;
+  readonly hwid: string;
+  readonly user_agent: string;
+  readonly headers: string;
+  readonly enabled: boolean;
+}
+
+export interface UpdateSourceInput {
+  readonly name: string;
+  readonly description: string;
+  readonly type: string;
+}
+
+export interface RefreshSourceInput {
+  readonly entries: readonly { fingerprint: string; original_name: string; protocol: string; country_code: string }[];
+  readonly sync_status: string;
+  readonly sync_error: string;
+}
+
+export interface BuilderSource {
+  readonly source_id: number;
+  readonly position: number;
+}
+
+export interface BuilderItem {
+  readonly id: number;
+  readonly kind: 'country' | 'node';
+  readonly source_id: number;
+  readonly country_code: string;
+  readonly fingerprint: string;
+  readonly original_name: string;
+  readonly custom_name: string | null;
+  readonly description: string;
+  readonly position: number;
+  readonly enabled: boolean;
+}
+
+export interface AdminBuilder {
+  readonly id: number;
+  readonly name: string;
+  readonly description: string;
+  readonly enabled: boolean;
+  readonly profile_title: string;
+  readonly support_url: string;
+  readonly announce: string;
+  readonly version: number;
+  readonly sources: readonly BuilderSource[] | null;
+  readonly items: readonly BuilderItem[] | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface CreateBuilderInput {
+  readonly request_key: string;
+  readonly name: string;
+  readonly description: string;
+  readonly enabled: boolean;
+  readonly profile_title: string;
+  readonly support_url: string;
+  readonly announce: string;
+}
+
+export interface UpdateBuilderInput {
+  readonly request_key: string;
+  readonly version: number;
+  readonly name: string;
+  readonly description: string;
+  readonly enabled: boolean;
+  readonly profile_title: string;
+  readonly support_url: string;
+  readonly announce: string;
+}
+
+export interface UpsertBuilderItemInput {
+  readonly id?: number;
+  readonly kind: 'country' | 'node';
+  readonly source_id: number;
+  readonly country_code?: string;
+  readonly fingerprint?: string;
+  readonly original_name?: string;
+  readonly custom_name?: string | null;
+  readonly description?: string;
+  readonly position: number;
+  readonly enabled: boolean;
+}
+
+export type FingerprintStatus = 'matched' | 'fallback' | 'missing' | 'conflict';
+
+export interface PreviewItem {
+  readonly item_id: number;
+  readonly kind: string;
+  readonly source_id: number;
+  readonly entry: SourceEntry | null;
+  readonly display_name: string;
+  readonly status: FingerprintStatus;
+  readonly position: number;
+}
+
+export interface BuilderPreview {
+  readonly builder_id: number;
+  readonly items: readonly PreviewItem[];
+  readonly warnings: readonly string[] | null;
+  readonly missing: number;
+  readonly conflicts: number;
+  readonly total: number;
+  readonly previewed_at: string;
+}
+
+export interface SetBuilderInput {
+  readonly request_key: string;
+  readonly builder_id: number | null;
+}
+
+export interface AssignmentAudit {
+  readonly audit: {
+    readonly id: number;
+    readonly actor: string;
+    readonly action: string;
+    readonly target_type: string;
+    readonly target_id: number;
+    readonly created_at: string;
+    readonly success: boolean;
+  };
 }

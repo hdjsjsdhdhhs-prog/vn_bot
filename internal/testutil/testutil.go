@@ -164,6 +164,8 @@ type DatabaseService struct {
 	GetPoolStatsFunc                            func() (*database.PoolStats, error)
 	GetSubscriptionWithProviderSourceFunc       func(ctx context.Context, subscriptionID string) (*database.Subscription, error)
 	GetWithPlanAndNodesFunc                     func(ctx context.Context, subscriptionID string) (*database.SubscriptionFull, error)
+	ResolveSubscriptionBuilderFunc              func(ctx context.Context, sub *database.Subscription) (*database.ResolvedBuilder, error)
+	GetSourceEntriesFunc                        func(ctx context.Context, sourceID uint, countryCode string) ([]database.ProviderSourceEntry, error)
 	GetSubscriptionStatusFunc                   func(ctx context.Context, subscriptionID string) (string, time.Time, error)
 	UpdateDevicesFunc                           func(ctx context.Context, id uint, devicesJSON string) error
 	UpdateIPsFunc                               func(ctx context.Context, id uint, ipsJSON string) error
@@ -1337,6 +1339,25 @@ func (m *DatabaseService) GetPoolStats() (*database.PoolStats, error) {
 	}
 
 	return &database.PoolStats{}, nil
+}
+
+// ResolveSubscriptionBuilder defaults to "no builder" so existing tests keep
+// the legacy/provider-source pipeline.
+func (m *DatabaseService) ResolveSubscriptionBuilder(ctx context.Context, sub *database.Subscription) (*database.ResolvedBuilder, error) {
+	if m.ResolveSubscriptionBuilderFunc != nil {
+		return m.ResolveSubscriptionBuilderFunc(ctx, sub)
+	}
+
+	return nil, nil
+}
+
+// GetSourceEntries defaults to an empty catalogue.
+func (m *DatabaseService) GetSourceEntries(ctx context.Context, sourceID uint, countryCode string) ([]database.ProviderSourceEntry, error) {
+	if m.GetSourceEntriesFunc != nil {
+		return m.GetSourceEntriesFunc(ctx, sourceID, countryCode)
+	}
+
+	return nil, nil
 }
 
 func (m *DatabaseService) GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*database.Subscription, error) {

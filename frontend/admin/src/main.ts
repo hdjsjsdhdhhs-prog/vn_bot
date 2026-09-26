@@ -3,14 +3,17 @@ import {
   AdminApi, ApiError, errorText, limits, newRequestKey, RENEW_MAX_DAYS,
   type AdminNode, type AdminPlan, type AdminSubscription, type Dashboard, type Mutation, type MutationAction,
   type MutationOutcome, type SubscriptionStatus, type UserDetail, type UsersPage, type UsersQuery,
+  type AdminSource, type AdminBuilder, type BuilderItem,
+  type CreateSourceInput, type UpdateSourceInput,
+  type CreateBuilderInput, type UpdateBuilderInput, type UpsertBuilderItemInput, type SetBuilderInput,
 } from './api';
 
 // ---------------------------------------------------------------------------
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
 // handful of glyphs does not add a runtime dependency. One family, one stroke.
 
-type IconName = 'overview' | 'users' | 'audit' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
-  | 'search' | 'back' | 'prev' | 'next' | 'chevron' | 'check';
+type IconName = 'overview' | 'users' | 'audit' | 'sources' | 'builders' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
+  | 'search' | 'back' | 'prev' | 'next' | 'chevron' | 'check' | 'plus' | 'trash' | 'drag' | 'edit';
 type Shape = readonly ['path' | 'circle' | 'rect', Readonly<Record<string, string>>];
 
 const ICONS: Record<IconName, readonly Shape[]> = {
@@ -54,6 +57,23 @@ const ICONS: Record<IconName, readonly Shape[]> = {
   next: [['path', { d: 'm9 18 6-6-6-6' }]],
   chevron: [['path', { d: 'm6 9 6 6 6-6' }]],
   check: [['circle', { cx: '12', cy: '12', r: '10' }], ['path', { d: 'm9 12 2 2 4-4' }]],
+  sources: [
+    ['path', { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' }],
+  ],
+  builders: [
+    ['path', { d: 'M3 9h18' }],
+    ['path', { d: 'M3 15h18' }],
+    ['path', { d: 'M9 3v18' }],
+    ['path', { d: 'M15 3v18' }],
+  ],
+  plus: [['path', { d: 'M12 5v14' }], ['path', { d: 'M5 12h14' }]],
+  trash: [
+    ['path', { d: 'M3 6h18' }],
+    ['path', { d: 'M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6' }],
+    ['path', { d: 'M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2' }],
+  ],
+  drag: [['path', { d: 'M9 5h2' }], ['path', { d: 'M9 12h2' }], ['path', { d: 'M9 19h2' }], ['path', { d: 'M13 5h2' }], ['path', { d: 'M13 12h2' }], ['path', { d: 'M13 19h2' }]],
+  edit: [['path', { d: 'M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7' }], ['path', { d: 'M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z' }]],
 };
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -119,7 +139,7 @@ const clock = (date: Date) => date.toLocaleTimeString('ru-RU', { hour: '2-digit'
 // Sections. Overview reads /admin/api/dashboard, Users reads /admin/api/users;
 // Audit is still a page frame with a placeholder until its stage lands.
 
-type SectionId = 'overview' | 'users' | 'audit';
+type SectionId = 'overview' | 'users' | 'audit' | 'sources' | 'builders';
 interface Section {
   id: SectionId;
   label: string;
@@ -135,6 +155,14 @@ const SECTIONS: readonly Section[] = [
   {
     id: 'users', label: 'Пользователи',
     description: 'Клиенты с привязанным Telegram-аккаунтом и их подписки. Пробные подписки без привязки сюда не входят.',
+  },
+  {
+    id: 'sources', label: 'Источники',
+    description: 'Внешние подписки-источники VPN-конфигураций для построителей.',
+  },
+  {
+    id: 'builders', label: 'Построители',
+    description: 'Конфигурации подписок: правила фильтрации, порядок серверов, назначение планам.',
   },
   {
     id: 'audit', label: 'Журнал',
@@ -497,6 +525,52 @@ function retryButton(onRetry: () => void): HTMLButtonElement {
   return retry;
 }
 
+/**
+ * Drag-and-drop reorder for a list. Items with the given CSS class are
+ * draggable. The callback receives the new order as an array of data-src-id or
+ * data-drag-idx values (strings), depending on which attribute is present.
+ */
+function setupDragReorder(list: HTMLElement, itemClass: string, onReorder: (newOrder: string[]) => void) {
+  let dragSrc: HTMLElement | null = null;
+
+  const items = list.querySelectorAll<HTMLElement>(`.${itemClass}`);
+  for (const item of items) {
+    item.addEventListener('dragstart', (e) => {
+      dragSrc = item;
+      item.classList.add('dragging');
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', item.dataset.srcId ?? item.dataset.dragIdx ?? '');
+      }
+    });
+    item.addEventListener('dragend', () => {
+      item.classList.remove('dragging');
+      list.querySelectorAll('.drag-over').forEach(n => n.classList.remove('drag-over'));
+      dragSrc = null;
+    });
+    item.addEventListener('dragover', (e) => {
+      if (!dragSrc || dragSrc === item) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      list.querySelectorAll('.drag-over').forEach(n => n.classList.remove('drag-over'));
+      item.classList.add('drag-over');
+    });
+    item.addEventListener('drop', (e) => {
+      e.preventDefault();
+      if (!dragSrc || dragSrc === item) return;
+      const allItems = [...list.querySelectorAll<HTMLElement>(`.${itemClass}`)];
+      const fromIdx = allItems.indexOf(dragSrc);
+      const toIdx = allItems.indexOf(item);
+      if (fromIdx === -1 || toIdx === -1) return;
+      allItems.splice(fromIdx, 1);
+      allItems.splice(toIdx, 0, dragSrc);
+      for (const n of allItems) list.append(n);
+      const newOrder = allItems.map(n => n.dataset.srcId ?? n.dataset.dragIdx ?? '');
+      onReorder(newOrder);
+    });
+  }
+}
+
 function skeletonPanel(rows: number, head = true): HTMLElement {
   const panel = el('div', 'panel');
   if (head) {
@@ -848,6 +922,16 @@ class AdminApp {
   // management action shown on the subscription page it belongs to.
   private dialog: { dismiss: () => void } | null = null;
   private manageNotice: { subscriptionId: number; notice: Notice } | null = null;
+  // Sources section state
+  private sourcesCache: readonly AdminSource[] | null = null;
+  private sourcesRequest = 0;
+  private sourcesView: { body: HTMLElement; refresh: HTMLButtonElement } | null = null;
+  // Builders section state
+  private buildersCache: readonly AdminBuilder[] | null = null;
+  private buildersRequest = 0;
+  private buildersView: { body: HTMLElement; refresh: HTMLButtonElement } | null = null;
+  // Builder editor state (single builder open)
+  private builderEditorRequest = 0;
 
   constructor(private readonly root: HTMLElement, private readonly api: AdminApi) {
     this.toasts.setAttribute('aria-live', 'polite');
@@ -1137,9 +1221,14 @@ class AdminApp {
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
+    this.sourcesView = null;
+    this.buildersView = null;
     this.dashboardRequest++;
     this.usersRequest++;
     this.detailRequest++;
+    this.sourcesRequest++;
+    this.buildersRequest++;
+    this.builderEditorRequest++;
     window.clearTimeout(this.searchTimer);
 
     const header = el('header', 'page-header');
@@ -1164,6 +1253,12 @@ class AdminApp {
     } else if (section.id === 'users') {
       page.append(header, this.buildUsers(header));
       load = () => this.loadUsers();
+    } else if (section.id === 'sources') {
+      page.append(header, this.buildSourcesSection(header));
+      load = () => this.loadSources();
+    } else if (section.id === 'builders') {
+      page.append(header, this.buildBuildersSection(header));
+      load = () => this.loadBuilders();
     } else if (section.placeholder) {
       const empty = el('section', 'panel empty');
       empty.setAttribute('aria-labelledby', 'empty-title');
@@ -1610,7 +1705,7 @@ class AdminApp {
     const now = Date.now();
     const grid = el('div', 'detail-grid');
     grid.append(subscriptionPanel(user, data.plan, now), planPanel(user, data.plan));
-    view.body.replaceChildren(grid, this.managePanel(data, now), nodesPanel(user, data.nodes));
+    view.body.replaceChildren(grid, this.managePanel(data, now), this.builderPanel(data, view), nodesPanel(user, data.nodes));
     if (focusKey) this.focusManage(focusKey);
   }
 
@@ -2127,6 +2222,1064 @@ class AdminApp {
     this.toasts.replaceChildren(node);
     window.clearTimeout(this.toastTimer);
     this.toastTimer = window.setTimeout(() => node.remove(), TOAST_MS);
+  }
+
+  // ===========================================================================
+  // Builder assignment panel (Plan → Builder, Subscription → Builder override)
+  // ===========================================================================
+
+  /** Renders the "Построитель" panel on the subscription detail page. */
+  private builderPanel(data: UserDetail, _view: DetailView): HTMLElement {
+    const sub = data.subscription;
+    const plan = data.plan;
+    const panel = el('section', 'panel');
+    panel.setAttribute('aria-labelledby', 'builder-assign-title');
+    panel.append(panelHead('builder-assign-title', 'Построитель'));
+
+    const facts = el('dl', 'facts facts-single');
+
+    const mkBuilderFact = (label: string, builderId: number | null, note: string, onEdit: () => void, disabled = false) => {
+      const name = builderId !== null
+        ? this.buildersCache?.find(b => b.id === builderId)?.name ?? `Построитель #${builderId}`
+        : '—';
+      const factEl = fact(label, name, note);
+      const btn = button('Изменить', 'btn btn-secondary btn-xs');
+      btn.disabled = disabled;
+      btn.addEventListener('click', onEdit);
+      factEl.querySelector('dd')?.append(btn);
+      return factEl;
+    };
+
+    // Plan builder
+    const planBuilderId = plan?.subscription_builder_id ?? null;
+    facts.append(mkBuilderFact(
+      'Построитель плана',
+      planBuilderId,
+      plan ? 'Применяется ко всем подпискам этого тарифа' : 'Тариф не найден',
+      () => {
+        if (!plan) return;
+        this.openBuilderAssignDialog('plan', plan.id, planBuilderId, (newId) => {
+          void this.loadUser();
+          this.toast(newId === null ? 'Построитель плана снят.' : 'Построитель плана назначен.');
+        });
+      },
+      !plan,
+    ));
+
+    // Subscription override
+    const subBuilderId = sub.subscription_builder_id;
+    facts.append(mkBuilderFact(
+      'Переопределение подписки',
+      subBuilderId,
+      subBuilderId !== null ? 'Переопределяет построитель плана для этой подписки' : 'Используется построитель плана',
+      () => {
+        this.openBuilderAssignDialog('subscription', sub.id, subBuilderId, (newId) => {
+          void this.loadUser();
+          this.toast(newId === null ? 'Переопределение построителя снято.' : 'Построитель подписки назначен.');
+        });
+      },
+    ));
+
+    panel.append(facts);
+    return panel;
+  }
+
+  /** Opens a dialog to assign or clear a builder for a plan or subscription. */
+  private openBuilderAssignDialog(
+    target: 'plan' | 'subscription',
+    targetId: number,
+    currentBuilderId: number | null,
+    onDone: (newBuilderId: number | null) => void,
+  ) {
+    if (this.dialog || this.view !== 'app') return;
+
+    const builders = this.buildersCache ?? [];
+    const dialog = el('dialog', 'modal modal-wide');
+    dialog.setAttribute('aria-labelledby', 'ba-title');
+
+    const titleText = target === 'plan' ? 'Построитель плана' : 'Построитель подписки';
+    const titleEl = el('h2', 'modal-title', titleText);
+    titleEl.id = 'ba-title';
+
+    // Select
+    const sel = el('select', 'input');
+    sel.id = 'ba-builder';
+    const optNone = el('option', '', target === 'plan' ? '— Без построителя —' : '— Использовать построитель плана —');
+    optNone.value = '';
+    sel.append(optNone);
+    for (const b of builders) {
+      const opt = el('option', '', b.name + (b.enabled ? '' : ' (отключён)'));
+      opt.value = String(b.id);
+      sel.append(opt);
+    }
+    sel.value = currentBuilderId !== null ? String(currentBuilderId) : '';
+
+    const selField = el('div', 'field');
+    const selLabel = el('label', 'field-label', 'Построитель');
+    selLabel.htmlFor = 'ba-builder';
+    const selControl = el('div', 'control');
+    selControl.append(sel);
+    selField.append(selLabel, selControl);
+
+    if (builders.length === 0) {
+      selField.append(el('p', 'field-hint', 'Построители не загружены. Откройте раздел «Построители» и вернитесь.'));
+    }
+
+    const statusEl = el('div', 'modal-status');
+    statusEl.setAttribute('role', 'alert');
+    const showStatus = (n: Notice | null) => statusEl.replaceChildren(...(n ? [notice(n)] : []));
+
+    const cancelBtn = button('Отмена', 'btn btn-secondary');
+    const saveBtn = button('Сохранить', 'btn btn-primary');
+    const actionsRow = el('div', 'modal-actions');
+    actionsRow.append(cancelBtn, saveBtn);
+
+    const body = el('div', 'modal-body');
+    body.append(titleEl, selField, statusEl, actionsRow);
+    dialog.append(body);
+
+    let submitting = false;
+    const handle = { dismiss: () => { if (dialog.open) dialog.close(); dialog.remove(); } };
+    const isOpen = () => this.dialog === handle;
+    const close = () => { if (!isOpen()) return; this.dialog = null; handle.dismiss(); };
+
+    cancelBtn.addEventListener('click', close);
+    dialog.addEventListener('keydown', e => { if (e.key === 'Escape' && !submitting) close(); });
+    dialog.addEventListener('cancel', e => { e.preventDefault(); if (!submitting) close(); });
+
+    saveBtn.addEventListener('click', async () => {
+      if (submitting) return;
+      submitting = true;
+      saveBtn.disabled = true; saveBtn.setAttribute('aria-busy', 'true');
+      setLabel(saveBtn, 'Сохраняем…');
+      showStatus(null);
+      try {
+        const rawVal = sel.value;
+        const newBuilderId = rawVal === '' ? null : parseInt(rawVal, 10);
+        const input: SetBuilderInput = { request_key: newRequestKey(), builder_id: newBuilderId };
+        if (target === 'plan') {
+          await this.api.setPlanBuilder(targetId, input);
+        } else {
+          await this.api.setSubscriptionBuilder(targetId, input);
+        }
+        if (!isOpen()) return;
+        close();
+        onDone(newBuilderId);
+      } catch (error) {
+        if (!isOpen()) return;
+        submitting = false;
+        saveBtn.disabled = false; saveBtn.removeAttribute('aria-busy');
+        setLabel(saveBtn, 'Сохранить');
+        if (await this.endIfSignedOut(error, isOpen)) return;
+        showStatus({ tone: 'error', text: `Не удалось сохранить. ${errorText(error)}` });
+      }
+    });
+
+    this.dialog = handle;
+    this.root.append(dialog);
+    dialog.showModal();
+    sel.focus();
+  }
+
+  // ===========================================================================
+  // Sources section
+  // ===========================================================================
+
+  private buildSourcesSection(header: HTMLElement): HTMLElement {
+    const { actions, refresh, updated } = refreshActions(() => void this.loadSources());
+    const addBtn = button('Добавить источник', 'btn btn-primary btn-sm', 'plus');
+    addBtn.addEventListener('click', () => this.openSourceEditor(null));
+    actions.prepend(addBtn);
+    header.classList.add('has-actions');
+    header.append(actions);
+
+    const body = el('div', 'sources-section');
+    this.sourcesView = { body, refresh };
+    if (this.sourcesCache) this.paintSources(body, this.sourcesCache, updated);
+    else this.paintSourcesSkeleton(body, updated);
+    return body;
+  }
+
+  private paintSourcesSkeleton(body: HTMLElement, updated: HTMLElement) {
+    setLoading(body, 'Загружаем источники');
+    body.replaceChildren(skeletonPanel(5));
+    updated.textContent = '';
+  }
+
+  private paintSourcesError(body: HTMLElement, updated: HTMLElement, error: unknown) {
+    setLoading(body, null);
+    body.replaceChildren(messagePanel('alert', 'Не удалось загрузить источники', errorText(error), 'alert',
+      retryButton(() => void this.loadSources())));
+    updated.textContent = '';
+  }
+
+  private paintSources(body: HTMLElement, sources: readonly AdminSource[], updated: HTMLElement) {
+    setLoading(body, null);
+    const at = new Date();
+    updated.textContent = `Обновлено в ${clockSeconds(at)}`;
+    if (sources.length === 0) {
+      body.replaceChildren(messagePanel('sources', 'Источников пока нет',
+        'Добавьте внешнюю подписку-источник VPN-конфигураций, чтобы построители могли её использовать.', 'status'));
+      return;
+    }
+    const panel = el('section', 'panel');
+    panel.setAttribute('aria-labelledby', 'sources-list-title');
+    panel.append(panelHead('sources-list-title', 'Источники', formatCount(sources.length)));
+    const list = el('ul', 'source-list');
+    for (const src of sources) list.append(this.sourceRow(src));
+    panel.append(list);
+    body.replaceChildren(panel);
+  }
+
+  private sourceRow(src: AdminSource): HTMLElement {
+    const item = el('li', 'source-item');
+    const info = el('div', 'source-info');
+    const nameRow = el('div', 'source-name-row');
+    const name = el('span', 'source-name', src.name);
+    const badge = el('span', src.enabled ? 'badge badge-active' : 'badge badge-disabled',
+      src.enabled ? 'Активен' : 'Отключён');
+    nameRow.append(name, badge);
+    const meta = el('p', 'source-meta');
+    meta.textContent = [
+      src.type,
+      src.last_sync_at ? `Синхр. ${formatDateTime(src.last_sync_at)}` : 'Не синхронизирован',
+      src.last_sync_status && src.last_sync_status !== 'ok' ? `⚠ ${src.last_sync_status}` : '',
+    ].filter(Boolean).join(' · ');
+    info.append(nameRow, meta);
+    if (src.description) info.append(el('p', 'source-desc', src.description));
+
+    const acts = el('div', 'source-actions');
+    const editBtn = button('Изменить', 'btn btn-secondary btn-xs', 'edit');
+    editBtn.addEventListener('click', () => this.openSourceEditor(src));
+    const toggleBtn = button(src.enabled ? 'Отключить' : 'Включить', 'btn btn-secondary btn-xs');
+    toggleBtn.addEventListener('click', () => void this.toggleSource(src, toggleBtn));
+    acts.append(editBtn, toggleBtn);
+    item.append(info, acts);
+    return item;
+  }
+
+  private async toggleSource(src: AdminSource, btn: HTMLButtonElement) {
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    try {
+      const updated = src.enabled ? await this.api.disableSource(src.id) : await this.api.enableSource(src.id);
+      if (this.sourcesCache) {
+        this.sourcesCache = this.sourcesCache.map(s => s.id === updated.id ? updated : s);
+        const view = this.sourcesView;
+        if (view) {
+          const dummy = el('p', 'updated');
+          this.paintSources(view.body, this.sourcesCache, dummy);
+        }
+      }
+    } catch (error) {
+      if (await this.endIfSignedOut(error, () => this.sourcesView !== null)) return;
+      this.toast(`Не удалось изменить статус источника. ${errorText(error)}`);
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+    }
+  }
+
+  private async loadSources() {
+    const view = this.sourcesView;
+    if (!view) return;
+    const request = ++this.sourcesRequest;
+    const current = () => this.sourcesView === view && request === this.sourcesRequest;
+    setRefreshBusy(view.refresh, true);
+    const dummy = el('p', 'updated');
+    if (!this.sourcesCache) this.paintSourcesSkeleton(view.body, dummy);
+    try {
+      const sources = await this.api.listSources();
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      this.sourcesCache = sources;
+      const updated = view.refresh.closest('.page-actions')?.querySelector<HTMLElement>('.updated') ?? dummy;
+      this.paintSources(view.body, sources, updated);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      const updated = view.refresh.closest('.page-actions')?.querySelector<HTMLElement>('.updated') ?? dummy;
+      if (this.sourcesCache) this.toast(`Не удалось обновить источники. ${errorText(error)}`);
+      else this.paintSourcesError(view.body, updated, error);
+    } finally {
+      if (current()) setRefreshBusy(view.refresh, false);
+    }
+  }
+
+  // Source editor dialog -------------------------------------------------------
+
+  private openSourceEditor(src: AdminSource | null) {
+    if (this.dialog || this.view !== 'app') return;
+
+    const isNew = src === null;
+    const dialog = el('dialog', 'modal modal-wide');
+    dialog.setAttribute('aria-labelledby', 'src-editor-title');
+
+    const title = el('h2', 'modal-title', isNew ? 'Новый источник' : `Источник: ${src!.name}`);
+    title.id = 'src-editor-title';
+
+    const mkInput = (id: string, labelText: string, value = '', type = 'text', hint?: string) => {
+      const inp = el('input', 'input');
+      Object.assign(inp, { id, type, value, spellcheck: false });
+      const f = field(labelText, inp);
+      if (hint) f.root.append(el('p', 'field-hint', hint));
+      return { inp, ...f };
+    };
+
+    const nameF = mkInput('src-name', 'Название', src?.name ?? '');
+    const descF = mkInput('src-desc', 'Описание', src?.description ?? '');
+    const typeF = mkInput('src-type', 'Тип', src?.type ?? 'xui', 'text', 'Например: xui, proxman');
+    const urlF = mkInput('src-url', 'URL подписки', '', 'url', 'Полный URL внешней подписки');
+    const hwidF = mkInput('src-hwid', 'HWID', '', 'text', 'Идентификатор устройства (если требуется)');
+    const uaF = mkInput('src-ua', 'User-Agent', '', 'text');
+    const headersF = mkInput('src-headers', 'Заголовки', '', 'text', 'Дополнительные HTTP-заголовки');
+
+    const enabledChk = el('input', 'checkbox');
+    enabledChk.type = 'checkbox';
+    enabledChk.id = 'src-enabled';
+    enabledChk.checked = src?.enabled ?? true;
+    const enabledLabel = el('label', 'checkbox-label', 'Активен');
+    enabledLabel.htmlFor = 'src-enabled';
+    const enabledRow = el('div', 'checkbox-row');
+    enabledRow.append(enabledChk, enabledLabel);
+
+    const isCreate = isNew;
+    if (!isCreate) {
+      urlF.root.hidden = true;
+      hwidF.root.hidden = true;
+      uaF.root.hidden = true;
+      headersF.root.hidden = true;
+    }
+
+    const statusEl = el('div', 'modal-status');
+    statusEl.setAttribute('role', 'alert');
+    const showStatus = (n: Notice | null) => statusEl.replaceChildren(...(n ? [notice(n)] : []));
+
+    const cancel = button('Отмена', 'btn btn-secondary');
+    const save = button(isNew ? 'Создать' : 'Сохранить', 'btn btn-primary');
+    const acts = el('div', 'modal-actions');
+    acts.append(cancel, save);
+
+    const body = el('div', 'modal-body');
+    body.append(title, nameF.root, descF.root, typeF.root);
+    if (isCreate) body.append(urlF.root, hwidF.root, uaF.root, headersF.root);
+    body.append(enabledRow, statusEl, acts);
+    dialog.append(body);
+
+    let submitting = false;
+    const handle = {
+      dismiss: () => { if (dialog.open) dialog.close(); dialog.remove(); },
+    };
+    const isOpen = () => this.dialog === handle;
+    const close = () => {
+      if (!isOpen()) return;
+      this.dialog = null;
+      handle.dismiss();
+    };
+
+    cancel.addEventListener('click', () => close());
+    dialog.addEventListener('keydown', e => { if (e.key === 'Escape' && !submitting) close(); });
+    dialog.addEventListener('cancel', e => { e.preventDefault(); if (!submitting) close(); });
+
+    save.addEventListener('click', async () => {
+      if (submitting) return;
+      nameF.setError(''); descF.setError('');
+      const name = nameF.inp.value.trim();
+      if (!name) { nameF.setError('Введите название.'); nameF.inp.focus(); return; }
+      submitting = true;
+      save.disabled = true; save.setAttribute('aria-busy', 'true');
+      setLabel(save, 'Сохраняем…');
+      showStatus(null);
+      try {
+        let updated: AdminSource;
+        if (isNew) {
+          const input: CreateSourceInput = {
+            name, description: descF.inp.value.trim(), type: typeF.inp.value.trim() || 'xui',
+            subscription_url: urlF.inp.value.trim(), hwid: hwidF.inp.value.trim(),
+            user_agent: uaF.inp.value.trim(), headers: headersF.inp.value.trim(),
+            enabled: enabledChk.checked,
+          };
+          updated = await this.api.createSource(input);
+        } else {
+          const input: UpdateSourceInput = {
+            name, description: descF.inp.value.trim(), type: typeF.inp.value.trim() || src!.type,
+          };
+          updated = await this.api.updateSource(src!.id, input);
+        }
+        if (!isOpen()) return;
+        if (isNew) {
+          this.sourcesCache = this.sourcesCache ? [...this.sourcesCache, updated] : [updated];
+        } else {
+          this.sourcesCache = this.sourcesCache?.map(s => s.id === updated.id ? updated : s) ?? null;
+        }
+        close();
+        void this.loadSources();
+        this.toast(isNew ? 'Источник создан.' : 'Источник обновлён.');
+      } catch (error) {
+        if (!isOpen()) return;
+        submitting = false;
+        save.disabled = false; save.removeAttribute('aria-busy');
+        setLabel(save, isNew ? 'Создать' : 'Сохранить');
+        if (await this.endIfSignedOut(error, isOpen)) return;
+        showStatus({ tone: 'error', text: `Не удалось сохранить. ${errorText(error)}` });
+      }
+    });
+
+    this.dialog = handle;
+    this.root.append(dialog);
+    dialog.showModal();
+    nameF.inp.focus();
+  }
+
+  // ===========================================================================
+  // Builders section
+  // ===========================================================================
+
+  private buildBuildersSection(header: HTMLElement): HTMLElement {
+    const { actions, refresh, updated } = refreshActions(() => void this.loadBuilders());
+    const addBtn = button('Новый построитель', 'btn btn-primary btn-sm', 'plus');
+    addBtn.addEventListener('click', () => this.openBuilderEditor(null));
+    actions.prepend(addBtn);
+    header.classList.add('has-actions');
+    header.append(actions);
+
+    const body = el('div', 'builders-section');
+    this.buildersView = { body, refresh };
+    if (this.buildersCache) this.paintBuilders(body, this.buildersCache, updated);
+    else this.paintBuildersSkeleton(body, updated);
+    return body;
+  }
+
+  private paintBuildersSkeleton(body: HTMLElement, updated: HTMLElement) {
+    setLoading(body, 'Загружаем построители');
+    body.replaceChildren(skeletonPanel(5));
+    updated.textContent = '';
+  }
+
+  private paintBuildersError(body: HTMLElement, updated: HTMLElement, error: unknown) {
+    setLoading(body, null);
+    body.replaceChildren(messagePanel('alert', 'Не удалось загрузить построители', errorText(error), 'alert',
+      retryButton(() => void this.loadBuilders())));
+    updated.textContent = '';
+  }
+
+  private paintBuilders(body: HTMLElement, builders: readonly AdminBuilder[], updated: HTMLElement) {
+    setLoading(body, null);
+    updated.textContent = `Обновлено в ${clockSeconds(new Date())}`;
+    if (builders.length === 0) {
+      body.replaceChildren(messagePanel('builders', 'Построителей пока нет',
+        'Создайте построитель, чтобы задать правила фильтрации и порядок серверов для подписок.', 'status'));
+      return;
+    }
+    const panel = el('section', 'panel');
+    panel.setAttribute('aria-labelledby', 'builders-list-title');
+    panel.append(panelHead('builders-list-title', 'Построители', formatCount(builders.length)));
+    const list = el('ul', 'builder-list');
+    for (const b of builders) list.append(this.builderRow(b));
+    panel.append(list);
+    body.replaceChildren(panel);
+  }
+
+  private builderRow(b: AdminBuilder): HTMLElement {
+    const item = el('li', 'builder-item');
+    const info = el('div', 'builder-info');
+    const nameRow = el('div', 'builder-name-row');
+    const name = el('span', 'builder-name', b.name);
+    const badge = el('span', b.enabled ? 'badge badge-active' : 'badge badge-disabled',
+      b.enabled ? 'Активен' : 'Отключён');
+    nameRow.append(name, badge);
+    const meta = el('p', 'builder-meta');
+    const srcCount = b.sources?.length ?? 0;
+    const itemCount = b.items?.length ?? 0;
+    meta.textContent = [
+      `v${b.version}`,
+      `${srcCount} ${srcCount === 1 ? 'источник' : srcCount < 5 ? 'источника' : 'источников'}`,
+      `${itemCount} ${itemCount === 1 ? 'правило' : itemCount < 5 ? 'правила' : 'правил'}`,
+    ].join(' · ');
+    info.append(nameRow, meta);
+    if (b.description) info.append(el('p', 'builder-desc', b.description));
+
+    const acts = el('div', 'builder-actions');
+    const editBtn = button('Редактировать', 'btn btn-primary btn-xs', 'edit');
+    editBtn.addEventListener('click', () => this.openBuilderEditor(b));
+    const toggleBtn = button(b.enabled ? 'Отключить' : 'Включить', 'btn btn-secondary btn-xs');
+    toggleBtn.addEventListener('click', () => void this.toggleBuilder(b, toggleBtn));
+    acts.append(editBtn, toggleBtn);
+    item.append(info, acts);
+    return item;
+  }
+
+  private async toggleBuilder(b: AdminBuilder, btn: HTMLButtonElement) {
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    try {
+      const updated = b.enabled ? await this.api.disableBuilder(b.id) : await this.api.enableBuilder(b.id);
+      if (this.buildersCache) {
+        this.buildersCache = this.buildersCache.map(x => x.id === updated.id ? updated : x);
+        const view = this.buildersView;
+        if (view) {
+          const dummy = el('p', 'updated');
+          this.paintBuilders(view.body, this.buildersCache, dummy);
+        }
+      }
+    } catch (error) {
+      if (await this.endIfSignedOut(error, () => this.buildersView !== null)) return;
+      this.toast(`Не удалось изменить статус построителя. ${errorText(error)}`);
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+    }
+  }
+
+  private async loadBuilders() {
+    const view = this.buildersView;
+    if (!view) return;
+    const request = ++this.buildersRequest;
+    const current = () => this.buildersView === view && request === this.buildersRequest;
+    setRefreshBusy(view.refresh, true);
+    const dummy = el('p', 'updated');
+    if (!this.buildersCache) this.paintBuildersSkeleton(view.body, dummy);
+    try {
+      const builders = await this.api.listBuilders();
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      this.buildersCache = builders;
+      const updated = view.refresh.closest('.page-actions')?.querySelector<HTMLElement>('.updated') ?? dummy;
+      this.paintBuilders(view.body, builders, updated);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      const updated = view.refresh.closest('.page-actions')?.querySelector<HTMLElement>('.updated') ?? dummy;
+      if (this.buildersCache) this.toast(`Не удалось обновить построители. ${errorText(error)}`);
+      else this.paintBuildersError(view.body, updated, error);
+    } finally {
+      if (current()) setRefreshBusy(view.refresh, false);
+    }
+  }
+
+  // ===========================================================================
+  // Builder editor (full-screen dialog)
+  // ===========================================================================
+
+  private openBuilderEditor(b: AdminBuilder | null) {
+    if (this.dialog || this.view !== 'app') return;
+    const isNew = b === null;
+
+    // ---- State ----
+    let currentBuilder: AdminBuilder | null = b;
+    let unsaved = false;
+    let submitting = false;
+    // Ordered list of source IDs (drag-reorder)
+    let selectedSourceIds: number[] = b?.sources?.slice().sort((a, x) => a.position - x.position).map(s => s.source_id) ?? [];
+    // Items (rules) — local copy for drag-reorder
+    let localItems: BuilderItem[] = b?.items?.slice().sort((a, x) => a.position - x.position) ?? [];
+
+    // ---- Dialog shell ----
+    const dialog = el('dialog', 'modal modal-editor');
+    dialog.setAttribute('aria-labelledby', 'be-title');
+
+    const titleEl = el('h2', 'modal-title', isNew ? 'Новый построитель' : `Построитель: ${b!.name}`);
+    titleEl.id = 'be-title';
+
+    // ---- Unsaved indicator ----
+    const unsavedBadge = el('span', 'badge badge-warn unsaved-badge');
+    unsavedBadge.textContent = 'Несохранённые изменения';
+    unsavedBadge.hidden = true;
+    const markUnsaved = () => { unsaved = true; unsavedBadge.hidden = false; };
+
+    // ---- Basic fields ----
+    const mkInp = (id: string, labelText: string, value = '', hint?: string) => {
+      const inp = el('input', 'input');
+      Object.assign(inp, { id, type: 'text', value, spellcheck: false });
+      const f = field(labelText, inp);
+      if (hint) f.root.append(el('p', 'field-hint', hint));
+      inp.addEventListener('input', markUnsaved);
+      return { inp, ...f };
+    };
+
+    const nameF = mkInp('be-name', 'Название', b?.name ?? '');
+    const descF = mkInp('be-desc', 'Описание', b?.description ?? '');
+    const profileTitleF = mkInp('be-profile-title', 'Заголовок профиля', b?.profile_title ?? '',
+      'Отображается в клиентском приложении как имя подписки.');
+    const supportUrlF = mkInp('be-support-url', 'URL поддержки', b?.support_url ?? '');
+    const announceF = mkInp('be-announce', 'Анонс', b?.announce ?? '',
+      'Короткое сообщение, которое клиент видит при обновлении подписки.');
+
+    const enabledChk = el('input', 'checkbox');
+    enabledChk.type = 'checkbox';
+    enabledChk.id = 'be-enabled';
+    enabledChk.checked = b?.enabled ?? true;
+    enabledChk.addEventListener('change', markUnsaved);
+    const enabledLabel = el('label', 'checkbox-label', 'Активен');
+    enabledLabel.htmlFor = 'be-enabled';
+    const enabledRow = el('div', 'checkbox-row');
+    enabledRow.append(enabledChk, enabledLabel);
+
+    // ---- Sources panel ----
+    const sourcesPanel = el('section', 'editor-panel');
+    sourcesPanel.setAttribute('aria-labelledby', 'be-sources-title');
+    const sourcesPanelHead = panelHead('be-sources-title', 'Источники');
+    sourcesPanelHead.append(el('p', 'panel-note', 'Выберите источники и задайте их порядок перетаскиванием. Построитель использует их в указанном порядке.'));
+    sourcesPanel.append(sourcesPanelHead);
+
+    const sourcesListEl = el('ul', 'sources-picker');
+    const renderSourcesPicker = () => {
+      sourcesListEl.replaceChildren();
+      const allSources = this.sourcesCache ?? [];
+      const selected = selectedSourceIds.map(id => allSources.find(s => s.id === id)).filter(Boolean) as AdminSource[];
+      const unselected = allSources.filter(s => !selectedSourceIds.includes(s.id));
+
+      for (const src of selected) {
+        const li = el('li', 'source-pick-item source-pick-selected');
+        li.draggable = true;
+        li.dataset.srcId = String(src.id);
+        const dragHandle = el('span', 'drag-handle');
+        dragHandle.append(icon('drag'));
+        dragHandle.setAttribute('aria-hidden', 'true');
+        const lbl = el('span', 'source-pick-name', src.name);
+        const bdg = el('span', src.enabled ? 'badge badge-active' : 'badge badge-disabled',
+          src.enabled ? 'Активен' : 'Отключён');
+        const removeBtn = button('Убрать', 'btn btn-secondary btn-xs');
+        removeBtn.addEventListener('click', () => {
+          selectedSourceIds = selectedSourceIds.filter(id => id !== src.id);
+          markUnsaved();
+          renderSourcesPicker();
+        });
+        li.append(dragHandle, lbl, bdg, removeBtn);
+        sourcesListEl.append(li);
+      }
+      for (const src of unselected) {
+        const li = el('li', 'source-pick-item');
+        li.dataset.srcId = String(src.id);
+        const lbl = el('span', 'source-pick-name', src.name);
+        const bdg = el('span', src.enabled ? 'badge badge-active' : 'badge badge-disabled',
+          src.enabled ? 'Активен' : 'Отключён');
+        const addBtn = button('Добавить', 'btn btn-primary btn-xs');
+        addBtn.addEventListener('click', () => {
+          selectedSourceIds = [...selectedSourceIds, src.id];
+          markUnsaved();
+          renderSourcesPicker();
+        });
+        li.append(lbl, bdg, addBtn);
+        sourcesListEl.append(li);
+      }
+      if (allSources.length === 0) {
+        sourcesListEl.append(el('li', 'source-pick-empty', 'Источники не загружены. Обновите страницу.'));
+      }
+      setupDragReorder(sourcesListEl, 'source-pick-selected', (newOrder) => {
+        selectedSourceIds = newOrder.map(Number);
+        markUnsaved();
+      });
+    };
+    renderSourcesPicker();
+    sourcesPanel.append(sourcesListEl);
+
+    // ---- Items (rules) panel ----
+    const itemsPanel = el('section', 'editor-panel');
+    itemsPanel.setAttribute('aria-labelledby', 'be-items-title');
+    const itemsPanelHead = panelHead('be-items-title', 'Правила');
+    itemsPanelHead.append(el('p', 'panel-note', 'Правила определяют, какие серверы и страны включаются в подписку и в каком порядке.'));
+    itemsPanel.append(itemsPanelHead);
+
+    const itemsListEl = el('ul', 'items-list');
+    const addItemBtn = button('Добавить правило', 'btn btn-secondary btn-sm', 'plus');
+
+    const renderItems = () => {
+      itemsListEl.replaceChildren();
+      if (localItems.length === 0) {
+        itemsListEl.append(el('li', 'items-empty', 'Правил пока нет. Добавьте страну или конкретный узел.'));
+      }
+      for (let i = 0; i < localItems.length; i++) {
+        const item = localItems[i];
+        itemsListEl.append(this.buildItemRow(item, i, localItems, (updated) => {
+          localItems = updated;
+          markUnsaved();
+          renderItems();
+        }, currentBuilder, isNew));
+      }
+      setupDragReorder(itemsListEl, 'item-row', (newOrder) => {
+        const reordered = newOrder.map(idx => localItems[Number(idx)]);
+        localItems = reordered.map((it, pos) => ({ ...it, position: pos }));
+        markUnsaved();
+        renderItems();
+      });
+    };
+    renderItems();
+
+    addItemBtn.addEventListener('click', () => {
+      this.openItemEditor(null, currentBuilder, selectedSourceIds, (newItem) => {
+        localItems = [...localItems, { ...newItem, position: localItems.length }];
+        markUnsaved();
+        renderItems();
+      });
+    });
+    itemsPanel.append(itemsListEl, addItemBtn);
+
+    // ---- Preview panel ----
+    const previewPanel = el('section', 'editor-panel');
+    previewPanel.setAttribute('aria-labelledby', 'be-preview-title');
+    previewPanel.append(panelHead('be-preview-title', 'Предпросмотр'));
+    const previewBody = el('div', 'preview-body');
+    const previewBtn = button('Запустить предпросмотр', 'btn btn-secondary btn-sm', 'eye');
+    previewBtn.disabled = isNew;
+    previewBtn.title = isNew ? 'Сначала сохраните построитель' : '';
+    previewBtn.addEventListener('click', () => void this.runPreview(currentBuilder, previewBody, previewBtn));
+    previewPanel.append(previewBody, previewBtn);
+
+    // ---- Status / actions ----
+    const statusEl = el('div', 'modal-status');
+    statusEl.setAttribute('role', 'alert');
+    const showStatus = (n: Notice | null) => statusEl.replaceChildren(...(n ? [notice(n)] : []));
+
+    const cancelBtn = button('Закрыть', 'btn btn-secondary');
+    const saveBtn = button(isNew ? 'Создать' : 'Сохранить', 'btn btn-primary');
+
+    const actionsRow = el('div', 'modal-actions');
+    actionsRow.append(cancelBtn, saveBtn);
+
+    // ---- Assemble body ----
+    const bodyEl = el('div', 'modal-body editor-body');
+    bodyEl.append(
+      titleEl, unsavedBadge,
+      el('div', 'editor-section-title', 'Основные настройки'),
+      nameF.root, descF.root, profileTitleF.root, supportUrlF.root, announceF.root, enabledRow,
+      sourcesPanel,
+      itemsPanel,
+      previewPanel,
+      statusEl, actionsRow,
+    );
+    dialog.append(bodyEl);
+
+    // ---- Dialog lifecycle ----
+    let handle: { dismiss: () => void };
+    const isOpen = () => this.dialog === handle;
+    const close = (force = false) => {
+      if (!isOpen()) return;
+      if (unsaved && !force) {
+        if (!window.confirm('Есть несохранённые изменения. Закрыть без сохранения?')) return;
+      }
+      this.dialog = null;
+      handle.dismiss();
+    };
+    handle = {
+      dismiss: () => { if (dialog.open) dialog.close(); dialog.remove(); },
+    };
+
+    cancelBtn.addEventListener('click', () => close());
+    dialog.addEventListener('keydown', e => { if (e.key === 'Escape' && !submitting) close(); });
+    dialog.addEventListener('cancel', e => { e.preventDefault(); if (!submitting) close(); });
+
+    // ---- Save ----
+    saveBtn.addEventListener('click', async () => {
+      if (submitting) return;
+      nameF.setError('');
+      const name = nameF.inp.value.trim();
+      if (!name) { nameF.setError('Введите название.'); nameF.inp.focus(); return; }
+
+      submitting = true;
+      saveBtn.disabled = true; saveBtn.setAttribute('aria-busy', 'true');
+      setLabel(saveBtn, 'Сохраняем…');
+      showStatus(null);
+
+      try {
+        let saved: AdminBuilder;
+        if (isNew) {
+          const input: CreateBuilderInput = {
+            request_key: newRequestKey(),
+            name, description: descF.inp.value.trim(),
+            enabled: enabledChk.checked,
+            profile_title: profileTitleF.inp.value.trim(),
+            support_url: supportUrlF.inp.value.trim(),
+            announce: announceF.inp.value.trim(),
+          };
+          const res = await this.api.createBuilder(input);
+          saved = res.builder;
+        } else {
+          const input: UpdateBuilderInput = {
+            request_key: newRequestKey(),
+            version: currentBuilder!.version,
+            name, description: descF.inp.value.trim(),
+            enabled: enabledChk.checked,
+            profile_title: profileTitleF.inp.value.trim(),
+            support_url: supportUrlF.inp.value.trim(),
+            announce: announceF.inp.value.trim(),
+          };
+          const res = await this.api.updateBuilder(currentBuilder!.id, input);
+          saved = res.builder;
+        }
+        if (!isOpen()) return;
+
+        // Save sources order
+        if (selectedSourceIds.length > 0 || !isNew) {
+          await this.api.setBuilderSources(saved.id, selectedSourceIds);
+        }
+
+        // Save items (upsert all, then reorder)
+        if (localItems.length > 0) {
+          const upserted: BuilderItem[] = [];
+          for (const item of localItems) {
+            const inp: UpsertBuilderItemInput = {
+              id: item.id > 0 ? item.id : undefined,
+              kind: item.kind,
+              source_id: item.source_id,
+              country_code: item.kind === 'country' ? item.country_code : undefined,
+              fingerprint: item.kind === 'node' ? item.fingerprint : undefined,
+              original_name: item.kind === 'node' ? item.original_name : undefined,
+              custom_name: item.custom_name,
+              description: item.description,
+              position: item.position,
+              enabled: item.enabled,
+            };
+            const upsertedItem = await this.api.upsertBuilderItem(saved.id, inp);
+            upserted.push(upsertedItem);
+          }
+          if (upserted.length > 1) {
+            await this.api.reorderBuilderItems(saved.id, upserted.map(it => it.id));
+          }
+        }
+
+        if (!isOpen()) return;
+        currentBuilder = saved;
+        unsaved = false;
+        unsavedBadge.hidden = true;
+        titleEl.textContent = `Построитель: ${saved.name}`;
+        previewBtn.disabled = false;
+        previewBtn.title = '';
+
+        // Update cache
+        if (isNew) {
+          this.buildersCache = this.buildersCache ? [...this.buildersCache, saved] : [saved];
+        } else {
+          this.buildersCache = this.buildersCache?.map(x => x.id === saved.id ? saved : x) ?? null;
+        }
+        void this.loadBuilders();
+        this.toast(isNew ? 'Построитель создан.' : 'Построитель сохранён.');
+        submitting = false;
+        saveBtn.disabled = false; saveBtn.removeAttribute('aria-busy');
+        setLabel(saveBtn, 'Сохранить');
+        showStatus({ tone: 'success', text: 'Изменения сохранены.' });
+      } catch (error) {
+        if (!isOpen()) return;
+        submitting = false;
+        saveBtn.disabled = false; saveBtn.removeAttribute('aria-busy');
+        setLabel(saveBtn, isNew ? 'Создать' : 'Сохранить');
+        if (await this.endIfSignedOut(error, isOpen)) return;
+        const code = error instanceof ApiError ? error.code : '';
+        const status = error instanceof ApiError ? error.status : 0;
+        if (status === 409 && code === 'version_conflict') {
+          showStatus({ tone: 'error', text: 'Конфликт версий: построитель был изменён в другой вкладке. Закройте редактор и откройте снова.' });
+        } else if (status === 409 && code === 'name_taken') {
+          nameF.setError('Построитель с таким названием уже существует.');
+          nameF.inp.focus();
+        } else {
+          showStatus({ tone: 'error', text: `Не удалось сохранить. ${errorText(error)}` });
+        }
+      }
+    });
+
+    this.dialog = handle;
+    this.root.append(dialog);
+    dialog.showModal();
+    nameF.inp.focus();
+  }
+
+  // ---- Item row in builder editor ----
+  private buildItemRow(
+    item: BuilderItem,
+    index: number,
+    allItems: BuilderItem[],
+    onChange: (updated: BuilderItem[]) => void,
+    _builder: AdminBuilder | null,
+    _isNew: boolean,
+  ): HTMLElement {
+    const li = el('li', 'item-row');
+    li.draggable = true;
+    li.dataset.dragIdx = String(index);
+
+    const dragHandle = el('span', 'drag-handle');
+    dragHandle.append(icon('drag'));
+    dragHandle.setAttribute('aria-hidden', 'true');
+
+    const kindBadge = el('span', item.kind === 'country' ? 'badge badge-country' : 'badge badge-node',
+      item.kind === 'country' ? '🌍 Страна' : '🖥 Узел');
+
+    const nameEl = el('span', 'item-name');
+    if (item.kind === 'country') {
+      nameEl.textContent = item.custom_name || item.country_code || '—';
+    } else {
+      nameEl.textContent = item.custom_name || item.original_name || item.fingerprint || '—';
+    }
+
+    const enabledBadge = el('span', item.enabled ? 'badge badge-active' : 'badge badge-disabled',
+      item.enabled ? 'Вкл' : 'Выкл');
+
+    const editBtn = button('Изменить', 'btn btn-secondary btn-xs', 'edit');
+    editBtn.addEventListener('click', () => {
+      this.openItemEditor(item, _builder, [], (updated) => {
+        onChange(allItems.map((it, i) => i === index ? { ...updated, position: it.position } : it));
+      });
+    });
+
+    const deleteBtn = button('Удалить', 'btn btn-secondary btn-xs', 'trash');
+    deleteBtn.addEventListener('click', () => {
+      if (!window.confirm('Удалить правило?')) return;
+      // If item has a real id, delete from server on next save (handled by caller)
+      onChange(allItems.filter((_, i) => i !== index).map((it, pos) => ({ ...it, position: pos })));
+    });
+
+    const acts = el('div', 'item-actions');
+    acts.append(editBtn, deleteBtn);
+
+    li.append(dragHandle, kindBadge, nameEl, enabledBadge, acts);
+    return li;
+  }
+
+  // ---- Item editor sub-dialog ----
+  private openItemEditor(
+    item: BuilderItem | null,
+    _builder: AdminBuilder | null,
+    _sourceIds: number[],
+    onSave: (item: BuilderItem) => void,
+  ) {
+    const isNew = item === null;
+    const dialog = el('dialog', 'modal modal-wide');
+    dialog.setAttribute('aria-labelledby', 'ie-title');
+
+    const titleEl = el('h2', 'modal-title', isNew ? 'Новое правило' : 'Изменить правило');
+    titleEl.id = 'ie-title';
+
+    // Kind selector
+    const kindSel = el('select', 'input');
+    kindSel.id = 'ie-kind';
+    const optCountry = el('option', '', 'Страна');
+    optCountry.value = 'country';
+    const optNode = el('option', '', 'Узел');
+    optNode.value = 'node';
+    kindSel.append(optCountry, optNode);
+    kindSel.value = item?.kind ?? 'country';
+    const kindField = el('div', 'field');
+    const kindLabel = el('label', 'field-label', 'Тип правила');
+    kindLabel.htmlFor = 'ie-kind';
+    kindField.append(kindLabel, el('div', 'control', ''));
+    kindField.querySelector('.control')!.append(kindSel);
+
+    const mkInp = (id: string, labelText: string, value = '', hint?: string) => {
+      const inp = el('input', 'input');
+      Object.assign(inp, { id, type: 'text', value, spellcheck: false });
+      const f = field(labelText, inp);
+      if (hint) f.root.append(el('p', 'field-hint', hint));
+      return { inp, ...f };
+    };
+
+    const countryF = mkInp('ie-country', 'Код страны (ISO 3166-1 alpha-2)', item?.country_code ?? '', 'Например: RU, DE, US');
+    const fingerprintF = mkInp('ie-fingerprint', 'Fingerprint узла', item?.fingerprint ?? '');
+    const origNameF = mkInp('ie-orig-name', 'Оригинальное имя', item?.original_name ?? '');
+    const customNameF = mkInp('ie-custom-name', 'Пользовательское имя', item?.custom_name ?? '', 'Если задано, заменяет оригинальное имя в подписке.');
+    const descF = mkInp('ie-desc', 'Описание', item?.description ?? '');
+    const sourceIdF = mkInp('ie-source-id', 'ID источника', String(item?.source_id ?? 0), 'Числовой ID источника (0 = любой)');
+
+    const enabledChk = el('input', 'checkbox');
+    enabledChk.type = 'checkbox';
+    enabledChk.id = 'ie-enabled';
+    enabledChk.checked = item?.enabled ?? true;
+    const enabledLabel = el('label', 'checkbox-label', 'Включено');
+    enabledLabel.htmlFor = 'ie-enabled';
+    const enabledRow = el('div', 'checkbox-row');
+    enabledRow.append(enabledChk, enabledLabel);
+
+    const updateVisibility = () => {
+      const isCountry = kindSel.value === 'country';
+      countryF.root.hidden = !isCountry;
+      fingerprintF.root.hidden = isCountry;
+      origNameF.root.hidden = isCountry;
+    };
+    kindSel.addEventListener('change', updateVisibility);
+    updateVisibility();
+
+    const statusEl = el('div', 'modal-status');
+    statusEl.setAttribute('role', 'alert');
+
+    const cancelBtn = button('Отмена', 'btn btn-secondary');
+    const saveBtn = button('Применить', 'btn btn-primary');
+    const acts = el('div', 'modal-actions');
+    acts.append(cancelBtn, saveBtn);
+
+    const body = el('div', 'modal-body');
+    body.append(titleEl, kindField, countryF.root, fingerprintF.root, origNameF.root,
+      customNameF.root, descF.root, sourceIdF.root, enabledRow, statusEl, acts);
+    dialog.append(body);
+
+    const close = () => { if (dialog.open) dialog.close(); dialog.remove(); };
+    cancelBtn.addEventListener('click', close);
+    dialog.addEventListener('cancel', e => { e.preventDefault(); close(); });
+
+    saveBtn.addEventListener('click', () => {
+      const kind = kindSel.value as 'country' | 'node';
+      const sourceId = parseInt(sourceIdF.inp.value.trim(), 10);
+      const result: BuilderItem = {
+        id: item?.id ?? 0,
+        kind,
+        source_id: Number.isFinite(sourceId) ? sourceId : 0,
+        country_code: kind === 'country' ? countryF.inp.value.trim().toUpperCase() : '',
+        fingerprint: kind === 'node' ? fingerprintF.inp.value.trim() : '',
+        original_name: kind === 'node' ? origNameF.inp.value.trim() : '',
+        custom_name: customNameF.inp.value.trim() || null,
+        description: descF.inp.value.trim(),
+        position: item?.position ?? 0,
+        enabled: enabledChk.checked,
+      };
+      onSave(result);
+      close();
+    });
+
+    document.body.append(dialog);
+    dialog.showModal();
+    (kindSel.value === 'country' ? countryF.inp : fingerprintF.inp).focus();
+  }
+
+  // ---- Preview ----
+  private async runPreview(builder: AdminBuilder | null, body: HTMLElement, btn: HTMLButtonElement) {
+    if (!builder) return;
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    body.replaceChildren(el('p', 'preview-loading', 'Загружаем предпросмотр…'));
+    try {
+      const preview = await this.api.previewBuilder(builder.id);
+      body.replaceChildren();
+
+      if (preview.warnings && preview.warnings.length > 0) {
+        const warnBox = el('div', 'preview-warnings');
+        for (const w of preview.warnings) warnBox.append(el('p', 'preview-warn', `⚠ ${w}`));
+        body.append(warnBox);
+      }
+
+      const stats = el('p', 'preview-stats');
+      stats.textContent = [
+        `Всего: ${preview.total}`,
+        preview.missing > 0 ? `Не найдено: ${preview.missing}` : '',
+        preview.conflicts > 0 ? `Конфликтов: ${preview.conflicts}` : '',
+      ].filter(Boolean).join(' · ');
+      body.append(stats);
+
+      if (preview.items.length === 0) {
+        body.append(el('p', 'preview-empty', 'Предпросмотр пуст — нет подходящих узлов.'));
+      } else {
+        const list = el('ul', 'preview-list');
+        for (const pi of preview.items) {
+          const li = el('li', `preview-item preview-${pi.status}`);
+          const pos = el('span', 'preview-pos', String(pi.position + 1));
+          const name = el('span', 'preview-name', pi.display_name || pi.entry?.original_name || '—');
+          const statusBadge = el('span', `badge preview-status-badge preview-status-${pi.status}`, pi.status);
+          const country = el('span', 'preview-country', pi.entry?.country_code ?? '');
+          li.append(pos, name, country, statusBadge);
+          list.append(li);
+        }
+        body.append(list);
+      }
+    } catch (error) {
+      body.replaceChildren(el('p', 'preview-error', `Ошибка предпросмотра: ${errorText(error)}`));
+    } finally {
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+    }
   }
 }
 

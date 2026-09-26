@@ -65,6 +65,12 @@ type SubscriptionQueries interface {
 	GetAllSubscriptions(ctx context.Context) ([]database.Subscription, error)
 	GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*database.Subscription, error)
 	GetWithPlanAndNodes(ctx context.Context, subscriptionID string) (*database.SubscriptionFull, error)
+	// ResolveSubscriptionBuilder returns the builder serving the subscription
+	// (subscription override > plan default) or nil to keep the existing pipeline.
+	ResolveSubscriptionBuilder(ctx context.Context, sub *database.Subscription) (*database.ResolvedBuilder, error)
+	// GetSourceEntries returns the present catalogue entries of a provider
+	// source ("*" = all countries).
+	GetSourceEntries(ctx context.Context, sourceID uint, countryCode string) ([]database.ProviderSourceEntry, error)
 	// GetActiveSubscriptionsWithTrafficLimit returns active subscriptions whose
 	// plan has a non-zero traffic limit, together with that limit (in bytes).
 	GetActiveSubscriptionsWithTrafficLimit(ctx context.Context) ([]database.SubscriptionTrafficTarget, error)

@@ -1010,7 +1010,10 @@ func TestAdminAPI_SubscriptionByID(t *testing.T) {
 
 		plan := raw["plan"].(map[string]any)
 		assert.Equal(t, database.FreePlanName, plan["name"])
-		assert.ElementsMatch(t, []string{"id", "name", "is_active", "devices_limit", "traffic_limit"}, mapKeys(plan))
+		assert.ElementsMatch(t, []string{"id", "name", "is_active", "devices_limit", "traffic_limit", "subscription_builder_id"}, mapKeys(plan))
+		assert.Nil(t, plan["subscription_builder_id"], "no plan default builder assigned: null")
+		assert.Contains(t, sub, "subscription_builder_id")
+		assert.Nil(t, sub["subscription_builder_id"], "no subscription override assigned: null")
 
 		assert.Equal(t, []any{}, raw["nodes"], "no bindings: [] not null")
 

@@ -91,7 +91,10 @@ type Subscription struct {
 	ReferredBy       *int64     `gorm:"index"`
 	ProductID        *uint      `gorm:"index"`
 	ProviderSourceID *uint      `gorm:"index"`
-	StartedAt        *time.Time
+	// SubscriptionBuilderID is an optional per-subscription builder override
+	// (migration 045). NULL falls back to the plan's default builder.
+	SubscriptionBuilderID *uint `gorm:"column:subscription_builder_id;index"`
+	StartedAt             *time.Time
 	PricePaidCents   int64   `gorm:"default:0"`
 	Currency         *string `gorm:"size:3"`
 	Devices          string  `gorm:"type:text;default:'[]'"` // JSON array of {header_key: value} device entries
@@ -164,7 +167,101 @@ type ProviderSource struct {
 	Enabled         bool      `gorm:"not null;index;column:enabled"`
 	CreatedAt       time.Time `gorm:"not null;autoCreateTime;column:created_at"`
 	UpdatedAt       time.Time `gorm:"not null;autoUpdateTime;column:updated_at"`
+	// Admin metadata and last catalogue refresh (migration 045). Errors are
+	// stable codes only and never contain upstream URLs or credentials.
+	Description    string     `gorm:"type:text;not null;default:'';column:description"`
+	LastSyncAt     *time.Time `gorm:"column:last_sync_at"`
+	LastSyncStatus string     `gorm:"size:16;not null;default:'';column:last_sync_status"`
+	LastSyncError  string     `gorm:"size:64;not null;default:'';column:last_sync_error"`
 }
+
+// ProviderSourceEntry is one entry (server/node) seen in a provider source on
+// the last catalogue refresh. Only metadata is stored; share links with
+// credentials are always fetched live from the upstream URL.
+// (migration 045)
+type ProviderSourceEntry struct {
+	ID               uint      `gorm:"primaryKey;column:id"`
+	SourceID         uint      `gorm:"not null;index;column:source_id"`
+	Fingerprint      string    `gorm:"size:64;not null;column:fingerprint"`
+	OriginalName     string    `gorm:"size:255;not null;default:'';column:original_name"`
+	Protocol         string    `gorm:"size:32;not null;default:'';column:protocol"`
+	CountryCode      string    `gorm:"size:2;not null;default:'';column:country_code"`
+	UpstreamPosition int       `gorm:"not null;default:0;column:upstream_position"`
+	Present          bool      `gorm:"not null;default:true;column:present"`
+	LastSeenAt       time.Time `gorm:"not null;column:last_seen_at"`
+
+	Source *ProviderSource `gorm:"foreignKey:SourceID"`
+}
+
+// SubscriptionBuilder is an output configuration that selects and orders
+// entries from one or more ProviderSources. Plans reference a default builder;
+// individual subscriptions may override it. (migration 045)
+type SubscriptionBuilder struct {
+	ID           uint      `gorm:"primaryKey;column:id"`
+	Name         string    `gorm:"size:128;not null;uniqueIndex;column:name"`
+	Description  string    `gorm:"type:text;not null;default:'';column:description"`
+	Enabled      bool      `gorm:"not null;default:true;column:enabled"`
+	ProfileTitle string    `gorm:"size:128;not null;default:'';column:profile_title"`
+	SupportURL   string    `gorm:"size:512;not null;default:'';column:support_url"`
+	Announce     string    `gorm:"size:512;not null;default:'';column:announce"`
+	// Version is incremented on every update and used for optimistic locking.
+	Version   int       `gorm:"not null;default:1;column:version"`
+	CreatedAt time.Time `gorm:"not null;autoCreateTime;column:created_at"`
+	UpdatedAt time.Time `gorm:"not null;autoUpdateTime;column:updated_at"`
+
+	Sources []SubscriptionBuilderSource `gorm:"foreignKey:BuilderID"`
+	Items   []SubscriptionBuilderItem   `gorm:"foreignKey:BuilderID"`
+}
+
+// SubscriptionBuilderSource links a builder to one of its input sources and
+// defines the order in which sources are consulted. (migration 045)
+type SubscriptionBuilderSource struct {
+	BuilderID uint `gorm:"primaryKey;column:builder_id"`
+	SourceID  uint `gorm:"primaryKey;column:source_id"`
+	Position  int  `gorm:"not null;default:0;column:position"`
+
+	Builder *SubscriptionBuilder `gorm:"foreignKey:BuilderID"`
+	Source  *ProviderSource      `gorm:"foreignKey:SourceID"`
+}
+
+// SubscriptionBuilderItem is one selection rule inside a builder.
+//
+// kind = "country": dynamically includes every present entry of the source
+// whose country_code matches. Resolved on every build — new nodes appear
+// automatically after the next source refresh.
+//
+// kind = "node": targets one concrete entry matched first by fingerprint
+// (exact), then by original_name (unique fallback). Fingerprint match
+// semantics follow the fallback fingerprint spec:
+//   - 1 match  → use it (+ warning when matched by name only)
+//   - 0 matches → missing (entry omitted)
+//   - >1 matches → conflict (entry omitted)
+//
+// custom_name overrides the display name in the assembled subscription.
+// enabled = false excludes the item from the build (soft exclude).
+// (migration 045)
+type SubscriptionBuilderItem struct {
+	ID           uint    `gorm:"primaryKey;column:id"`
+	BuilderID    uint    `gorm:"not null;index;column:builder_id"`
+	Kind         string  `gorm:"size:16;not null;column:kind"` // "country" | "node"
+	SourceID     uint    `gorm:"not null;column:source_id"`
+	CountryCode  string  `gorm:"size:2;not null;default:'';column:country_code"`
+	Fingerprint  string  `gorm:"size:64;not null;default:'';column:fingerprint"`
+	OriginalName string  `gorm:"size:255;not null;default:'';column:original_name"`
+	CustomName   *string `gorm:"size:128;column:custom_name"`
+	Description  string  `gorm:"type:text;not null;default:'';column:description"`
+	Position     int     `gorm:"not null;default:0;column:position"`
+	Enabled      bool    `gorm:"not null;default:true;column:enabled"`
+
+	Builder *SubscriptionBuilder `gorm:"foreignKey:BuilderID"`
+	Source  *ProviderSource      `gorm:"foreignKey:SourceID"`
+}
+
+// BuilderItemKind enumerates the two selection strategies.
+const (
+	BuilderItemKindCountry = "country"
+	BuilderItemKindNode    = "node"
+)
 
 // Plan represents a subscription plan.
 type Plan struct {
@@ -173,9 +270,11 @@ type Plan struct {
 	IsActive     bool   `gorm:"not null;default:true;column:is_active"`
 	DevicesLimit int    `gorm:"default:1;column:devices_limit"`
 	// TrafficLimit — лимит трафика в байтах. 0 = безлимит.
-	TrafficLimit int64     `gorm:"default:0;column:traffic_limit"`
-	CreatedAt    time.Time `gorm:"autoCreateTime;column:created_at"`
-	UpdatedAt    time.Time `gorm:"autoUpdateTime;column:updated_at"`
+	TrafficLimit int64 `gorm:"default:0;column:traffic_limit"`
+	// SubscriptionBuilderID is the plan's default builder (migration 045).
+	SubscriptionBuilderID *uint     `gorm:"column:subscription_builder_id"`
+	CreatedAt             time.Time `gorm:"autoCreateTime;column:created_at"`
+	UpdatedAt             time.Time `gorm:"autoUpdateTime;column:updated_at"`
 
 	Products  []Product  `gorm:"foreignKey:PlanID"`
 	PlanNodes []PlanNode `gorm:"foreignKey:PlanID"`
@@ -478,6 +577,22 @@ func (SubscriptionNode) TableName() string {
 
 func (Broadcast) TableName() string {
 	return "broadcasts"
+}
+
+func (ProviderSourceEntry) TableName() string {
+	return "provider_source_entries"
+}
+
+func (SubscriptionBuilder) TableName() string {
+	return "subscription_builders"
+}
+
+func (SubscriptionBuilderSource) TableName() string {
+	return "subscription_builder_sources"
+}
+
+func (SubscriptionBuilderItem) TableName() string {
+	return "subscription_builder_items"
 }
 
 // IsExpired returns true if the subscription has expired.

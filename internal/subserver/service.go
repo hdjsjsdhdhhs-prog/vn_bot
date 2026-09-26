@@ -78,6 +78,7 @@ func (s *Service) SetCache(key string, body []byte, headers map[string]string) {
 func (s *Service) InvalidateCache(key string) {
 	s.cache.Delete(key)
 	s.cache.DeletePrefix(key + ":provider:")
+	s.cache.DeletePrefix(key + ":builder:")
 }
 
 // Stop shuts down the background cache cleanup loop.

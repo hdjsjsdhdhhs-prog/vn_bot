@@ -21,11 +21,26 @@ func TestPurchaseMigration042_LegacyOrderSavePreservesNulls(t *testing.T) {
 	require.NoError(t, err)
 	svc := &Service{db: gdb}
 	ctx := context.Background()
-	// Migrations alone do not perform NewService's default-plan seeding.
-	require.NoError(t, gdb.Create(&Plan{Name: FreePlanName, IsActive: true}).Error)
-	sub := createTestSubscription(t, svc, 42001, "legacy-purchase", "legacy-purchase-client")
+	// Seed with raw SQL: the Go models describe the latest schema (e.g.
+	// plans/subscriptions.subscription_builder_id from 045), which does not
+	// exist yet at 041. Migrations alone do not perform NewService's seeding.
+	// Same columns/values the pre-045 Plan model wrote (gorm defaults).
+	now := time.Now().UTC()
+	result, err := sqlDB.Exec(`INSERT INTO plans (name, is_active, devices_limit, traffic_limit, created_at, updated_at)
+		VALUES (?, 1, 1, 0, ?, ?)`, FreePlanName, now, now)
+	require.NoError(t, err)
+	planID, err := result.LastInsertId()
+	require.NoError(t, err)
+	result, err = sqlDB.Exec(`INSERT INTO subscriptions
+		(telegram_id, username, client_id, subscription_id, expires_at, status, plan_id)
+		VALUES (42001, 'legacy-purchase', 'legacy-purchase-client', 'sub-legacy-purchase-client', ?, 'active', ?)`,
+		time.Now().Add(24*time.Hour).UTC(), planID)
+	require.NoError(t, err)
+	subPK, err := result.LastInsertId()
+	require.NoError(t, err)
+	sub := &Subscription{ID: uint(subPK), PlanID: uint(planID)}
 	// Insert before 042, without referencing any purchase/offer columns.
-	result, err := sqlDB.Exec(`INSERT INTO products (plan_id, name, duration_days, price_cents, currency, is_active)
+	result, err = sqlDB.Exec(`INSERT INTO products (plan_id, name, duration_days, price_cents, currency, is_active)
 		VALUES (?, 'Legacy monthly', 30, 5000, 'RUB', 1)`, sub.PlanID)
 	require.NoError(t, err)
 	productID, err := result.LastInsertId()

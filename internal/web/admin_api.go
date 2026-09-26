@@ -27,12 +27,13 @@ const adminAPIMaxBody = 4096
 // redirect noncanonical paths (double slashes, dot segments), and the admin
 // namespace must never emit redirects. Unknown routes answer 404 JSON.
 type adminAPI struct {
-	svc   *service.AdminService
-	actor string
+	svc        *service.AdminService
+	builderSvc *service.BuilderService
+	actor      string
 }
 
-func newAdminAPI(svc *service.AdminService, actor string) http.Handler {
-	return &adminAPI{svc: svc, actor: actor}
+func newAdminAPI(svc *service.AdminService, builderSvc *service.BuilderService, actor string) http.Handler {
+	return &adminAPI{svc: svc, builderSvc: builderSvc, actor: actor}
 }
 
 func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +81,212 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.mutate(w, r, id, action)
+	case len(segments) == 1 && segments[0] == "sources":
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			a.builderListSources(w, r)
+		case http.MethodPost:
+			a.builderCreateSource(w, r)
+		default:
+			w.Header().Set("Allow", "GET, HEAD, POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		}
+	case len(segments) == 2 && segments[0] == "sources":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			a.builderGetSource(w, r, id)
+		case http.MethodPatch:
+			a.builderUpdateSource(w, r, id)
+		default:
+			w.Header().Set("Allow", "GET, HEAD, PATCH")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		}
+	case len(segments) == 3 && segments[0] == "sources" && segments[2] == "enable":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderSetSourceEnabled(w, r, id, true)
+	case len(segments) == 3 && segments[0] == "sources" && segments[2] == "disable":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderSetSourceEnabled(w, r, id, false)
+	case len(segments) == 1 && segments[0] == "builders":
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			a.get(w, r, a.builderList)
+		case http.MethodPost:
+			a.builderCreate(w, r)
+		default:
+			w.Header().Set("Allow", "GET, HEAD, POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		}
+	case len(segments) == 2 && segments[0] == "builders":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			a.builderGet(w, r, id)
+		case http.MethodPatch:
+			a.builderUpdate(w, r, id)
+		default:
+			w.Header().Set("Allow", "GET, HEAD, PATCH")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		}
+	case len(segments) == 3 && segments[0] == "builders" && segments[2] == "sources":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPut {
+			w.Header().Set("Allow", "PUT")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderSetSources(w, r, id)
+	case len(segments) == 3 && segments[0] == "builders" && segments[2] == "items":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderUpsertItem(w, r, id)
+	case len(segments) == 4 && segments[0] == "builders" && segments[2] == "items":
+		builderID, ok1 := parseAdminID(segments[1])
+		itemID, ok2 := parseAdminID(segments[3])
+		if !ok1 || !ok2 {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodDelete {
+			w.Header().Set("Allow", "DELETE")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		_ = builderID // builderID validated for path consistency
+		a.builderDeleteItem(w, r, itemID)
+	case len(segments) == 3 && segments[0] == "builders" && segments[2] == "reorder":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderReorderItems(w, r, id)
+	case len(segments) == 3 && segments[0] == "builders" && segments[2] == "enable":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderSetEnabled(w, r, id, true)
+	case len(segments) == 3 && segments[0] == "builders" && segments[2] == "disable":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderSetEnabled(w, r, id, false)
+	case len(segments) == 3 && segments[0] == "builders" && segments[2] == "preview":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderPreview(w, r, id)
+	case len(segments) == 1 && segments[0] == "builders" && r.Method == http.MethodPost:
+		// already handled above in the len==1 builders case; this branch is unreachable
+		writeAdminError(w, http.StatusNotFound, "not_found")
+	case len(segments) == 3 && segments[0] == "sources" && segments[2] == "entries":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		a.get(w, r, func(w http.ResponseWriter, r *http.Request) { a.builderListSourceEntries(w, r, id) })
+	case len(segments) == 3 && segments[0] == "sources" && segments[2] == "refresh":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderRefreshSource(w, r, id)
+	case len(segments) == 3 && segments[0] == "plans" && segments[2] == "builder":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderSetPlanBuilder(w, r, id)
+	case len(segments) == 3 && segments[0] == "subscriptions" && segments[2] == "builder":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderSetSubscriptionBuilder(w, r, id)
 	default:
 		writeAdminError(w, http.StatusNotFound, "not_found")
 	}
