@@ -315,18 +315,13 @@ func parseBuilderSource(subID string, source database.ProviderSource, resp *Node
 func newBuilderEntry(sourceID uint, link string, raw json.RawMessage, name string, countries map[string]string) builderEntry {
 	fp := EntryFingerprint(link)
 
-	country := countries[fp]
-	if country == "" {
-		country = countryFromName(name)
-	}
-
 	return builderEntry{
 		sourceID:    sourceID,
 		link:        link,
 		raw:         raw,
 		name:        name,
 		fingerprint: fp,
-		country:     country,
+		country:     database.EntryCountry(countries[fp], name),
 	}
 }
 
@@ -402,7 +397,7 @@ func selectBuilderEntries(subID string, b *database.SubscriptionBuilder, parsed 
 		switch it.Kind {
 		case database.BuilderItemKindCountry:
 			for _, e := range entries {
-				if strings.EqualFold(e.country, it.CountryCode) {
+				if database.CountryMatches(e.country, e.name, it.CountryCode) {
 					add(e, displayName(it, e))
 				}
 			}
@@ -437,26 +432,17 @@ func resolveNodeEntry(it database.SubscriptionBuilderItem, entries []builderEntr
 		}
 	}
 
-	if it.OriginalName == "" {
-		return -1, database.FingerprintStatusMissing
-	}
-
-	match := -1
-	count := 0
+	names := make([]string, len(entries))
 	for i := range entries {
-		if entries[i].name == it.OriginalName {
-			if match < 0 {
-				match = i
-			}
-			count++
-		}
+		names[i] = entries[i].name
 	}
 
-	switch count {
+	matches := database.MatchOriginalName(it.OriginalName, names)
+	switch len(matches) {
 	case 0:
 		return -1, database.FingerprintStatusMissing
 	case 1:
-		return match, database.FingerprintStatusFallback
+		return matches[0], database.FingerprintStatusFallback
 	default:
 		return -1, database.FingerprintStatusConflict
 	}
@@ -753,20 +739,8 @@ func renameJSONConfig(raw json.RawMessage, name string) json.RawMessage {
 	return out
 }
 
-// countryFromName extracts an ISO country code from the first flag emoji
-// (pair of regional indicator symbols) in a server name.
+// countryFromName extracts an ISO country code from the first flag emoji in a
+// server name. It delegates to the shared rule used by the admin Preview.
 func countryFromName(name string) string {
-	runes := []rune(name)
-	for i := 0; i+1 < len(runes); i++ {
-		a, b := runes[i], runes[i+1]
-		if isRegionalIndicator(a) && isRegionalIndicator(b) {
-			return string([]rune{'A' + (a - 0x1F1E6), 'A' + (b - 0x1F1E6)})
-		}
-	}
-
-	return ""
-}
-
-func isRegionalIndicator(r rune) bool {
-	return r >= 0x1F1E6 && r <= 0x1F1FF
+	return database.CountryFromName(name)
 }

@@ -317,6 +317,29 @@ func TestBuilder_FingerprintStatuses(t *testing.T) {
 	assert.Equal(t, []string{"matched", "fallback"}, linkNames(decodeBuilderLinks(t, result)))
 }
 
+func TestBuilder_OriginalNameFallbackURLEncoding(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Join([]string{
+		"vless://u@plus.example:443?security=tls&sni=plus.example&type=tcp#Fast+Node",
+		testLink("u", "pct.example", "My Node"),
+	}, "\n")
+	up := newBuilderTestUpstream(t, http.StatusOK, nil, body)
+	src := testSource(14, up.srv.URL)
+
+	sub := activeRuntimeSubscription("builder-name-encoding", nil)
+	db := builderTestDB(t, sub, func() *database.SubscriptionBuilder {
+		return testBuilder(1, []*database.ProviderSource{src},
+			nodeItem(src.ID, "stale-1", "Fast Node", strPtr("plus"), 0),
+			nodeItem(src.ID, "stale-2", "My%20Node", strPtr("percent"), 1),
+		)
+	})
+
+	result, _, _, err := HandleSubscription(context.Background(), db, newTestSubSvc(t), sub.SubscriptionID, "", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plus", "percent"}, linkNames(decodeBuilderLinks(t, result)))
+}
+
 func TestResolveNodeEntry_Statuses(t *testing.T) {
 	t.Parallel()
 
@@ -324,6 +347,8 @@ func TestResolveNodeEntry_Statuses(t *testing.T) {
 		{fingerprint: "fp-a", name: "A"},
 		{fingerprint: "fp-b", name: "B"},
 		{fingerprint: "fp-c", name: "B"},
+		{fingerprint: "fp-d", name: "Fast+Node"}, // upstream fragment encoded space as "+"
+		{fingerprint: "fp-e", name: "My Node"},
 	}
 
 	for _, tc := range []struct {
@@ -338,6 +363,9 @@ func TestResolveNodeEntry_Statuses(t *testing.T) {
 		{"conflict", nodeItem(1, "fp-x", "B", nil, 0), -1, database.FingerprintStatusConflict},
 		{"missing", nodeItem(1, "fp-x", "Z", nil, 0), -1, database.FingerprintStatusMissing},
 		{"missing without keys", nodeItem(1, "", "", nil, 0), -1, database.FingerprintStatusMissing},
+		// original_name fallback is tolerant to URL encoding (same rule as Preview).
+		{"fallback plus as space", nodeItem(1, "fp-x", "Fast Node", nil, 0), 3, database.FingerprintStatusFallback},
+		{"fallback percent encoded", nodeItem(1, "fp-x", "My%20Node", nil, 0), 4, database.FingerprintStatusFallback},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			idx, status := resolveNodeEntry(tc.item, entries)

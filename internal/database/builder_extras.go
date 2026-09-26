@@ -106,16 +106,35 @@ func (s *Service) PreviewBuilder(ctx context.Context, builderID uint) (*PreviewB
 		PreviewedAt: time.Now().UTC(),
 	}
 
+	linked := make(map[uint]bool, len(b.Sources))
+	for _, src := range b.Sources {
+		linked[src.SourceID] = true
+	}
+
 	pos := 0
 	for _, item := range b.Items {
 		if !item.Enabled {
 			continue
 		}
+		// Same as /sub: rules for a source not linked to the builder are ignored.
+		if !linked[item.SourceID] {
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("item %d: source %d is not linked to the builder, rule ignored", item.ID, item.SourceID))
+			continue
+		}
 		switch item.Kind {
 		case BuilderItemKindCountry:
-			entries, err := s.GetSourceEntries(ctx, item.SourceID, item.CountryCode)
+			// Load every present entry and apply the shared country rule
+			// (catalogue country, else flag emoji in the name) exactly like /sub.
+			all, err := s.GetSourceEntries(ctx, item.SourceID, "*")
 			if err != nil {
 				return nil, fmt.Errorf("preview country item %d: %w", item.ID, err)
+			}
+			entries := make([]ProviderSourceEntry, 0, len(all))
+			for i := range all {
+				if CountryMatches(all[i].CountryCode, all[i].OriginalName, item.CountryCode) {
+					entries = append(entries, all[i])
+				}
 			}
 			for i := range entries {
 				name := entries[i].OriginalName

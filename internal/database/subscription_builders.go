@@ -416,18 +416,31 @@ func (s *Service) ResolveNodeItem(ctx context.Context, item SubscriptionBuilderI
 		// Fall through to name-based lookup.
 	}
 
-	// 2. Name-based fallback.
+	// 2. Name-based fallback (same tiered, URL-encoding tolerant comparison
+	// as the /sub runtime).
+	if item.OriginalName == "" {
+		return FingerprintResolution{Status: FingerprintStatusMissing}, nil
+	}
+
 	var entries []ProviderSourceEntry
 	if err := s.db.WithContext(ctx).
-		Where("source_id = ? AND original_name = ? AND present = ?", item.SourceID, item.OriginalName, true).
+		Where("source_id = ? AND present = ?", item.SourceID, true).
+		Order("upstream_position ASC").
 		Find(&entries).Error; err != nil {
 		return FingerprintResolution{}, fmt.Errorf("resolve by name: %w", err)
 	}
-	switch len(entries) {
+
+	names := make([]string, len(entries))
+	for i := range entries {
+		names[i] = entries[i].OriginalName
+	}
+
+	matches := MatchOriginalName(item.OriginalName, names)
+	switch len(matches) {
 	case 0:
 		return FingerprintResolution{Status: FingerprintStatusMissing}, nil
 	case 1:
-		return FingerprintResolution{Entry: &entries[0], Status: FingerprintStatusFallback}, nil
+		return FingerprintResolution{Entry: &entries[matches[0]], Status: FingerprintStatusFallback}, nil
 	default:
 		return FingerprintResolution{Status: FingerprintStatusConflict, Conflict: true}, nil
 	}
