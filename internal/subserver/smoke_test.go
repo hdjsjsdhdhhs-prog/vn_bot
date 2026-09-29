@@ -1,10 +1,12 @@
+//go:build integration
+
 package subserver_test
 
 // Smoke test for the real provider source sync.
-// Activated only when SMOKE_SOURCE_URL is set in the environment.
+// Activated only when built with -tags integration AND SMOKE_SOURCE_URL is set.
 // The URL is never printed, logged or included in test output.
 // Run:
-//   SMOKE_SOURCE_URL=<url> go test -v -run TestSmoke ./internal/subserver/
+//   SMOKE_SOURCE_URL=<url> go test -v -tags integration -run TestSmoke ./internal/subserver/
 
 import (
 	"context"
