@@ -99,6 +99,7 @@ type Server struct {
 	starsService       *service.StarsPaymentService
 	adminService       *service.AdminService
 	builderService     *service.BuilderService
+	tariffService      *service.TariffService
 	paymentConfig      *PaymentConfig
 	subServer          *subserver.Service
 	subserverLogger    *subserver.AccessLogger
@@ -161,6 +162,16 @@ func (s *Server) SetBuilderService(builderService *service.BuilderService) {
 	defer s.mu.Unlock()
 
 	s.builderService = builderService
+}
+
+// SetTariffService wires the tariff editor JSON API under /admin/api/tariffs
+// and /admin/api/plans. Without it those (still session-protected) routes
+// answer 503. Set before Start.
+func (s *Server) SetTariffService(tariffService *service.TariffService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.tariffService = tariffService
 }
 
 // SetPaymentConfig configures runtime payment settings used by the callback
@@ -242,7 +253,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cfg != nil {
 		actor = s.cfg.AdminUsername
 	}
-	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, actor))
+	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, s.tariffService, actor))
 
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)

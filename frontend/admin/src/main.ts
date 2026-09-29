@@ -6,13 +6,19 @@ import {
   type AdminSource, type AdminBuilder, type BuilderItem,
   type CreateSourceInput, type UpdateSourceInput,
   type CreateBuilderInput, type UpdateBuilderInput, type UpsertBuilderItemInput, type SetBuilderInput,
+  TARIFF_LIMITS, type AdminTariff, type TariffPlan, type TariffOutcome,
 } from './api';
+import {
+  BADGE_PRESETS, DURATION_PRESETS, SERVER_FIELDS, TARIFF_CURRENCIES, botButtonLabel, catalogueOrder, durationLabel,
+  featuresFromText, formFromTariff, formatTariffPrice, isRetired, moveItem, parsePriceInput, pluralRu, reorderIds, sameForm,
+  termsChanged, validateTariffForm, type FieldErrors, type TariffField, type TariffForm,
+} from './tariffs';
 
 // ---------------------------------------------------------------------------
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
 // handful of glyphs does not add a runtime dependency. One family, one stroke.
 
-type IconName = 'overview' | 'users' | 'audit' | 'sources' | 'builders' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
+type IconName = 'overview' | 'users' | 'tariffs' | 'up' | 'audit' | 'sources' | 'builders' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
   | 'search' | 'back' | 'prev' | 'next' | 'chevron' | 'check' | 'plus' | 'trash' | 'drag' | 'edit';
 type Shape = readonly ['path' | 'circle' | 'rect', Readonly<Record<string, string>>];
 
@@ -29,6 +35,11 @@ const ICONS: Record<IconName, readonly Shape[]> = {
     ['path', { d: 'M22 21v-2a4 4 0 0 0-3-3.87' }],
     ['path', { d: 'M16 3.13a4 4 0 0 1 0 7.75' }],
   ],
+  tariffs: [
+    ['path', { d: 'M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z' }],
+    ['circle', { cx: '7.5', cy: '7.5', r: '.5' }],
+  ],
+  up: [['path', { d: 'm18 15-6-6-6 6' }]],
   audit: [
     ['path', { d: 'M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8' }],
     ['path', { d: 'M3 3v5h5' }],
@@ -139,7 +150,7 @@ const clock = (date: Date) => date.toLocaleTimeString('ru-RU', { hour: '2-digit'
 // Sections. Overview reads /admin/api/dashboard, Users reads /admin/api/users;
 // Audit is still a page frame with a placeholder until its stage lands.
 
-type SectionId = 'overview' | 'users' | 'audit' | 'sources' | 'builders';
+type SectionId = 'overview' | 'users' | 'tariffs' | 'audit' | 'sources' | 'builders';
 interface Section {
   id: SectionId;
   label: string;
@@ -155,6 +166,10 @@ const SECTIONS: readonly Section[] = [
   {
     id: 'users', label: 'Пользователи',
     description: 'Клиенты с привязанным Telegram-аккаунтом и их подписки. Пробные подписки без привязки сюда не входят.',
+  },
+  {
+    id: 'tariffs', label: 'Тарифы',
+    description: 'Предложения для покупки в Mini App и боте: цена, срок, карточка и порядок показа.',
   },
   {
     id: 'sources', label: 'Источники',
@@ -176,8 +191,10 @@ const SECTIONS: readonly Section[] = [
 
 // Routes: #/overview, #/users, #/users/{telegram_id}, #/audit. Only canonical
 // positive Telegram IDs open a user, matching the API route.
-interface Route { section: Section; userId: number | null }
+// Tariffs: #/tariffs, #/tariffs/new, #/tariffs/{product_id}.
+interface Route { section: Section; userId: number | null; tariffId: number | 'new' | null }
 const USER_ROUTE = /^users\/([1-9][0-9]{0,15})$/;
+const TARIFF_ROUTE = /^tariffs\/(new|[1-9][0-9]{0,15})$/;
 
 function currentRoute(): Route {
   const path = location.hash.replace(/^#\/?/, '');
@@ -185,9 +202,15 @@ function currentRoute(): Route {
   const users = SECTIONS.find(section => section.id === 'users');
   if (match && users) {
     const id = Number(match[1]);
-    if (Number.isSafeInteger(id)) return { section: users, userId: id };
+    if (Number.isSafeInteger(id)) return { section: users, userId: id, tariffId: null };
   }
-  return { section: SECTIONS.find(section => section.id === path) ?? SECTIONS[0], userId: null };
+  const tariff = TARIFF_ROUTE.exec(path);
+  const tariffs = SECTIONS.find(section => section.id === 'tariffs');
+  if (tariff && tariffs) {
+    const id = tariff[1] === 'new' ? 'new' : Number(tariff[1]);
+    if (id === 'new' || Number.isSafeInteger(id)) return { section: tariffs, userId: null, tariffId: id };
+  }
+  return { section: SECTIONS.find(section => section.id === path) ?? SECTIONS[0], userId: null, tariffId: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +918,21 @@ interface OverviewView {
   updated: HTMLElement;
 }
 
+interface TariffsView {
+  body: HTMLElement;
+  refresh: HTMLButtonElement;
+  updated: HTMLElement;
+  summary: HTMLElement;
+}
+
+interface TariffEditorView {
+  /** null while creating a tariff. */
+  id: number | null;
+  body: HTMLElement;
+  title: HTMLElement;
+  desc: HTMLElement;
+}
+
 class AdminApp {
   private view: 'boot' | 'fatal' | 'login' | 'app' = 'boot';
   private shell: Shell | null = null;
@@ -932,10 +970,34 @@ class AdminApp {
   private buildersView: { body: HTMLElement; refresh: HTMLButtonElement } | null = null;
   // Builder editor state (single builder open)
   private builderEditorRequest = 0;
+  // Tariffs section state. The catalogue snapshot survives navigation within
+  // the session; pendingOrder is an edited, not yet saved catalogue order.
+  private tariffsCache: readonly AdminTariff[] | null = null;
+  private plansCache: readonly TariffPlan[] | null = null;
+  private tariffsRequest = 0;
+  private tariffsView: TariffsView | null = null;
+  private tariffsAt: Date | null = null;
+  private showRetired = false;
+  private pendingOrder: number[] | null = null;
+  // Idempotency key of the order being saved: the same edited order retries
+  // with the same key, so an uncertain response is never applied twice.
+  private orderKey: { ids: string; key: string } | null = null;
+  private tariffEditorView: TariffEditorView | null = null;
+  private tariffEditorRequest = 0;
+  private orderSaving = false;
+  // Outcome of a create or a new version, shown once the editor re-opens on
+  // the resulting tariff.
+  private tariffNotice: { id: number; notice: Notice } | null = null;
+  // Reports unsaved changes of the open screen (tariff editor, edited order).
+  // Leaving through navigation or reload asks for confirmation first.
+  private unsavedChanges: (() => boolean) | null = null;
 
   constructor(private readonly root: HTMLElement, private readonly api: AdminApi) {
     this.toasts.setAttribute('aria-live', 'polite');
-    window.addEventListener('hashchange', () => this.onRoute());
+    window.addEventListener('beforeunload', event => {
+      if (this.unsavedChanges?.()) event.preventDefault();
+    });
+    window.addEventListener('hashchange', event => this.onRoute(event));
     document.addEventListener('visibilitychange', () => void this.checkSession());
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && this.shell?.sidebar.dataset.open === 'true') {
@@ -958,6 +1020,10 @@ class AdminApp {
 
   private mount(...nodes: HTMLElement[]) {
     this.closeDialog();
+    this.unsavedChanges = null;
+    this.pendingOrder = null;
+    this.tariffsView = null;
+    this.tariffEditorView = null;
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
@@ -1018,6 +1084,10 @@ class AdminApp {
     this.usersState = initialUsersState();
     this.detailCache = null;
     this.manageNotice = null;
+    this.tariffsCache = null;
+    this.tariffsAt = null;
+    this.plansCache = null;
+    this.orderKey = null;
 
     const card = el('section', 'auth-card');
     card.setAttribute('aria-labelledby', 'login-title');
@@ -1197,16 +1267,26 @@ class AdminApp {
     menuButton.replaceChildren(icon(open ? 'close' : 'menu', 20));
   }
 
-  private onRoute() {
+  private onRoute(event?: HashChangeEvent) {
     if (this.view !== 'app') return;
+    if (this.unsavedChanges?.()) {
+      if (!window.confirm('Есть несохранённые изменения. Уйти без сохранения?')) {
+        // Stay: put the previous address back without rendering anything.
+        const previous = event ? new URL(event.oldURL).hash : '';
+        if (previous) history.replaceState(null, '', previous);
+        return;
+      }
+    }
+    this.unsavedChanges = null;
+    this.pendingOrder = null;
     this.setMenu(false);
     this.renderSection(true);
   }
 
   private renderSection(focus: boolean) {
     if (!this.shell) return;
-    const { section, userId } = currentRoute();
-    const canonical = userId === null ? `#/${section.id}` : `#/users/${userId}`;
+    const { section, userId, tariffId } = currentRoute();
+    const canonical = userId !== null ? `#/users/${userId}` : tariffId !== null ? `#/tariffs/${tariffId}` : `#/${section.id}`;
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
     for (const [id, link] of this.shell.links) {
       if (id === section.id) link.setAttribute('aria-current', 'page');
@@ -1223,6 +1303,12 @@ class AdminApp {
     this.detailView = null;
     this.sourcesView = null;
     this.buildersView = null;
+    this.tariffsView = null;
+    this.tariffEditorView = null;
+    this.unsavedChanges = null;
+    this.pendingOrder = null;
+    this.tariffsRequest++;
+    this.tariffEditorRequest++;
     this.dashboardRequest++;
     this.usersRequest++;
     this.detailRequest++;
@@ -1253,6 +1339,15 @@ class AdminApp {
     } else if (section.id === 'users') {
       page.append(header, this.buildUsers(header));
       load = () => this.loadUsers();
+    } else if (tariffId !== null) {
+      const back = el('a', 'back-link');
+      back.href = '#/tariffs';
+      back.append(icon('back'), el('span', '', 'Назад к тарифам'));
+      page.append(back, header, this.buildTariffEditor(tariffId === 'new' ? null : tariffId, title, desc));
+      load = () => this.loadTariffEditor();
+    } else if (section.id === 'tariffs') {
+      page.append(header, this.buildTariffsSection(header));
+      load = () => this.loadTariffs();
     } else if (section.id === 'sources') {
       page.append(header, this.buildSourcesSection(header));
       load = () => this.loadSources();
@@ -2258,9 +2353,13 @@ class AdminApp {
       plan ? 'Применяется ко всем подпискам этого тарифа' : 'Тариф не найден',
       () => {
         if (!plan) return;
-        this.openBuilderAssignDialog('plan', plan.id, planBuilderId, (newId) => {
-          void this.loadUser();
-          this.toast(newId === null ? 'Построитель плана снят.' : 'Построитель плана назначен.');
+        const view = this.detailView;
+        void this.planImpact(plan.id, plan.name).then(impact => {
+          if (this.detailView !== view) return;
+          this.openBuilderAssignDialog('plan', plan.id, planBuilderId, (newId) => {
+            void this.loadUser();
+            this.toast(newId === null ? 'Построитель плана снят.' : 'Построитель плана назначен.');
+          }, impact);
         });
       },
       !plan,
@@ -2290,6 +2389,7 @@ class AdminApp {
     targetId: number,
     currentBuilderId: number | null,
     onDone: (newBuilderId: number | null) => void,
+    impact?: PlanImpact,
   ) {
     if (this.dialog || this.view !== 'app') return;
 
@@ -2335,7 +2435,18 @@ class AdminApp {
     actionsRow.append(cancelBtn, saveBtn);
 
     const body = el('div', 'modal-body');
-    body.append(titleEl, selField, statusEl, actionsRow);
+    body.append(titleEl);
+    // A plan's builder applies to every subscription of the plan: say how many
+    // before the change, and tie the warning to the picker for screen readers.
+    if (target === 'plan' && impact) {
+      const warning = notice({ tone: 'info', text: planImpactText(impact) });
+      warning.id = 'ba-impact';
+      warning.classList.add('notice-impact');
+      warning.dataset.subscriptions = impact.subscriptions === null ? 'unknown' : String(impact.subscriptions);
+      sel.setAttribute('aria-describedby', warning.id);
+      body.append(warning);
+    }
+    body.append(selField, statusEl, actionsRow);
     dialog.append(body);
 
     let submitting = false;
@@ -3281,9 +3392,1279 @@ class AdminApp {
       btn.removeAttribute('aria-busy');
     }
   }
+
+  // ===========================================================================
+  // Tariffs: catalogue list and order (#/tariffs)
+  // ===========================================================================
+
+  private buildTariffsSection(header: HTMLElement): HTMLElement {
+    const { actions, refresh, updated } = refreshActions(() => void this.loadTariffs());
+    const add = el('a', 'btn btn-primary btn-sm');
+    add.href = '#/tariffs/new';
+    add.append(icon('plus'), el('span', 'btn-label', 'Новый тариф'));
+    actions.prepend(add);
+    actions.classList.add('tariffs-actions');
+    header.classList.add('has-actions');
+    header.append(actions);
+
+    const root = el('div', 'tariffs');
+    const toolbar = el('div', 'toolbar tariffs-toolbar');
+    const summary = el('p', 'tariffs-summary');
+    const toggle = el('label', 'toggle');
+    const retired = el('input');
+    retired.type = 'checkbox';
+    retired.checked = this.showRetired;
+    retired.addEventListener('change', () => {
+      this.showRetired = retired.checked;
+      if (this.tariffsView && this.tariffsCache) this.paintTariffs(this.tariffsView);
+    });
+    toggle.append(retired, el('span', '', 'Показывать прежние версии'));
+    toolbar.append(summary, toggle);
+    const body = el('div', 'tariffs-body');
+    root.append(toolbar, body);
+
+    const view: TariffsView = { body, refresh, updated, summary };
+    this.tariffsView = view;
+    this.unsavedChanges = () => this.pendingOrder !== null;
+    if (this.tariffsCache) this.paintTariffs(view);
+    else this.paintTariffsSkeleton(view);
+    return root;
+  }
+
+  private paintTariffsSkeleton(view: TariffsView) {
+    setLoading(view.body, 'Загружаем тарифы');
+    view.body.replaceChildren(skeletonPanel(5));
+    view.updated.textContent = '';
+    view.summary.textContent = '';
+  }
+
+  private paintTariffsError(view: TariffsView, error: unknown) {
+    setLoading(view.body, null);
+    view.body.replaceChildren(messagePanel('alert', 'Не удалось загрузить тарифы', errorText(error), 'alert',
+      retryButton(() => void this.loadTariffs())));
+    view.updated.textContent = '';
+    view.summary.textContent = '';
+  }
+
+  /** Current (not retired) tariffs in the saved catalogue order. */
+  private liveTariffIds(): number[] {
+    return catalogueOrder(this.tariffsCache ?? []).filter(tariff => !isRetired(tariff)).map(tariff => tariff.id);
+  }
+
+  private paintTariffs(view: TariffsView, focusKey?: string) {
+    setLoading(view.body, null);
+    const all = this.tariffsCache ?? [];
+    const ordered = catalogueOrder(all);
+    const live = ordered.filter(tariff => !isRetired(tariff));
+    const retired = ordered.filter(isRetired);
+    const onSale = live.filter(tariff => tariff.is_active).length;
+    view.updated.textContent = this.tariffsAt ? `Обновлено в ${clockSeconds(this.tariffsAt)}` : '';
+    const parts = [`${formatCount(live.length)} ${pluralRu(live.length, 'тариф', 'тарифа', 'тарифов')}`, `в продаже ${formatCount(onSale)}`];
+    if (retired.length) parts.push(`прежних версий ${formatCount(retired.length)}`);
+    view.summary.textContent = all.length ? parts.join(' · ') : '';
+
+    if (all.length === 0) {
+      const create = el('a', 'btn btn-primary btn-sm');
+      create.href = '#/tariffs/new';
+      create.append(icon('plus'), el('span', 'btn-label', 'Создать тариф'));
+      view.body.replaceChildren(messagePanel('tariffs', 'Тарифов пока нет',
+        'Создайте первый тариф: включённый тариф сразу появится в каталоге Mini App и в боте.', 'status', create));
+      return;
+    }
+
+    const byId = new Map(all.map(tariff => [tariff.id, tariff] as const));
+    const order = (this.pendingOrder ?? live.map(tariff => tariff.id))
+      .map(id => byId.get(id))
+      .filter((tariff): tariff is AdminTariff => tariff !== undefined);
+    const nodes: HTMLElement[] = [];
+    if (this.pendingOrder) nodes.push(this.orderBanner());
+
+    const panel = el('section', 'panel');
+    panel.setAttribute('aria-labelledby', 'tariffs-list-title');
+    panel.append(panelHead('tariffs-list-title', 'Каталог', 'Порядок показа в Mini App и боте'));
+    if (order.length) {
+      const list = el('ol', 'tariff-list');
+      order.forEach((tariff, index) => list.append(this.tariffRow(tariff, index, order.length)));
+      panel.append(list);
+    } else {
+      panel.append(el('p', 'panel-note', 'Действующих тарифов нет: остались только прежние версии. Создайте новый тариф.'));
+    }
+    nodes.push(panel);
+
+    if (this.showRetired && retired.length) {
+      const old = el('section', 'panel');
+      old.setAttribute('aria-labelledby', 'tariffs-retired-title');
+      old.append(panelHead('tariffs-retired-title', 'Прежние версии', formatCount(retired.length)),
+        el('p', 'panel-note tariff-note', 'Заменены новыми версиями при изменении условий покупки. Подписки, купленные по ним, продолжают действовать.'));
+      const list = el('ul', 'tariff-list');
+      for (const tariff of retired) list.append(this.tariffRow(tariff, -1, 0));
+      old.append(list);
+      nodes.push(old);
+    }
+    view.body.replaceChildren(...nodes);
+    if (focusKey) view.body.querySelector<HTMLElement>(`[data-focus-key='${focusKey}']`)?.focus();
+  }
+
+  /** One catalogue row; index -1 marks a retired version (not reorderable). */
+  private tariffRow(tariff: AdminTariff, index: number, count: number): HTMLElement {
+    const movable = index >= 0;
+    const item = el('li', 'tariff-row');
+    item.dataset.tariffId = String(tariff.id);
+    if (movable) {
+      const position = el('span', 'tariff-pos', String(index + 1));
+      position.setAttribute('aria-hidden', 'true');
+      item.append(position);
+    }
+    const info = el('div', 'tariff-info');
+    const nameRow = el('div', 'tariff-name-row');
+    const link = el('a', 'tariff-name', tariff.name);
+    link.href = `#/tariffs/${tariff.id}`;
+    nameRow.append(link, tariffStateTag(tariff));
+    if (tariff.badge) nameRow.append(el('span', 'tag tag-accent', tariff.badge));
+    const meta = [
+      formatTariffPrice(tariff.price_cents, tariff.currency), durationLabel(tariff.duration_days),
+      `план «${tariff.plan_name}»${tariff.plan_active ? '' : ' (отключён)'}`, tariffUsage(tariff),
+    ];
+    info.append(nameRow, el('p', 'tariff-meta', meta.join(' · ')));
+
+    const actions = el('div', 'tariff-actions');
+    if (movable) {
+      const up = iconButton('up', `Поднять «${tariff.name}» выше`);
+      up.dataset.focusKey = `up-${tariff.id}`;
+      up.disabled = index === 0 || this.orderSaving;
+      up.addEventListener('click', () => this.moveTariff(tariff.id, -1));
+      const down = iconButton('chevron', `Опустить «${tariff.name}» ниже`);
+      down.dataset.focusKey = `down-${tariff.id}`;
+      down.disabled = index === count - 1 || this.orderSaving;
+      down.addEventListener('click', () => this.moveTariff(tariff.id, 1));
+      actions.append(up, down);
+    }
+    // A retired version can still be taken off sale, never put back on it.
+    if (tariff.is_active || !isRetired(tariff)) {
+      const label = tariff.is_active ? 'Скрыть' : 'Включить';
+      const toggle = button(label, 'btn btn-secondary btn-sm');
+      toggle.setAttribute('aria-label', `${label} «${tariff.name}»`);
+      toggle.dataset.focusKey = `toggle-${tariff.id}`;
+      toggle.addEventListener('click', () => void this.toggleTariff(tariff, toggle));
+      actions.append(toggle);
+    }
+    item.append(info, actions);
+    return item;
+  }
+
+  private orderBanner(): HTMLElement {
+    const bar = el('div', 'unsaved-banner tariff-order-bar');
+    bar.setAttribute('role', 'region');
+    bar.setAttribute('aria-label', 'Несохранённый порядок');
+    const text = el('p', 'unsaved-text', this.orderSaving ? 'Сохраняем порядок…' : 'Порядок тарифов изменён и ещё не сохранён.');
+    const actions = el('div', 'unsaved-actions');
+    const reset = button('Отменить', 'btn btn-secondary btn-sm');
+    reset.disabled = this.orderSaving;
+    reset.addEventListener('click', () => {
+      this.pendingOrder = null;
+      if (this.tariffsView) this.paintTariffs(this.tariffsView);
+    });
+    const save = button(this.orderSaving ? 'Сохраняем…' : 'Сохранить порядок', 'btn btn-primary btn-sm');
+    save.dataset.focusKey = 'order-save';
+    save.disabled = this.orderSaving;
+    save.setAttribute('aria-busy', String(this.orderSaving));
+    save.addEventListener('click', () => void this.saveTariffOrder());
+    actions.append(reset, save);
+    bar.append(text, actions);
+    return bar;
+  }
+
+  private moveTariff(id: number, delta: -1 | 1) {
+    const view = this.tariffsView;
+    if (!view || !this.tariffsCache || this.orderSaving) return;
+    const saved = this.liveTariffIds();
+    const base = this.pendingOrder ?? saved;
+    const from = base.indexOf(id);
+    if (from === -1) return;
+    const next = moveItem(base, from, from + delta);
+    this.pendingOrder = next.join(',') === saved.join(',') ? null : next;
+    // Keep focus on the arrow just used; at an edge it is disabled, so move to the other one.
+    const to = next.indexOf(id);
+    const atEdge = delta < 0 ? to === 0 : to === next.length - 1;
+    const direction = delta < 0 ? (atEdge ? 'down' : 'up') : (atEdge ? 'up' : 'down');
+    this.paintTariffs(view, `${direction}-${id}`);
+  }
+
+  /**
+   * Saves the edited order. The same order retries with the same request key,
+   * so an uncertain outcome is replayed instead of applied twice; a stale
+   * catalogue (a tariff created or deleted meanwhile) drops the edited order.
+   */
+  private async saveTariffOrder() {
+    const view = this.tariffsView;
+    const cache = this.tariffsCache;
+    if (!view || !cache || !this.pendingOrder || this.orderSaving) return;
+    const ids = reorderIds(this.pendingOrder, cache);
+    const signature = ids.join(',');
+    if (!this.orderKey || this.orderKey.ids !== signature) this.orderKey = { ids: signature, key: newRequestKey() };
+    const key = this.orderKey.key;
+    this.orderSaving = true;
+    this.paintTariffs(view, 'order-save');
+    const current = () => this.tariffsView === view;
+    const repaintOther = () => { if (this.tariffsView && this.tariffsView !== view) this.paintTariffs(this.tariffsView); };
+    try {
+      const tariffs = await this.api.reorderTariffs(ids, key);
+      this.orderKey = null;
+      this.orderSaving = false;
+      this.tariffsCache = tariffs;
+      this.tariffsAt = new Date();
+      this.lastSessionCheck = Date.now();
+      if (!current()) { repaintOther(); return; }
+      this.pendingOrder = null;
+      this.paintTariffs(view);
+      this.toast('Порядок тарифов сохранён. Mini App и бот показывают его сразу.');
+    } catch (error) {
+      this.orderSaving = false;
+      if (!current()) { repaintOther(); return; }
+      if (await this.endIfSignedOut(error, current)) return;
+      const code = error instanceof ApiError ? error.code : '';
+      if (code === 'order_stale' || code === 'request_key_conflict' || code === 'invalid_request') {
+        this.orderKey = null;
+        this.pendingOrder = null;
+        this.paintTariffs(view);
+        this.toast(`Порядок не сохранён. ${tariffErrorText(error)} Список обновлён — расставьте тарифы заново.`);
+        void this.loadTariffs();
+        return;
+      }
+      this.paintTariffs(view, 'order-save');
+      this.toast(`Порядок не сохранён. ${errorText(error)} Повторите: повтор не применит порядок дважды.`);
+    }
+  }
+
+  private async toggleTariff(tariff: AdminTariff, trigger: HTMLButtonElement) {
+    const view = this.tariffsView;
+    if (!view) return;
+    const active = !tariff.is_active;
+    trigger.disabled = true;
+    trigger.setAttribute('aria-busy', 'true');
+    const current = () => this.tariffsView === view;
+    try {
+      // The version guards the change: a retry after an uncertain outcome is a
+      // version conflict, never a second toggle.
+      const outcome = await this.api.setTariffActive(tariff.id, tariff.version, active, newRequestKey());
+      this.applyTariffOutcome(outcome);
+      if (!current()) return;
+      this.paintTariffs(view, `toggle-${tariff.id}`);
+      this.toast(active
+        ? `Тариф «${tariff.name}» включён и показывается в каталоге.`
+        : `Тариф «${tariff.name}» скрыт из каталога. Купленные подписки продолжают действовать.`);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      trigger.disabled = false;
+      trigger.removeAttribute('aria-busy');
+      this.toast(`${active ? 'Тариф не включён' : 'Тариф не скрыт'}. ${tariffErrorText(error)}`);
+      if (isStaleTariffError(error)) void this.loadTariffs();
+    }
+  }
+
+  /** Keeps the catalogue snapshot in step with a mutation outcome. */
+  private applyTariffOutcome(outcome: TariffOutcome) {
+    if (!this.tariffsCache) return;
+    const next = [...this.tariffsCache];
+    for (const tariff of [outcome.tariff, outcome.previous]) {
+      if (!tariff) continue;
+      const index = next.findIndex(item => item.id === tariff.id);
+      if (index === -1) next.push(tariff);
+      else next[index] = tariff;
+    }
+    this.tariffsCache = next;
+  }
+
+  private removeCachedTariff(id: number) {
+    if (this.tariffsCache) this.tariffsCache = this.tariffsCache.filter(tariff => tariff.id !== id);
+  }
+
+  private async loadTariffs() {
+    const view = this.tariffsView;
+    if (!view) return;
+    const request = ++this.tariffsRequest;
+    const current = () => this.tariffsView === view && request === this.tariffsRequest;
+    setRefreshBusy(view.refresh, true);
+    const shown = this.tariffsCache !== null;
+    if (!shown) this.paintTariffsSkeleton(view);
+    try {
+      const tariffs = await this.api.listTariffs();
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      this.tariffsCache = tariffs;
+      this.tariffsAt = new Date();
+      // An edited order survives a refresh only while it covers the same tariffs.
+      if (this.pendingOrder) {
+        const live = this.liveTariffIds();
+        const same = live.length === this.pendingOrder.length && this.pendingOrder.every(id => live.includes(id));
+        if (!same) {
+          this.pendingOrder = null;
+          this.toast('Каталог изменился: несохранённый порядок сброшен.');
+        }
+      }
+      this.paintTariffs(view);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      if (shown) this.toast(`Не удалось обновить тарифы. ${errorText(error)}`);
+      else this.paintTariffsError(view, error);
+    } finally {
+      if (current()) setRefreshBusy(view.refresh, false);
+    }
+  }
+
+  // ===========================================================================
+  // Tariff editor (#/tariffs/new, #/tariffs/{id})
+  // ===========================================================================
+
+  private buildTariffEditor(id: number | null, title: HTMLElement, desc: HTMLElement): HTMLElement {
+    const known = id === null ? null : this.tariffsCache?.find(tariff => tariff.id === id) ?? null;
+    title.textContent = id === null ? 'Новый тариф' : known?.name ?? 'Тариф';
+    desc.textContent = id === null ? NEW_TARIFF_DESC : `Тариф #${id}`;
+    const body = el('div', 'tariff-editor');
+    const view: TariffEditorView = { id, body, title, desc };
+    this.tariffEditorView = view;
+    this.paintTariffEditorSkeleton(view);
+    return body;
+  }
+
+  private paintTariffEditorSkeleton(view: TariffEditorView) {
+    setLoading(view.body, 'Загружаем тариф');
+    const grid = el('div', 'editor-grid');
+    const main = el('div', 'editor-main');
+    main.append(skeletonPanel(8));
+    const side = el('div', 'editor-side');
+    side.append(skeletonPanel(4));
+    grid.append(main, side);
+    view.body.replaceChildren(grid);
+  }
+
+  private paintTariffMissing(view: TariffEditorView) {
+    setLoading(view.body, null);
+    view.title.textContent = 'Тариф не найден';
+    view.desc.textContent = view.id === null ? '' : `Тариф #${view.id}`;
+    const back = el('a', 'btn btn-secondary btn-sm', 'К списку тарифов');
+    back.href = '#/tariffs';
+    view.body.replaceChildren(messagePanel('tariffs', 'Тариф не найден',
+      `Тарифа #${view.id} нет: возможно, его уже удалили.`, 'status', back));
+  }
+
+  private paintTariffEditorError(view: TariffEditorView, error: unknown) {
+    setLoading(view.body, null);
+    view.body.replaceChildren(messagePanel('alert', 'Не удалось загрузить тариф', errorText(error), 'alert',
+      retryButton(() => void this.loadTariffEditor())));
+  }
+
+  private async loadTariffEditor() {
+    const view = this.tariffEditorView;
+    if (!view) return;
+    const request = ++this.tariffEditorRequest;
+    const current = () => this.tariffEditorView === view && request === this.tariffEditorRequest;
+    this.paintTariffEditorSkeleton(view);
+    try {
+      const [plans, tariff] = await Promise.all([
+        this.api.listPlans(),
+        view.id === null ? Promise.resolve(null) : this.api.getTariff(view.id).catch((error: unknown) => {
+          if (error instanceof ApiError && error.status === 404) return 'missing' as const;
+          throw error;
+        }),
+      ]);
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      this.plansCache = plans;
+      if (tariff === 'missing') {
+        if (view.id !== null) this.removeCachedTariff(view.id);
+        this.paintTariffMissing(view);
+        return;
+      }
+      if (tariff) this.applyTariffOutcome({ tariff, previous: null, versioned: false, replayed: false });
+      this.paintTariffEditor(view, tariff, plans);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      this.paintTariffEditorError(view, error);
+    }
+  }
+
+  /**
+   * The editor: purchase terms, card, publication, a live preview of the Mini
+   * App card and the bot button, the plan with its builder, and sale/delete.
+   * Saving is idempotent per payload (like openManage): an uncertain outcome
+   * freezes the form so the retry carries exactly the same request.
+   */
+  private paintTariffEditor(view: TariffEditorView, loaded: AdminTariff | null, plans: readonly TariffPlan[]) {
+    setLoading(view.body, null);
+    let base = loaded;
+    const selectable = plans.filter(plan => plan.selectable);
+    const fallbackPlan = selectable.find(plan => plan.is_active) ?? selectable[0] ?? null;
+    let baseline = formFromTariff(base, fallbackPlan?.id ?? null);
+    let form: TariffForm = { ...baseline };
+    let saving = false;
+    let frozen = false;
+    let pending: { payload: string; key: string } | null = null;
+    const isCurrent = () => this.tariffEditorView === view;
+    const retired = () => base !== null && isRetired(base);
+    const dirty = () => !sameForm(form, baseline);
+    this.unsavedChanges = () => isCurrent() && !retired() && (dirty() || frozen);
+
+    // Status and notices ------------------------------------------------------
+    const retiredSlot = el('div', 'editor-status');
+    const statusSlot = el('div', 'editor-status');
+    const showStatus = (next: Notice | null, actions: HTMLElement[] = [], focus = true) => {
+      if (!next) { statusSlot.replaceChildren(); return; }
+      const node = noticeWithActions(next, actions);
+      node.setAttribute('role', next.tone === 'error' ? 'alert' : 'status');
+      node.tabIndex = -1;
+      statusSlot.replaceChildren(node);
+      if (focus) node.focus();
+    };
+    const backLink = () => {
+      const link = el('a', 'btn btn-secondary btn-sm', 'К списку тарифов');
+      link.href = '#/tariffs';
+      return link;
+    };
+
+    const paintHeading = () => {
+      const name = base?.name ?? 'Новый тариф';
+      view.title.textContent = name;
+      document.title = `${name} · RS8 Admin`;
+      view.desc.textContent = base
+        ? [`Тариф #${base.id}`, base.previous_id ? `новая версия тарифа #${base.previous_id}` : '', `изменён ${formatDateTime(base.updated_at)}`]
+          .filter(Boolean).join(' · ')
+        : NEW_TARIFF_DESC;
+    };
+
+    // Controls ----------------------------------------------------------------
+    const setters = new Map<TariffField, (text: string) => void>();
+    const targets = new Map<TariffField, HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>();
+    const counters: (() => void)[] = [];
+    const register = (key: TariffField, control: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, setError: (text: string) => void) => {
+      setters.set(key, setError);
+      targets.set(key, control);
+    };
+    const textInput = (id: string, inputMode: 'text' | 'numeric' | 'decimal' = 'text') => {
+      const node = el('input', 'input');
+      node.id = id;
+      node.type = 'text';
+      node.autocomplete = 'off';
+      node.inputMode = inputMode;
+      return node;
+    };
+    const hint = (root: HTMLElement, text: string) => {
+      const node = el('p', 'field-hint', text);
+      root.append(node);
+      return node;
+    };
+    const counter = (root: HTMLElement, control: HTMLInputElement | HTMLTextAreaElement, limit: number) => {
+      const node = el('p', 'counter');
+      node.setAttribute('aria-hidden', 'true');
+      root.append(node);
+      counters.push(() => {
+        const length = Array.from(control.value.trim()).length;
+        node.textContent = `${formatCount(length)} / ${formatCount(limit)}`;
+        node.classList.toggle('is-over', length > limit);
+      });
+    };
+    const chipGroup = (label: string, values: readonly { value: string; text: string }[], apply: (value: string) => void) => {
+      const group = el('div', 'chips');
+      group.setAttribute('role', 'group');
+      group.setAttribute('aria-label', label);
+      const chips = values.map(({ value, text }) => {
+        const chip = button(text, 'chip');
+        chip.dataset.value = value;
+        chip.setAttribute('aria-pressed', 'false');
+        chip.addEventListener('click', () => apply(value));
+        group.append(chip);
+        return chip;
+      });
+      return { group, chips };
+    };
+
+    const name = textInput('tf-name');
+    const nameField = field('Название', name);
+    register('name', name, nameField.setError);
+    counter(nameField.root, name, TARIFF_LIMITS.name);
+
+    const plan = el('select', 'input');
+    plan.id = 'tf-plan';
+    if (!selectable.length) plan.append(option('', 'Нет планов, доступных для продажи'));
+    for (const item of plans) {
+      if (!item.selectable && item.id !== base?.plan_id) continue;
+      const entry = option(String(item.id), `${item.name}${item.is_active ? '' : ' — план отключён'}${item.selectable ? '' : ' — системный'}`);
+      entry.disabled = !item.selectable;
+      plan.append(entry);
+    }
+    if (base && !plans.some(item => item.id === base?.plan_id)) plan.append(option(String(base.plan_id), base.plan_name || `План #${base.plan_id}`));
+    const planField = field('План', plan);
+    register('planId', plan, planField.setError);
+    hint(planField.root, selectable.length
+      ? 'План задаёт лимиты подписки и построитель конфигурации. Системные планы (пробный, бесплатный) не продаются.'
+      : 'Нет планов, доступных для продажи: создайте план в боте, затем вернитесь сюда.');
+
+    const duration = textInput('tf-duration', 'numeric');
+    const durationField = field('Срок, дней', duration);
+    register('durationDays', duration, durationField.setError);
+    const durationChips = chipGroup('Быстрый выбор срока',
+      DURATION_PRESETS.map(days => ({ value: String(days), text: durationLabel(days) })),
+      value => { duration.value = value; durationField.setError(''); sync(); });
+    durationField.root.append(durationChips.group);
+
+    const price = textInput('tf-price', 'decimal');
+    const priceField = field('Цена', price);
+    register('price', price, priceField.setError);
+    const priceHint = hint(priceField.root, '');
+
+    const currency = el('select', 'input');
+    currency.id = 'tf-currency';
+    const currencies: string[] = [...TARIFF_CURRENCIES];
+    if (base && !currencies.includes(base.currency)) currencies.push(base.currency);
+    for (const code of currencies) currency.append(option(code, CURRENCY_LABELS[code] ?? code));
+    const currencyField = field('Валюта', currency);
+    register('currency', currency, currencyField.setError);
+    const priceRow = el('div', 'form-row');
+    priceRow.append(priceField.root, currencyField.root);
+
+    const description = el('textarea', 'input textarea');
+    description.id = 'tf-description';
+    description.rows = 3;
+    const descriptionField = field('Описание', description);
+    register('description', description, descriptionField.setError);
+    counter(descriptionField.root, description, TARIFF_LIMITS.description);
+
+    const features = el('textarea', 'input textarea');
+    features.id = 'tf-features';
+    features.rows = 4;
+    const featuresField = field('Преимущества', features);
+    register('features', features, featuresField.setError);
+    const featuresHint = hint(featuresField.root, '');
+
+    const badge = textInput('tf-badge');
+    const badgeField = field('Бейдж', badge);
+    register('badge', badge, badgeField.setError);
+    counter(badgeField.root, badge, TARIFF_LIMITS.badge);
+    const badgeChips = chipGroup('Готовые бейджи',
+      [...BADGE_PRESETS.map(text => ({ value: text, text })), { value: '', text: 'Без бейджа' }],
+      value => { badge.value = value; badgeField.setError(''); sync(); });
+    badgeField.root.append(badgeChips.group);
+
+    const sort = textInput('tf-sort', 'numeric');
+    const sortField = field('Позиция в каталоге', sort);
+    register('sortOrder', sort, sortField.setError);
+    hint(sortField.root, base
+      ? 'Меньше — выше. Порядок удобнее менять стрелками в списке тарифов.'
+      : 'Меньше — выше. Оставьте пустым, чтобы добавить тариф в конец каталога.');
+
+    const active = el('input');
+    active.type = 'checkbox';
+    active.id = 'tf-active';
+    const activeRow = el('label', 'toggle');
+    activeRow.htmlFor = 'tf-active';
+    activeRow.append(active, el('span', '', 'В продаже: показывать в каталоге Mini App и бота'));
+
+    const textControls = [name, duration, price, description, features, badge, sort];
+    const choiceControls = [plan, currency, active];
+    const chips = [...durationChips.chips, ...badgeChips.chips];
+
+    const read = (): TariffForm => ({
+      // Same key order as formFromTariff: sameForm compares serialized forms.
+      name: name.value, planId: plan.value ? Number(plan.value) : null, durationDays: duration.value, price: price.value,
+      currency: currency.value, description: description.value, features: features.value, badge: badge.value,
+      isActive: active.checked, sortOrder: sort.value,
+    });
+    const write = (next: TariffForm) => {
+      name.value = next.name;
+      plan.value = next.planId === null ? '' : String(next.planId);
+      duration.value = next.durationDays;
+      price.value = next.price;
+      currency.value = next.currency;
+      description.value = next.description;
+      features.value = next.features;
+      badge.value = next.badge;
+      active.checked = next.isActive;
+      sort.value = next.sortOrder;
+    };
+    const clearErrors = () => { for (const setError of setters.values()) setError(''); };
+    const showFieldErrors = (errors: FieldErrors) => {
+      let first: HTMLElement | null = null;
+      for (const key of TARIFF_FIELD_ORDER) {
+        const text = errors[key];
+        if (!text) continue;
+        setters.get(key)?.(text);
+        first ??= targets.get(key) ?? null;
+      }
+      first?.focus();
+    };
+
+    // Panels ------------------------------------------------------------------
+    const termsSlot = el('div', 'terms-note');
+    const termsPanel = el('section', 'panel');
+    termsPanel.setAttribute('aria-labelledby', 'tf-terms-title');
+    const termsBody = el('div', 'tariff-form');
+    termsBody.append(termsSlot, nameField.root, planField.root, durationField.root, priceRow);
+    termsPanel.append(panelHead('tf-terms-title', 'Условия покупки'), termsBody);
+
+    const cardPanel = el('section', 'panel');
+    cardPanel.setAttribute('aria-labelledby', 'tf-card-title');
+    const cardBody = el('div', 'tariff-form');
+    cardBody.append(descriptionField.root, featuresField.root, badgeField.root);
+    cardPanel.append(panelHead('tf-card-title', 'Карточка'), cardBody);
+
+    const publishPanel = el('section', 'panel');
+    publishPanel.setAttribute('aria-labelledby', 'tf-publish-title');
+    const publishBody = el('div', 'tariff-form');
+    publishBody.append(activeRow, sortField.root);
+    publishPanel.append(panelHead('tf-publish-title', 'Публикация'), publishBody);
+
+    const dirtyNote = el('p', 'unsaved-text');
+    dirtyNote.setAttribute('aria-live', 'polite');
+    const reset = button('Отменить изменения', 'btn btn-secondary');
+    const save = button('Сохранить', 'btn btn-primary');
+    save.type = 'submit';
+    const actionBar = el('div', 'panel editor-actions');
+    actionBar.append(dirtyNote, reset, save);
+
+    const formEl = el('form', 'editor-main');
+    formEl.noValidate = true;
+    formEl.setAttribute('aria-label', 'Параметры тарифа');
+    formEl.append(retiredSlot, statusSlot, termsPanel, cardPanel, publishPanel, actionBar);
+
+    const previewPanel = el('section', 'panel');
+    previewPanel.setAttribute('aria-labelledby', 'tf-preview-title');
+    const previewBody = el('div', 'tariff-preview');
+    previewPanel.append(panelHead('tf-preview-title', 'Предпросмотр'), previewBody);
+
+    const planPanel = el('section', 'panel');
+    planPanel.setAttribute('aria-labelledby', 'tf-plan-title');
+    const planBody = el('div');
+    planPanel.append(panelHead('tf-plan-title', 'План и построитель'), planBody);
+
+    const managePanel = el('section', 'panel');
+    managePanel.setAttribute('aria-labelledby', 'tf-manage-title');
+    const manageBody = el('div', 'tariff-manage');
+    managePanel.append(panelHead('tf-manage-title', 'Продажа и удаление'), manageBody);
+
+    const side = el('div', 'editor-side');
+    side.append(previewPanel, planPanel);
+    if (base) side.append(managePanel);
+    const grid = el('div', 'editor-grid');
+    grid.append(formEl, side);
+    view.body.replaceChildren(grid);
+
+    // Painters ----------------------------------------------------------------
+    const paintTerms = () => {
+      termsSlot.replaceChildren();
+      if (!base || retired() || !base.in_use) return;
+      const { input } = validateTariffForm(form);
+      const versioned = input !== null && termsChanged(base, input);
+      const node = notice({
+        tone: 'info',
+        text: versioned
+          ? `Тариф уже покупали (${tariffUsage(base)}). Сохранение создаст новую версию тарифа: текущая будет снята с продажи, купленные подписки не изменятся.`
+          : `Тариф уже покупали (${tariffUsage(base)}). Название, план, срок, цена и валюта защищены: их изменение создаст новую версию. Карточку и публикацию можно менять свободно.`,
+      });
+      node.dataset.terms = versioned ? 'versioned' : 'protected';
+      termsSlot.append(node);
+    };
+
+    const paintPreview = () => {
+      const code = form.currency;
+      const amount = parsePriceInput(form.price, code);
+      const title = form.name.trim() || 'Название тарифа';
+      const days = /^\d{1,5}$/.test(form.durationDays.trim()) ? Number(form.durationDays.trim()) : 0;
+      const card = el('div', form.isActive ? 'offer-preview' : 'offer-preview is-hidden');
+      card.setAttribute('role', 'group');
+      card.setAttribute('aria-label', 'Карточка в Mini App');
+      const top = el('div', 'offer-preview-top');
+      const mark = el('span', 'offer-preview-icon', '↗');
+      mark.setAttribute('aria-hidden', 'true');
+      top.append(mark);
+      const badgeText = form.badge.trim();
+      if (badgeText) top.append(el('span', 'tag tag-accent offer-preview-badge', badgeText));
+      card.append(top, el('p', 'offer-preview-name', title), el('p', 'offer-preview-days', days ? `${days} дней доступа` : 'Срок не указан'));
+      const text = form.description.replace(/\r\n/g, '\n').trim();
+      if (text) card.append(el('p', 'offer-preview-desc', text));
+      const items = featuresFromText(form.features);
+      if (items.length) {
+        const list = el('ul', 'offer-preview-features');
+        for (const item of items) list.append(el('li', '', item));
+        card.append(list);
+      }
+      const row = el('div', 'offer-preview-row');
+      const arrow = el('span', 'offer-preview-arrow', '→');
+      arrow.setAttribute('aria-hidden', 'true');
+      row.append(el('strong', 'offer-preview-price', amount !== null && amount > 0 ? miniAppPrice(amount, code) : '—'), arrow);
+      card.append(row);
+      if (code !== 'XTR') card.append(el('p', 'offer-preview-note', 'Оплата Stars недоступна'));
+
+      const bot = el('div', 'bot-preview');
+      bot.setAttribute('role', 'group');
+      bot.setAttribute('aria-label', 'Кнопка в боте');
+      bot.append(el('p', 'preview-caption', 'Кнопка в боте'));
+      if (code === 'XTR') bot.append(el('p', 'field-hint', 'Не показывается: оплата Telegram Stars доступна только в Mini App.'));
+      else bot.append(el('span', 'bot-button', botButtonLabel(title, amount ?? 0)));
+
+      const nodes: HTMLElement[] = [el('p', 'preview-caption', 'Карточка в Mini App'), card, bot];
+      if (!form.isActive) nodes.push(el('p', 'field-hint', 'Тариф скрыт: покупатели не увидят его, пока он не включён.'));
+      previewBody.replaceChildren(...nodes);
+    };
+
+    let paintedPlan: number | null | undefined;
+    const paintPlan = (force = false) => {
+      if (!force && paintedPlan === form.planId) return;
+      paintedPlan = form.planId;
+      const selected = (this.plansCache ?? plans).find(item => item.id === form.planId) ?? null;
+      if (!selected) {
+        planBody.replaceChildren(el('p', 'panel-note', 'Выберите план: он задаёт лимиты подписки и построитель конфигурации.'));
+        return;
+      }
+      const facts = el('dl', 'facts facts-single');
+      const builderName = selected.builder_name
+        || (selected.subscription_builder_id !== null ? `Построитель #${selected.subscription_builder_id}` : 'Не назначен');
+      facts.append(
+        fact('План', selected.name, selected.is_active ? undefined : 'План отключён', 'is-danger'),
+        fact('Устройства', selected.devices_limit ? formatCount(selected.devices_limit) : 'Без ограничения'),
+        fact('Трафик', formatTraffic(selected.traffic_limit)),
+        fact('Построитель', builderName, 'Назначается плану и действует для всех его тарифов и подписок.'),
+      );
+      const assign = button('Изменить построитель', 'btn btn-secondary btn-sm', 'builders');
+      assign.addEventListener('click', () => void this.assignPlanBuilder(selected, () => paintPlan(true)));
+      const foot = el('div', 'panel-foot');
+      foot.append(assign);
+      planBody.replaceChildren(facts, foot);
+    };
+
+    const paintManage = () => {
+      if (!base) return;
+      const current = base;
+      const busy = saving || frozen;
+      const nodes: HTMLElement[] = [];
+      const facts = el('dl', 'facts facts-single');
+      facts.append(fact('Использование', current.in_use ? tariffUsage(current) : 'Ещё не покупали'),
+        fact('Создан', formatDateTime(current.created_at)));
+      if (current.previous_id !== null) {
+        const link = el('a', 'inline-link', `Тариф #${current.previous_id}`);
+        link.href = `#/tariffs/${current.previous_id}`;
+        facts.append(fact('Прежняя версия', link));
+      }
+      nodes.push(facts);
+      const list = el('div', 'tariff-manage-actions');
+      if (!(retired() && !current.is_active)) {
+        const toggle = current.is_active
+          ? button('Скрыть из каталога', 'btn btn-secondary btn-sm')
+          : button('Включить продажу', 'btn btn-primary btn-sm');
+        toggle.disabled = busy;
+        toggle.addEventListener('click', () => void toggleActive());
+        const item = el('div', 'tariff-manage-item');
+        item.append(el('p', 'manage-text', current.is_active
+          ? 'Тариф в продаже. Скрытый тариф пропадёт из каталога; купленные подписки продолжат действовать.'
+          : 'Тариф скрыт из каталога Mini App и бота.'), toggle);
+        list.append(item);
+      }
+      const remove = button('Удалить тариф', 'btn btn-danger btn-sm', 'trash');
+      remove.disabled = busy || current.in_use;
+      remove.addEventListener('click', () => void removeTariff(remove));
+      const removeItem = el('div', 'tariff-manage-item');
+      removeItem.append(el('p', current.in_use ? 'manage-text is-blocked' : 'manage-text', current.in_use
+        ? `Удалить нельзя: ${tariffUsage(current)}. Тариф можно только скрыть.`
+        : 'Тариф ещё не покупали — его можно удалить безвозвратно.'), remove);
+      list.append(removeItem);
+      nodes.push(list);
+      manageBody.replaceChildren(...nodes);
+    };
+
+    const applyEditable = () => {
+      const locked = retired() || frozen;
+      for (const control of textControls) {
+        control.readOnly = locked;
+        control.disabled = retired();
+      }
+      for (const control of choiceControls) control.disabled = locked;
+      for (const chip of chips) chip.disabled = locked;
+      retiredSlot.replaceChildren();
+      if (base && retired() && base.replaced_by_id !== null) {
+        const successor = el('a', 'btn btn-secondary btn-sm', 'Открыть актуальную версию');
+        successor.href = `#/tariffs/${base.replaced_by_id}`;
+        retiredSlot.append(noticeWithActions({
+          tone: 'info',
+          text: 'Это прежняя версия тарифа: её заменили новой при изменении условий покупки, и она больше не редактируется. Подписки, купленные по ней, продолжают действовать.',
+        }, [successor]));
+      }
+    };
+
+    const paintActions = () => {
+      const isDirty = dirty();
+      const { input } = validateTariffForm(form);
+      const versioned = base !== null && base.in_use && input !== null && termsChanged(base, input);
+      actionBar.hidden = retired();
+      dirtyNote.textContent = frozen ? 'Результат сохранения не подтверждён'
+        : isDirty ? 'Есть несохранённые изменения' : base ? 'Все изменения сохранены' : '';
+      dirtyNote.classList.toggle('is-dirty', isDirty || frozen);
+      reset.disabled = saving || frozen || !isDirty;
+      save.disabled = saving || (base !== null && !isDirty && !frozen);
+      save.setAttribute('aria-busy', String(saving));
+      setLabel(save, saving ? 'Сохраняем…' : frozen ? 'Повторить сохранение'
+        : !base ? 'Создать тариф' : versioned ? 'Сохранить как новую версию' : 'Сохранить');
+    };
+
+    const sync = () => {
+      form = read();
+      for (const paint of counters) paint();
+      for (const chip of durationChips.chips) chip.setAttribute('aria-pressed', String(chip.dataset.value === form.durationDays.trim()));
+      for (const chip of badgeChips.chips) chip.setAttribute('aria-pressed', String(chip.dataset.value === form.badge.trim()));
+      priceHint.textContent = form.currency === 'XTR'
+        ? 'Целое число звёзд Telegram Stars. Такой тариф продаётся только в Mini App.'
+        : 'Например 199 или 199,90. Тариф в рублях продаётся через бота.';
+      const count = featuresFromText(form.features).length;
+      featuresHint.textContent = `По одному в строке, не больше ${TARIFF_LIMITS.features} пунктов по ${TARIFF_LIMITS.feature} символов. Сейчас: ${count}.`;
+      paintTerms();
+      paintPreview();
+      paintPlan();
+      paintActions();
+    };
+
+    // Server state reload after a conflict ----------------------------------
+    const refetch = async (keepEdits: boolean, prefix = '') => {
+      if (!base) return;
+      const id = base.id;
+      try {
+        const latest = await this.api.getTariff(id);
+        if (!isCurrent()) return;
+        this.applyTariffOutcome({ tariff: latest, previous: null, versioned: false, replayed: false });
+        base = latest;
+        const before = baseline;
+        baseline = formFromTariff(latest, null);
+        // Only the fields edited here move onto the latest version; the rest
+        // keeps what the other change saved.
+        form = keepEdits && !isRetired(latest) ? rebaseForm(before, form, baseline) : { ...baseline };
+        write(form);
+        pending = null;
+        frozen = false;
+        clearErrors();
+        applyEditable();
+        paintHeading();
+        sync();
+        paintManage();
+        if (isRetired(latest)) {
+          showStatus({ tone: 'error', text: `${prefix}Эта версия тарифа уже заменена новой.` });
+        } else {
+          showStatus({
+            tone: 'info',
+            text: keepEdits
+              ? `${prefix}Загружена актуальная версия тарифа. Ваши правки остались в форме — проверьте их и сохраните снова.`
+              : `${prefix}Загружена актуальная версия тарифа.`,
+          });
+        }
+      } catch (error) {
+        if (!isCurrent()) return;
+        if (await this.endIfSignedOut(error, isCurrent)) return;
+        if (error instanceof ApiError && error.status === 404) {
+          this.removeCachedTariff(id);
+          this.unsavedChanges = null;
+          this.paintTariffMissing(view);
+          return;
+        }
+        showStatus({ tone: 'error', text: `Не удалось загрузить тариф. ${errorText(error)}` });
+      }
+    };
+
+    const showConflict = (prefix: string) => {
+      const keep = button('Перенести мои правки', 'btn btn-primary btn-sm');
+      keep.addEventListener('click', () => void refetch(true));
+      const reload = button('Загрузить актуальную версию', 'btn btn-secondary btn-sm', 'refresh');
+      reload.addEventListener('click', () => void refetch(false));
+      showStatus({
+        tone: 'error',
+        text: `${prefix} Тариф успели изменить в другом окне или другим администратором. Перенесите свои правки на актуальную версию или загрузите её без них.`,
+      }, [keep, reload]);
+    };
+
+    /** Common rejection handling of save/toggle/delete; false for an uncertain outcome. */
+    const reject = async (error: unknown, prefix: string): Promise<boolean> => {
+      const code = error instanceof ApiError ? error.code : '';
+      if (error instanceof ApiError && code === 'invalid_tariff') {
+        const key = SERVER_FIELDS[error.field];
+        if (key) showFieldErrors({ [key]: key === 'planId' ? 'План недоступен для продажи: он системный или удалён.' : 'Сервер отклонил это значение.' });
+        showStatus({ tone: 'error', text: `${prefix} ${tariffErrorText(error)}` }, [], !key);
+        return true;
+      }
+      if (code === 'version_conflict') { showConflict(prefix); return true; }
+      if (code === 'tariff_superseded') { await refetch(false, `${prefix} `); return true; }
+      if (error instanceof ApiError && error.status === 404) {
+        showStatus({ tone: 'error', text: `${prefix} ${tariffErrorText(error)}` }, [backLink()]);
+        return true;
+      }
+      if (code === 'tariff_in_use') { await refetch(true, `${prefix} ${tariffErrorText(error)} `); return true; }
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+        showStatus({ tone: 'error', text: `${prefix} ${tariffErrorText(error)}` });
+        return true;
+      }
+      return false;
+    };
+
+    // Actions -----------------------------------------------------------------
+    const submit = async () => {
+      if (saving || retired()) return;
+      form = read();
+      clearErrors();
+      const { input, errors } = validateTariffForm(form);
+      if (!input) {
+        showStatus({ tone: 'error', text: 'Проверьте выделенные поля.' }, [], false);
+        showFieldErrors(errors);
+        return;
+      }
+      if (base && !dirty() && !frozen) return;
+      const target = base;
+      const submitted = { ...form };
+      const payload = JSON.stringify([target?.id ?? 0, target?.version ?? 0, input]);
+      if (!pending || pending.payload !== payload) pending = { payload, key: newRequestKey() };
+      const key = pending.key;
+      const prefix = target ? 'Изменения не сохранены.' : 'Тариф не создан.';
+      saving = true;
+      showStatus(null);
+      paintActions();
+      paintManage();
+      try {
+        const outcome = target ? await this.api.updateTariff(target.id, target.version, input, key) : await this.api.createTariff(input, key);
+        pending = null;
+        frozen = false;
+        saving = false;
+        this.lastSessionCheck = Date.now();
+        this.applyTariffOutcome(outcome);
+        if (!isCurrent()) return;
+        const saved = outcome.tariff;
+        const replay = outcome.replayed ? ' Этот запрос уже был выполнен ранее, повторно изменение не применялось.' : '';
+        if (!saved) {
+          this.unsavedChanges = null;
+          showStatus({ tone: 'error', text: `Тариф был сохранён ранее, но с тех пор удалён.${replay}` }, [backLink()]);
+          applyEditable();
+          paintActions();
+          return;
+        }
+        if (!target || outcome.versioned) {
+          // Re-open the editor on the resulting tariff; the notice survives the render.
+          this.unsavedChanges = null;
+          this.tariffNotice = {
+            id: saved.id,
+            notice: {
+              tone: 'success',
+              text: !target
+                ? `Тариф «${saved.name}» создан${saved.is_active ? ' и показывается в каталоге' : ' и пока скрыт'}.${replay}`
+                : `Условия покупки изменены: создана новая версия тарифа #${saved.id}. Прежняя версия #${target.id} снята с продажи, купленные по ней подписки не изменились.${replay}`,
+            },
+          };
+          location.hash = `#/tariffs/${saved.id}`;
+          return;
+        }
+        base = saved;
+        baseline = formFromTariff(saved, null);
+        // Keep anything typed while the request was in flight.
+        form = sameForm(read(), submitted) ? { ...baseline } : read();
+        write(form);
+        applyEditable();
+        paintHeading();
+        sync();
+        paintManage();
+        showStatus({ tone: 'success', text: `Изменения сохранены.${replay}` });
+      } catch (error) {
+        saving = false;
+        if (!isCurrent()) return;
+        if (await this.endIfSignedOut(error, isCurrent)) return;
+        if (await reject(error, prefix)) {
+          pending = null;
+        } else {
+          frozen = true;
+          showStatus({
+            tone: 'error',
+            text: `Не удалось подтвердить сохранение. ${errorText(error)} Повторите: повторная отправка не создаст дубликат и не применит изменения дважды.`,
+          });
+        }
+        applyEditable();
+        paintActions();
+        paintManage();
+      }
+    };
+
+    const toggleActive = async () => {
+      if (!base || saving || frozen) return;
+      const target = base;
+      const next = !target.is_active;
+      saving = true;
+      paintActions();
+      paintManage();
+      try {
+        const outcome = await this.api.setTariffActive(target.id, target.version, next, newRequestKey());
+        this.applyTariffOutcome(outcome);
+        saving = false;
+        if (!isCurrent()) return;
+        if (outcome.tariff) {
+          base = outcome.tariff;
+          baseline = formFromTariff(base, null);
+          // Other edits stay in the form; only the publication flag follows the server.
+          form = { ...read(), isActive: base.is_active };
+          write(form);
+        }
+        applyEditable();
+        paintHeading();
+        sync();
+        paintManage();
+        showStatus({ tone: 'success', text: next ? 'Тариф включён и показывается в каталоге.' : 'Тариф скрыт из каталога. Купленные подписки продолжают действовать.' });
+      } catch (error) {
+        saving = false;
+        if (!isCurrent()) return;
+        if (await this.endIfSignedOut(error, isCurrent)) return;
+        const prefix = next ? 'Тариф не включён.' : 'Тариф не скрыт.';
+        if (!(await reject(error, prefix))) showStatus({ tone: 'error', text: `${prefix} ${errorText(error)}` });
+        paintActions();
+        paintManage();
+      }
+    };
+
+    const removeTariff = async (trigger: HTMLButtonElement) => {
+      if (!base || saving || frozen || base.in_use) return;
+      const target = base;
+      const confirmed = await this.confirmAction(`Удалить тариф «${target.name}»?`,
+        'Тариф ещё не покупали. Он исчезнет из каталога и из панели, действие нельзя отменить.', 'Удалить');
+      if (!isCurrent()) return;
+      if (!confirmed) { trigger.focus(); return; }
+      saving = true;
+      paintActions();
+      paintManage();
+      try {
+        await this.api.deleteTariff(target.id, target.version, newRequestKey());
+        this.removeCachedTariff(target.id);
+        if (!isCurrent()) return;
+        this.unsavedChanges = null;
+        this.toast(`Тариф «${target.name}» удалён.`);
+        location.hash = '#/tariffs';
+      } catch (error) {
+        saving = false;
+        if (!isCurrent()) return;
+        if (await this.endIfSignedOut(error, isCurrent)) return;
+        if (!(await reject(error, 'Тариф не удалён.'))) showStatus({ tone: 'error', text: `Тариф не удалён. ${errorText(error)}` });
+        paintActions();
+        paintManage();
+      }
+    };
+
+    // Wiring ------------------------------------------------------------------
+    for (const control of [...textControls, ...choiceControls]) {
+      control.addEventListener('input', sync);
+      control.addEventListener('change', sync);
+    }
+    // Saving reports every problem; editing a field clears its own. No blur
+    // validation: a message appearing or vanishing on blur shifts the layout
+    // under the pointer and the click lands elsewhere.
+    for (const [key, control] of targets) {
+      control.addEventListener('input', () => setters.get(key)?.(''));
+    }
+    reset.addEventListener('click', () => {
+      form = { ...baseline };
+      write(form);
+      clearErrors();
+      showStatus(null);
+      sync();
+      name.focus();
+    });
+    formEl.addEventListener('submit', event => {
+      event.preventDefault();
+      void submit();
+    });
+
+    write(form);
+    applyEditable();
+    paintHeading();
+    sync();
+    paintManage();
+    const shown = this.tariffNotice;
+    if (shown && base && shown.id === base.id) {
+      this.tariffNotice = null;
+      showStatus(shown.notice, [], false);
+    }
+  }
+
+  /** Assigns the plan's builder from the tariff editor (builders are per plan, never per tariff). */
+  private async assignPlanBuilder(plan: TariffPlan, onDone: () => void) {
+    if (this.dialog) return;
+    const view = this.tariffEditorView;
+    const current = () => this.tariffEditorView === view;
+    if (!this.buildersCache) {
+      try {
+        this.buildersCache = await this.api.listBuilders();
+      } catch (error) {
+        if (!current()) return;
+        if (await this.endIfSignedOut(error, current)) return;
+        this.toast(`Не удалось загрузить построители. ${errorText(error)}`);
+        return;
+      }
+      if (!current()) return;
+    }
+    this.openBuilderAssignDialog('plan', plan.id, plan.subscription_builder_id, builderId => {
+      const builderName = builderId === null ? '' : this.buildersCache?.find(item => item.id === builderId)?.name ?? '';
+      this.plansCache = (this.plansCache ?? []).map(item => item.id === plan.id
+        ? { ...item, subscription_builder_id: builderId, builder_name: builderName } : item);
+      if (this.tariffsCache) {
+        this.tariffsCache = this.tariffsCache.map(tariff => tariff.plan_id === plan.id ? { ...tariff, builder_id: builderId } : tariff);
+      }
+      if (current()) onDone();
+      this.toast(builderId === null ? `Построитель плана «${plan.name}» снят.` : `Построитель назначен плану «${plan.name}».`);
+    }, { planName: plan.name, subscriptions: plan.subscriptions });
+  }
+
+  /**
+   * Subscriptions affected by a plan's builder (TariffPlan.subscriptions, all
+   * statuses), from the plans snapshot or GET /admin/api/plans. A failed read
+   * still opens the dialog, with a warning that the count is unknown.
+   */
+  private async planImpact(planId: number, planName: string): Promise<PlanImpact> {
+    let plan = this.plansCache?.find(item => item.id === planId);
+    if (!plan) {
+      try {
+        this.plansCache = await this.api.listPlans();
+        plan = this.plansCache.find(item => item.id === planId);
+      } catch {
+        // The dialog still opens; its warning says the count is unknown.
+      }
+    }
+    return { planName: plan?.name ?? planName, subscriptions: plan ? plan.subscriptions : null };
+  }
+
+  /** A modal yes/no confirmation; resolves false when dismissed in any way. */
+  private confirmAction(titleText: string, text: string, confirmLabel: string): Promise<boolean> {
+    return new Promise(resolve => {
+      if (this.dialog || this.view !== 'app') { resolve(false); return; }
+      const dialog = el('dialog', 'modal');
+      dialog.setAttribute('aria-labelledby', 'confirm-action-title');
+      const heading = el('h2', 'modal-title', titleText);
+      heading.id = 'confirm-action-title';
+      const cancel = button('Отмена', 'btn btn-secondary');
+      const confirm = button(confirmLabel, 'btn btn-danger');
+      const actions = el('div', 'modal-actions');
+      actions.append(cancel, confirm);
+      const body = el('div', 'modal-body');
+      body.append(heading, el('p', 'modal-text', text), actions);
+      dialog.append(body);
+      let settled = false;
+      const handle = {
+        dismiss: () => {
+          if (dialog.open) dialog.close();
+          dialog.remove();
+          if (!settled) { settled = true; resolve(false); }
+        },
+      };
+      const finish = (value: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (this.dialog === handle) this.dialog = null;
+        handle.dismiss();
+        resolve(value);
+      };
+      cancel.addEventListener('click', () => finish(false));
+      confirm.addEventListener('click', () => finish(true));
+      dialog.addEventListener('cancel', event => { event.preventDefault(); finish(false); });
+      this.dialog = handle;
+      this.root.append(dialog);
+      dialog.showModal();
+      cancel.focus();
+    });
+  }
 }
 
-function field(label: string, input: HTMLInputElement, action?: HTMLElement) {
+// ---------------------------------------------------------------------------
+// Tariff helpers
+
+const NEW_TARIFF_DESC = 'Заполните условия покупки и карточку. Включённый тариф сразу появится в каталоге.';
+const TARIFF_FIELD_ORDER: readonly TariffField[] = ['name', 'planId', 'durationDays', 'price', 'currency', 'description', 'features', 'badge', 'sortOrder'];
+const CURRENCY_LABELS: Readonly<Record<string, string>> = {
+  RUB: 'RUB — рубли (бот)',
+  XTR: 'XTR — Telegram Stars (Mini App)',
+};
+
+/** The Mini App's price label (frontend/src/ui.ts price). */
+function miniAppPrice(amount: number, currency: string): string {
+  if (currency === 'XTR') return `${amount.toLocaleString('ru-RU')} ★`;
+  return `${(amount / 100).toLocaleString('ru-RU')} ${currency}`;
+}
+
+const TARIFF_REJECTIONS: Readonly<Record<string, string>> = {
+  version_conflict: 'Тариф успели изменить в другом окне или другим администратором.',
+  tariff_superseded: 'Эта версия тарифа уже заменена новой и больше не редактируется.',
+  tariff_in_use: 'Тариф уже используется в заказах или подписках: удалить его нельзя, можно только скрыть.',
+  order_stale: 'Каталог изменился после загрузки: тариф добавлен или удалён.',
+  request_key_conflict: 'Запрос конфликтует с ранее отправленным.',
+  invalid_request: 'Сервер отклонил параметры запроса.',
+};
+
+function tariffErrorText(error: unknown): string {
+  if (!(error instanceof ApiError)) return errorText(error);
+  if (error.code === 'invalid_tariff') {
+    return error.field === 'plan_id' ? 'План недоступен для продажи: он системный или удалён.' : 'Сервер отклонил значение одного из полей.';
+  }
+  if (error.code === 'not_found' && error.status === 404) return 'Тариф не найден: возможно, его уже удалили.';
+  return TARIFF_REJECTIONS[error.code] ?? errorText(error);
+}
+
+const isStaleTariffError = (error: unknown) =>
+  error instanceof ApiError && ['version_conflict', 'tariff_superseded', 'tariff_in_use', 'not_found'].includes(error.code);
+
+function tariffUsage(tariff: AdminTariff): string {
+  if (!tariff.in_use) return 'не покупали';
+  return `${formatCount(tariff.orders)} ${pluralRu(tariff.orders, 'заказ', 'заказа', 'заказов')}, ` +
+    `${formatCount(tariff.subscriptions)} ${pluralRu(tariff.subscriptions, 'подписка', 'подписки', 'подписок')}`;
+}
+
+function tariffStateTag(tariff: AdminTariff): HTMLElement {
+  if (isRetired(tariff)) return el('span', 'tag', 'Прежняя версия');
+  return tariff.is_active ? el('span', 'tag tag-on', 'В продаже') : el('span', 'tag', 'Скрыт');
+}
+
+function iconButton(name: IconName, label: string): HTMLButtonElement {
+  const node = el('button', 'icon-button');
+  node.type = 'button';
+  node.setAttribute('aria-label', label);
+  node.title = label;
+  node.append(icon(name));
+  return node;
+}
+
+/** Subscriptions of a plan reached by a change of its builder; null when unknown. */
+interface PlanImpact { planName: string; subscriptions: number | null }
+
+/** The explicit warning of the plan builder dialog. */
+function planImpactText({ planName, subscriptions }: PlanImpact): string {
+  if (subscriptions === null) return `Изменение затронет все подписки плана «${planName}». Число подписок получить не удалось.`;
+  if (subscriptions === 0) return `У плана «${planName}» нет подписок: изменение не затронет ни одной активной подписки.`;
+  return `Изменение затронет ${formatCount(subscriptions)} ${pluralRu(subscriptions, 'подписку', 'подписки', 'подписок')} плана «${planName}». ` +
+    'Учитываются подписки во всех статусах.';
+}
+
+/** The latest server form with the fields edited locally (mine vs before) applied on top. */
+function rebaseForm(before: TariffForm, mine: TariffForm, latest: TariffForm): TariffForm {
+  const next: TariffForm = { ...latest };
+  const target = next as unknown as Record<string, unknown>;
+  const edited = mine as unknown as Record<string, unknown>;
+  const original = before as unknown as Record<string, unknown>;
+  for (const key of Object.keys(edited)) {
+    if (edited[key] !== original[key]) target[key] = edited[key];
+  }
+  return next;
+}
+
+/** A notice with action buttons under its text. */
+function noticeWithActions(next: Notice, actions: HTMLElement[]): HTMLElement {
+  const node = notice(next);
+  if (!actions.length) return node;
+  const text = node.querySelector('p');
+  const content = el('div', 'notice-body');
+  if (text) content.append(text);
+  const row = el('div', 'notice-actions');
+  row.append(...actions);
+  content.append(row);
+  node.append(content);
+  return node;
+}
+
+function field(label: string, input: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, action?: HTMLElement) {
   const root = el('div', 'field');
   const caption = el('label', 'field-label', label);
   caption.htmlFor = input.id;

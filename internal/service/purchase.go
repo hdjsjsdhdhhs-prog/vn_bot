@@ -51,6 +51,14 @@ type SubscriptionOffer struct {
 	AmountCents int64 `json:"amount_cents"`
 	Currency string `json:"currency"`
 	AvailableUntil *time.Time `json:"available_until,omitempty"`
+	// Card presentation from the tariff editor (migration 046). Empty values
+	// mean "not configured": the Mini App falls back to its default card.
+	Description string `json:"description"`
+	Features []string `json:"features"`
+	Badge string `json:"badge"`
+	// SortOrder is the shared catalogue position; offers are already returned
+	// in catalogue order (database.ProductCatalogOrder).
+	SortOrder int `json:"sort_order"`
 }
 
 // PurchaseOrderInfo intentionally omits internal IDs, identity, idempotency key,
@@ -104,7 +112,9 @@ func (p *PurchaseService) Offers(ctx context.Context) ([]SubscriptionOffer, erro
 		if _, err := validatePurchaseOffer(catalog, product); err == nil {
 			offers = append(offers, SubscriptionOffer{OfferID: product.OfferID, Name: product.Name,
 				DurationDays: product.DurationDays, AmountCents: product.PriceCents,
-				Currency: product.Currency, AvailableUntil: product.OfferEndsAt})
+				Currency: product.Currency, AvailableUntil: product.OfferEndsAt,
+				Description: product.Description, Features: database.DecodeTariffFeatures(product.Features),
+				Badge: product.Badge, SortOrder: product.SortOrder})
 		}
 	}
 	return offers, nil

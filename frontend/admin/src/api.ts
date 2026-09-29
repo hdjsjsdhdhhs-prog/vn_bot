@@ -10,6 +10,8 @@ export class ApiError extends Error {
     readonly code: string,
     readonly status = 0,
     readonly retryAfter = 0,
+    /** Offending input field named by the server (tariff editor: invalid_tariff). */
+    readonly field = '',
   ) {
     super(code);
     this.name = 'ApiError';
@@ -480,7 +482,8 @@ export class AdminApi {
       const data: unknown = await response.json().catch(() => undefined);
       if (!response.ok) {
         const retryAfter = response.status === 429 ? retryAfterSeconds(response) : 0;
-        throw new ApiError(errorCode(data, response.status), response.status, retryAfter);
+        const field = isRecord(data) && typeof data.field === 'string' && /^[a-z_]{1,40}$/.test(data.field) ? data.field : '';
+        throw new ApiError(errorCode(data, response.status), response.status, retryAfter, field);
       }
       return data;
     } catch (error) {
@@ -623,6 +626,86 @@ export class AdminApi {
     const data = await this.#send('POST', `/admin/api/subscriptions/${subscriptionId}/builder`, JSON.stringify(input));
     if (!isRecord(data)) throw new ApiError('invalid_response');
     return data as unknown as AssignmentAudit;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Tariffs (web.adminAPI.routeTariffs → service.TariffService). Every write
+  // carries a request_key: the same key with the same payload replays the
+  // committed outcome, so an uncertain request is retried with the SAME key.
+  // Rejections: 400 invalid_tariff (+field) | invalid_request, 404 not_found,
+  // 409 version_conflict | tariff_in_use | tariff_superseded | order_stale |
+  // request_key_conflict.
+  // ---------------------------------------------------------------------------
+
+  /** GET /admin/api/tariffs: every product in catalogue order, retired versions included. */
+  async listTariffs(): Promise<readonly AdminTariff[]> {
+    const tariffs = parseTariffList(await this.#send('GET', '/admin/api/tariffs'));
+    if (!tariffs) throw new ApiError('invalid_response');
+    return tariffs;
+  }
+
+  /** GET /admin/api/tariffs/{id}. */
+  async getTariff(id: number): Promise<AdminTariff> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
+    const tariff = parseTariff(await this.#send('GET', `/admin/api/tariffs/${id}`));
+    if (!tariff || tariff.id !== id) throw new ApiError('invalid_response');
+    return tariff;
+  }
+
+  /** GET /admin/api/plans: the plan picker (system plans are not selectable). */
+  async listPlans(): Promise<readonly TariffPlan[]> {
+    const data = await this.#send('GET', '/admin/api/plans');
+    if (!isRecord(data) || !Array.isArray(data.plans)) throw new ApiError('invalid_response');
+    const plans: TariffPlan[] = [];
+    for (const item of data.plans) {
+      const plan = parseTariffPlan(item);
+      if (!plan) throw new ApiError('invalid_response');
+      plans.push(plan);
+    }
+    return plans;
+  }
+
+  /** POST /admin/api/tariffs. A null sort_order appends the tariff to the catalogue. */
+  async createTariff(input: TariffInput, requestKey: string): Promise<TariffOutcome> {
+    return this.#tariffOutcome(await this.#send('POST', '/admin/api/tariffs', tariffBody(requestKey, input)));
+  }
+
+  /**
+   * PATCH /admin/api/tariffs/{id}. For a used tariff, changing the purchase
+   * terms creates a successor (outcome.versioned, outcome.previous).
+   */
+  async updateTariff(id: number, version: number, input: TariffInput, requestKey: string): Promise<TariffOutcome> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
+    return this.#tariffOutcome(await this.#send('PATCH', `/admin/api/tariffs/${id}`, tariffBody(requestKey, input, version)));
+  }
+
+  /** POST /admin/api/tariffs/{id}/enable|disable. */
+  async setTariffActive(id: number, version: number, active: boolean, requestKey: string): Promise<TariffOutcome> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
+    const body = JSON.stringify({ request_key: requestKey, version });
+    return this.#tariffOutcome(await this.#send('POST', `/admin/api/tariffs/${id}/${active ? 'enable' : 'disable'}`, body));
+  }
+
+  /** POST /admin/api/tariffs/reorder: ids must list every tariff exactly once. */
+  async reorderTariffs(ids: readonly number[], requestKey: string): Promise<readonly AdminTariff[]> {
+    const tariffs = parseTariffList(await this.#send('POST', '/admin/api/tariffs/reorder', JSON.stringify({ request_key: requestKey, ids })));
+    if (!tariffs) throw new ApiError('invalid_response');
+    return tariffs;
+  }
+
+  /** DELETE /admin/api/tariffs/{id}: only unused tariffs (409 tariff_in_use otherwise). */
+  async deleteTariff(id: number, version: number, requestKey: string): Promise<void> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
+    const data = await this.#send('DELETE', `/admin/api/tariffs/${id}`, JSON.stringify({ request_key: requestKey, version }));
+    if (!isRecord(data) || data.deleted !== id) throw new ApiError('invalid_response');
+  }
+
+  #tariffOutcome(data: unknown): TariffOutcome {
+    if (!isRecord(data) || typeof data.versioned !== 'boolean' || typeof data.replayed !== 'boolean') throw new ApiError('invalid_response');
+    const tariff = data.tariff === null ? null : parseTariff(data.tariff);
+    const previous = data.previous === null || data.previous === undefined ? null : parseTariff(data.previous);
+    if (tariff === undefined || previous === undefined) throw new ApiError('invalid_response');
+    return { tariff, previous, versioned: data.versioned, replayed: data.replayed };
   }
 
 }
@@ -783,4 +866,148 @@ export interface AssignmentAudit {
     readonly created_at: string;
     readonly success: boolean;
   };
+}
+
+// =============================================================================
+// Tariff editor types (service.TariffView, service.TariffPlanView)
+// =============================================================================
+
+/** Server-side bounds (database.Tariff* constants), lengths in characters. */
+export const TARIFF_LIMITS = {
+  name: 64, description: 500, features: 8, feature: 80, badge: 24,
+  maxPriceCents: 100_000_000, maxDurationDays: RENEW_MAX_DAYS, maxSortOrder: 100_000,
+} as const;
+
+/**
+ * A tariff is a Product. Purchase terms (name, plan, duration, price,
+ * currency) are frozen once orders or subscriptions reference it (in_use):
+ * changing them creates a successor version. Prices are minor units; for XTR
+ * (Telegram Stars) whole Stars.
+ */
+export interface AdminTariff {
+  readonly id: number;
+  readonly offer_id: string;
+  readonly name: string;
+  readonly plan_id: number;
+  readonly plan_name: string;
+  readonly plan_active: boolean;
+  /** The plan's default builder; builders are assigned per plan, never per tariff. */
+  readonly builder_id: number | null;
+  readonly duration_days: number;
+  readonly price_cents: number;
+  readonly currency: string;
+  readonly is_active: boolean;
+  readonly description: string;
+  readonly features: readonly string[];
+  readonly badge: string;
+  readonly sort_order: number;
+  /** Optimistic-locking version, sent back with every change. */
+  readonly version: number;
+  /** The tariff this one replaced (versioning). */
+  readonly previous_id: number | null;
+  /** Set on a retired version: it is frozen, edit the successor instead. */
+  readonly replaced_by_id: number | null;
+  readonly orders: number;
+  readonly subscriptions: number;
+  readonly in_use: boolean;
+  readonly offer_ends_at: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface TariffPlan {
+  readonly id: number;
+  readonly name: string;
+  readonly is_active: boolean;
+  readonly devices_limit: number;
+  readonly traffic_limit: number;
+  readonly subscription_builder_id: number | null;
+  readonly builder_name: string;
+  /** Tariffs (all versions) and subscriptions on this plan. */
+  readonly tariffs: number;
+  readonly subscriptions: number;
+  /** false for the system trial/free plans. */
+  readonly selectable: boolean;
+}
+
+/** Editable content of a tariff (web.tariffBody without request_key/version). */
+export interface TariffInput {
+  readonly name: string;
+  readonly plan_id: number;
+  readonly duration_days: number;
+  readonly price_cents: number;
+  readonly currency: string;
+  readonly description: string;
+  readonly features: readonly string[];
+  readonly badge: string;
+  readonly is_active: boolean;
+  /** Omitted/null: append on create, keep the position on update. */
+  readonly sort_order?: number | null;
+}
+
+export interface TariffOutcome {
+  /** The resulting tariff: the successor when versioned. */
+  readonly tariff: AdminTariff | null;
+  /** The retired original when versioned. */
+  readonly previous: AdminTariff | null;
+  readonly versioned: boolean;
+  readonly replayed: boolean;
+}
+
+function tariffBody(requestKey: string, input: TariffInput, version?: number): string {
+  // Exactly the fields web.tariffBody accepts: unknown fields are rejected.
+  const body: Record<string, unknown> = {
+    request_key: requestKey, name: input.name, plan_id: input.plan_id, duration_days: input.duration_days,
+    price_cents: input.price_cents, currency: input.currency, description: input.description,
+    features: input.features, badge: input.badge, is_active: input.is_active,
+  };
+  if (input.sort_order !== undefined && input.sort_order !== null) body.sort_order = input.sort_order;
+  if (version !== undefined) body.version = version;
+  return JSON.stringify(body);
+}
+
+const isStringList = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string');
+
+function parseTariff(value: unknown): AdminTariff | undefined {
+  if (!isRecord(value)) return undefined;
+  const {
+    id, offer_id, name, plan_id, plan_name, plan_active, builder_id = null, duration_days, price_cents, currency,
+    is_active, description, features, badge, sort_order, version, previous_id = null, replaced_by_id = null,
+    orders, subscriptions, in_use, offer_ends_at = null, created_at, updated_at,
+  } = value;
+  if (!isPositive(id) || !isText(offer_id) || !isText(name) || !isCount(plan_id) || !isText(plan_name) ||
+    typeof plan_active !== 'boolean' || !isNullable(builder_id, isPositive) || !isCount(duration_days) ||
+    !isCount(price_cents) || !isCurrency(currency) || typeof is_active !== 'boolean' || !isText(description) ||
+    !isStringList(features) || !isText(badge) || !isCount(sort_order) || !isPositive(version) ||
+    !isNullable(previous_id, isPositive) || !isNullable(replaced_by_id, isPositive) || !isCount(orders) ||
+    !isCount(subscriptions) || typeof in_use !== 'boolean' || !isNullable(offer_ends_at, isTime) ||
+    !isTime(created_at) || !isTime(updated_at)) return undefined;
+  return {
+    id, offer_id, name, plan_id, plan_name, plan_active, builder_id, duration_days, price_cents, currency,
+    is_active, description, features, badge, sort_order, version, previous_id, replaced_by_id,
+    orders, subscriptions, in_use, offer_ends_at, created_at, updated_at,
+  };
+}
+
+function parseTariffList(value: unknown): AdminTariff[] | null {
+  if (!isRecord(value) || !Array.isArray(value.tariffs)) return null;
+  const tariffs: AdminTariff[] = [];
+  for (const item of value.tariffs) {
+    const tariff = parseTariff(item);
+    if (!tariff) return null;
+    tariffs.push(tariff);
+  }
+  return tariffs;
+}
+
+function parseTariffPlan(value: unknown): TariffPlan | undefined {
+  if (!isRecord(value)) return undefined;
+  const {
+    id, name, is_active, devices_limit, traffic_limit, subscription_builder_id = null, builder_name = '',
+    tariffs, subscriptions, selectable,
+  } = value;
+  if (!isPositive(id) || !isText(name) || typeof is_active !== 'boolean' || !isCount(devices_limit) ||
+    !isCount(traffic_limit) || !isNullable(subscription_builder_id, isPositive) || !isText(builder_name) ||
+    !isCount(tariffs) || !isCount(subscriptions) || typeof selectable !== 'boolean') return undefined;
+  return { id, name, is_active, devices_limit, traffic_limit, subscription_builder_id, builder_name, tariffs, subscriptions, selectable };
 }

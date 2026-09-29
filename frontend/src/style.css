@@ -49,6 +49,12 @@ p { line-height: 1.55; }
 .offer-card { position: relative; transition: transform .15s, border-color .15s; }
 .offer-card:hover { border-color: var(--accent); }
 .offer-icon { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 14px; color: var(--accent); background: var(--line); font-size: 25px; }
+.offer-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.offer-badge { color: var(--accent-ink); background: var(--accent); }
+.offer-description { color: var(--muted); font-size: 15px; white-space: pre-line; }
+.offer-features { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.offer-features li { position: relative; padding-left: 22px; line-height: 1.45; overflow-wrap: anywhere; }
+.offer-features li::before { content: '✦'; position: absolute; left: 0; color: var(--accent); }
 .row { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; gap: 12px; }
 .price { font-size: 26px; letter-spacing: -.04em; font-weight: 700; }
 .large { font-size: 42px; margin-top: 6px; }

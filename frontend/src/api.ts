@@ -5,6 +5,14 @@ export interface Offer {
   amount_cents: number;
   currency: string;
   available_until?: string;
+  // Card presentation from the admin tariff editor (migration 046). Optional:
+  // absent or empty values mean "not configured" and the card falls back to
+  // the default copy. Orders carry none of these fields.
+  description?: string;
+  features?: string[];
+  badge?: string;
+  // Shared catalogue position (the bot uses the same order).
+  sort_order?: number;
 }
 export interface Order extends Offer {
   order_id: string;
@@ -53,7 +61,21 @@ function isOffer(value: unknown): value is Offer {
   return record(value) && reference(value.offer_id) && typeof value.name === 'string' &&
     positiveInteger(value.duration_days) && positiveInteger(value.amount_cents) &&
     typeof value.currency === 'string' && /^[A-Z]{3}$/.test(value.currency) &&
-    (value.available_until === undefined || timestamp(value.available_until));
+    (value.available_until === undefined || timestamp(value.available_until)) &&
+    (value.description === undefined || typeof value.description === 'string') &&
+    (value.badge === undefined || typeof value.badge === 'string') &&
+    (value.features === undefined || (Array.isArray(value.features) && value.features.every(item => typeof item === 'string'))) &&
+    (value.sort_order === undefined || (typeof value.sort_order === 'number' && Number.isSafeInteger(value.sort_order) && value.sort_order >= 0));
+}
+/**
+ * Catalogue order shared with the bot: ascending sort_order. The server already
+ * returns offers in this order (ties by price, then ID); the stable sort keeps
+ * that tie order and also covers servers without sort_order (treated as 0).
+ */
+export function catalogOrder(offers: readonly Offer[]): Offer[] {
+  return offers.map((offer, index) => ({ offer, index }))
+    .sort((a, b) => (a.offer.sort_order ?? 0) - (b.offer.sort_order ?? 0) || a.index - b.index)
+    .map(item => item.offer);
 }
 function isOrder(value: unknown): value is Order {
   return record(value) && isOffer(value) && reference(value.order_id) &&

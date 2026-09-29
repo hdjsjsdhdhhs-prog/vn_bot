@@ -15,9 +15,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Pin the complete Mini App/Purchase/Stars/Admin-audit/Subscription Builder
-// schema; future-schema fixtures must remain strictly newer than this version.
-const expectedLatestMigrationVersion = 45
+// Pin the complete Mini App/Purchase/Stars/Admin-audit/Subscription Builder/
+// Tariff catalogue schema; future-schema fixtures must remain strictly newer
+// than this version.
+const expectedLatestMigrationVersion = 46
 
 func TestLatestEmbeddedMigrationVersion(t *testing.T) {
 	t.Parallel()

@@ -240,6 +240,30 @@ test('late purchase creation does not pull the user back from another screen', a
   await expect(page.getByRole('button', { name: 'Оплатить 150 ★' })).toBeEnabled();
 });
 
+test('tariff editor presentation: sort_order, badge, description, features and fallback card', async ({ page }) => {
+  await fixture(page);
+  const configured = { ...offer, offer_id: 'c'.repeat(32), name: 'Год без границ', amount_cents: 990, sort_order: 0, badge: 'Хит', description: 'Лучшая цена за год', features: ['Все серверы', 'Приоритетная поддержка'] };
+  const legacy = { ...offer, sort_order: 1, description: '', features: [], badge: '' };
+  // The server lists the configured tariff second; sort_order moves it first.
+  await page.route('**/api/miniapp/offers', route => route.fulfill({ json: { offers: [legacy, configured] } }));
+  await page.goto('/miniapp/#catalog');
+  const cards = page.locator('a.offer-card');
+  await expect(cards).toHaveCount(2);
+  await expect(cards.nth(0)).toContainText('Год без границ');
+  await expect(cards.nth(0)).toContainText('Хит');
+  await expect(cards.nth(0)).toContainText('Лучшая цена за год');
+  await expect(cards.nth(0).getByRole('listitem')).toHaveText(['Все серверы', 'Приоритетная поддержка']);
+  await expect(cards.nth(1)).toContainText('Месяц свободы');
+  await expect(cards.nth(1).getByRole('listitem')).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await cards.nth(0).click();
+  await expect(page.getByRole('heading', { name: 'Год без границ' })).toBeVisible();
+  await expect(page.getByRole('listitem')).toHaveText(['Все серверы', 'Приоритетная поддержка']);
+  await expect(page.getByText('✦ Без автоматических списаний')).toHaveCount(0);
+  await page.goto(`/miniapp/#product/${offer.offer_id}`);
+  await expect(page.getByText('✦ Без автоматических списаний')).toBeVisible();
+});
+
 test('responsive layout at narrow and wide sizes', async ({ page }) => {
   await fixture(page); await page.goto('/miniapp/');
   for (const width of [320, 390, 768]) {

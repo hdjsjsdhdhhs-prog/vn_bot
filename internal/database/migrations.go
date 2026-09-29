@@ -488,6 +488,17 @@ func foreignKeysMigrationSchemaComplete(sqlDB *sql.DB, version int) (bool, error
 	case 34:
 		fkTable = "orders"
 		complete, err = tableRebuildComplete(sqlDB, fkTable, "orders_old", "ON DELETE CASCADE")
+	case 46:
+		fkTable = "products"
+		complete, err = tableRebuildComplete(sqlDB, fkTable, "products_new", "sort_order INTEGER NOT NULL")
+		if err == nil && complete {
+			// The indexes are recreated after the rename; an interruption in
+			// between would leave offer references without their uniqueness.
+			var indexes int
+			err = sqlDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'products'
+				AND name IN ('idx_products_plan', 'idx_products_offer_id')`).Scan(&indexes)
+			complete = err == nil && indexes == 2
+		}
 	default:
 		return false, fmt.Errorf("no schema recovery verifier for migration %d", version)
 	}

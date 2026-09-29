@@ -233,6 +233,7 @@ func startWebServer(subService *service.SubscriptionService, cfg *config.Config,
 	webServer.SetOrderService(orderService)
 	webServer.SetAdminService(adminService)
 	webServer.SetBuilderService(builderService)
+	webServer.SetTariffService(service.NewTariffService(dbService))
 	webServer.SetBot(botAPI)
 
 	if cfg.PaymentEnabled {

@@ -38,6 +38,9 @@ func TestPurchaseMigration042_DownPopulated(t *testing.T) {
 	require.NoError(t, svc.db.First(&originalProduct, product.ID).Error)
 	originalProduct.OfferID = ""
 	originalProduct.OfferEndsAt = nil
+	// Columns added by 046 do not exist below it; the row reads back zero.
+	originalProduct.Description, originalProduct.Features, originalProduct.Badge = "", "", ""
+	originalProduct.SortOrder, originalProduct.Version, originalProduct.PreviousID = 0, 0, nil
 	originalSub, err := svc.GetByID(ctx, sub.ID)
 	require.NoError(t, err)
 	sqlDB, err := svc.db.DB()

@@ -354,12 +354,17 @@ func (a *adminAPI) builderReorderItems(w http.ResponseWriter, r *http.Request, b
 // decodeAdminJSON reads and decodes a JSON body, rejecting unknown fields and
 // extra trailing content. Returns false and writes the error response on failure.
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	return decodeAdminJSONLimit(w, r, dst, adminAPIMaxBody)
+}
+
+// decodeAdminJSONLimit is decodeAdminJSON with an explicit body limit.
+func decodeAdminJSONLimit(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
 	ct, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || ct != "application/json" {
 		writeAdminError(w, http.StatusUnsupportedMediaType, "unsupported_media_type")
 		return false
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, adminAPIMaxBody))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request")

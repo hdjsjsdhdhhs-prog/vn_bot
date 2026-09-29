@@ -131,6 +131,37 @@ func TestHandleBuyPremiumList_SuccessShowsProducts(t *testing.T) {
 	}
 }
 
+// The bot shows products in the catalogue order returned by
+// ListActiveProducts (database.ProductCatalogOrder: sort_order, then price):
+// the same order as the Mini App. It must never re-sort by price.
+func TestHandleBuyPremiumList_KeepsCatalogueSortOrder(t *testing.T) {
+	t.Parallel()
+
+	mockDB := testutil.NewDatabaseService()
+	mockDB.ListActiveProductsFunc = func(context.Context) ([]database.Product, error) {
+		return []database.Product{
+			{ID: 3, Name: "Год", PriceCents: 199900, IsActive: true, SortOrder: 0, Currency: "RUB"},
+			{ID: 1, Name: "Месяц", PriceCents: 19900, IsActive: true, SortOrder: 1, Currency: "RUB"},
+			{ID: 2, Name: "Квартал", PriceCents: 49900, IsActive: true, SortOrder: 2, Currency: "RUB"},
+		}, nil
+	}
+	h, bot := newPaymentTestHandler(t, mockDB, fakePaymentProvider{})
+
+	require.NoError(t, h.handleBuyPremiumList(context.Background(), 42, "user", 99))
+
+	edit, ok := bot.LastChattableSafe().(tgbotapi.EditMessageTextConfig)
+	require.True(t, ok)
+	require.NotNil(t, edit.ReplyMarkup)
+	rows := edit.ReplyMarkup.InlineKeyboard
+	require.Len(t, rows, 4)
+	var callbacks []string
+	for _, row := range rows[:3] {
+		require.NotNil(t, row[0].CallbackData)
+		callbacks = append(callbacks, *row[0].CallbackData)
+	}
+	assert.Equal(t, []string{"buy_product_3", "buy_product_1", "buy_product_2"}, callbacks)
+}
+
 func TestHandleBuyProduct_NotConfigured(t *testing.T) {
 	t.Parallel()
 

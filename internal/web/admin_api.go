@@ -29,11 +29,12 @@ const adminAPIMaxBody = 4096
 type adminAPI struct {
 	svc        *service.AdminService
 	builderSvc *service.BuilderService
+	tariffSvc  *service.TariffService
 	actor      string
 }
 
-func newAdminAPI(svc *service.AdminService, builderSvc *service.BuilderService, actor string) http.Handler {
-	return &adminAPI{svc: svc, builderSvc: builderSvc, actor: actor}
+func newAdminAPI(svc *service.AdminService, builderSvc *service.BuilderService, tariffSvc *service.TariffService, actor string) http.Handler {
+	return &adminAPI{svc: svc, builderSvc: builderSvc, tariffSvc: tariffSvc, actor: actor}
 }
 
 func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -61,6 +62,10 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.get(w, r, func(w http.ResponseWriter, r *http.Request) { a.user(w, r, telegramID) })
 	case len(segments) == 1 && segments[0] == "audit":
 		a.get(w, r, a.audit)
+	case segments[0] == "tariffs":
+		a.routeTariffs(w, r, segments)
+	case len(segments) == 1 && segments[0] == "plans":
+		a.get(w, r, a.plansList)
 	case len(segments) == 2 && segments[0] == "subscriptions":
 		id, ok := parseAdminID(segments[1])
 		if !ok {

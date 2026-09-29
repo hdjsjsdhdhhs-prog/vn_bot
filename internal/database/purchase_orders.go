@@ -94,7 +94,7 @@ func (s *Service) ReadPurchaseCatalog(ctx context.Context, telegramID int64) (*P
 		// Same base catalogue as ListActiveProducts, with associations needed
 		// only by the application policy. No source or external API calls.
 		return tx.Preload("Plan").Where("is_active = ? AND price_cents > 0", true).
-			Order("price_cents ASC, id ASC").Find(&catalog.Products).Error
+			Order(ProductCatalogOrder).Find(&catalog.Products).Error
 	})
 	return catalog, err
 }

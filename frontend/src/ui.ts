@@ -1,5 +1,5 @@
 import type { Offer, Order, Subscription } from './api';
-import { errorText } from './api';
+import { catalogOrder, errorText } from './api';
 import type { Store, Resource } from './store';
 import { safeHTTPS } from './telegram';
 import type { WebApp } from './telegram';
@@ -73,18 +73,49 @@ function subscriptionCard(sub: Subscription | null, details = false) {
   if (!details) card.append(link('Подробнее о подписке', 'subscriptions', true));
   return card;
 }
-function offerCard(offer: Offer) {
+// Card presentation from the admin tariff editor. Every field is optional:
+// blank values mean "not configured" and the card keeps its default copy.
+const badgeOf = (offer: Offer) => (offer.badge ?? '').trim();
+const descriptionOf = (offer: Offer) => (offer.description ?? '').trim();
+const featuresOf = (offer: Offer) => (offer.features ?? []).map(item => item.trim()).filter(Boolean);
+function featureList(items: string[]) {
+  const list = el('ul', 'offer-features');
+  for (const item of items) list.append(el('li', '', item));
+  return list;
+}
+export function offerCard(offer: Offer) {
   const card = el('a', 'card offer-card'); card.href = `#product/${offer.offer_id}`;
-  card.append(el('span', 'offer-icon', '↗'), el('h2', '', offer.name), el('p', 'muted', `${offer.duration_days} дней доступа`));
+  const badge = badgeOf(offer);
+  if (badge) {
+    const top = el('div', 'offer-top'); top.append(el('span', 'offer-icon', '↗'), el('span', 'badge offer-badge', badge)); card.append(top);
+  } else card.append(el('span', 'offer-icon', '↗'));
+  card.append(el('h2', '', offer.name), el('p', 'muted', `${offer.duration_days} дней доступа`));
+  const description = descriptionOf(offer);
+  if (description) card.append(el('p', 'offer-description', description));
+  const features = featuresOf(offer);
+  if (features.length) card.append(featureList(features));
   const row = el('div', 'row'); row.append(el('strong', 'price', price(offer)), el('span', 'arrow', '→')); card.append(row);
   if (offer.currency !== 'XTR') card.append(el('p', 'small muted', 'Оплата Stars недоступна'));
   return card;
 }
-function catalog(offers: Offer[]) {
+export function catalog(offers: Offer[]) {
   const node = el('div', 'stack');
   if (!offers.length) return message('Предложения появятся здесь', 'Сейчас для вашей подписки нет доступных предложений. Проверьте статус подписки или вернитесь чуть позже.');
-  for (const offer of offers) node.append(offerCard(offer));
+  for (const offer of catalogOrder(offers)) node.append(offerCard(offer));
   return node;
+}
+export function productDetail(offer: Offer) {
+  const card = el('section', 'card product-detail');
+  const badge = badgeOf(offer);
+  card.append(el('span', badge ? 'badge offer-badge' : 'badge', badge || 'Доступ по подписке'), el('h2', '', offer.name), el('p', 'price large', price(offer)), el('p', 'muted', `${offer.duration_days} дней · разовая покупка`));
+  if (offer.available_until) card.append(el('p', 'small muted', `Предложение доступно до ${date(offer.available_until)}`));
+  const description = descriptionOf(offer);
+  if (description) card.append(el('p', 'offer-description', description));
+  card.append(el('div', 'divider'));
+  const features = featuresOf(offer);
+  if (features.length) card.append(featureList(features));
+  else card.append(el('p', '', '✦ Подключение через ваш личный кабинет'), el('p', '', '✦ Без автоматических списаний'));
+  return card;
 }
 
 export function mount(root: HTMLElement, store: Store, telegram?: WebApp) {
@@ -132,10 +163,7 @@ export function mount(root: HTMLElement, store: Store, telegram?: WebApp) {
       main.append(resource(store.offers, offers => {
         const offer = offers.find(item => item.offer_id === route.split('/')[1]);
         if (!offer) return message('Предложение недоступно', 'Вернитесь в каталог и обновите список.');
-        const card = el('section', 'card product-detail');
-        card.append(el('span', 'badge', 'Доступ по подписке'), el('h2', '', offer.name), el('p', 'price large', price(offer)), el('p', 'muted', `${offer.duration_days} дней · разовая покупка`));
-        if (offer.available_until) card.append(el('p', 'small muted', `Предложение доступно до ${date(offer.available_until)}`));
-        card.append(el('div', 'divider'), el('p', '', '✦ Подключение через ваш личный кабинет'), el('p', '', '✦ Без автоматических списаний'));
+        const card = productDetail(offer);
         if (offer.currency === 'XTR') card.append(button(store.busy ? 'Создаём покупку…' : 'Перейти к покупке', () => { void store.buy(offer).then(order => { if (order) go(`purchase/${order.order_id}`); }); }, false, store.busy));
         else card.append(el('p', 'muted', 'Это предложение не поддерживает Stars. Выберите предложение с ценой в звёздах.'));
         return card;

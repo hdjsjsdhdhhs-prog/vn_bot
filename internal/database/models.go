@@ -301,8 +301,20 @@ type Product struct {
 	PriceCents   int64      `gorm:"not null;column:price_cents"`
 	Currency     string     `gorm:"size:3;not null;default:RUB;column:currency"`
 	IsActive     bool       `gorm:"not null;default:true;column:is_active"`
-	CreatedAt    time.Time  `gorm:"autoCreateTime;column:created_at"`
-	UpdatedAt    time.Time  `gorm:"autoUpdateTime;column:updated_at"`
+	// Card presentation (migration 046). Display only: never part of the
+	// immutable purchase terms. Features is a JSON array of strings.
+	Description string `gorm:"type:text;not null;default:'';column:description"`
+	Features    string `gorm:"type:text;not null;default:'[]';column:features"`
+	Badge       string `gorm:"size:32;not null;default:'';column:badge"`
+	// SortOrder is the catalogue position (ascending; ties by price, then ID).
+	SortOrder int `gorm:"not null;default:0;column:sort_order"`
+	// Version is incremented on every admin change (optimistic locking).
+	Version int `gorm:"not null;default:1;column:version"`
+	// PreviousID is the product this row replaced when the admin changed the
+	// purchase terms of a product already referenced by orders/subscriptions.
+	PreviousID *uint     `gorm:"column:previous_id"`
+	CreatedAt  time.Time `gorm:"autoCreateTime;column:created_at"`
+	UpdatedAt  time.Time `gorm:"autoUpdateTime;column:updated_at"`
 
 	Plan   *Plan   `gorm:"foreignKey:PlanID"`
 	Orders []Order `gorm:"foreignKey:ProductID"`

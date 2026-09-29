@@ -8,8 +8,14 @@ import (
 	"gorm.io/gorm"
 )
 
+// ProductCatalogOrder is the catalogue order shared by the bot, the Mini App
+// and the admin tariff list: admin position first, then price and ID as
+// deterministic tie-breakers (all rows start at sort_order 0 after 046, which
+// preserves the historical price order).
+const ProductCatalogOrder = "products.sort_order ASC, products.price_cents ASC, products.id ASC"
+
 // ListActiveProducts returns active paid products belonging to active plans,
-// sorted deterministically by price and ID.
+// in catalogue order (ProductCatalogOrder).
 func (s *Service) ListActiveProducts(ctx context.Context) ([]Product, error) {
 	var products []Product
 
@@ -18,7 +24,7 @@ func (s *Service) ListActiveProducts(ctx context.Context) ([]Product, error) {
 		Select("products.*").
 		Joins("JOIN plans ON plans.id = products.plan_id").
 		Where("products.is_active = ? AND products.price_cents > ? AND plans.is_active = ?", true, 0, true).
-		Order("products.price_cents ASC, products.id ASC").
+		Order(ProductCatalogOrder).
 		Find(&products)
 	if result.Error != nil {
 		return nil, fmt.Errorf("failed to list active products: %w", result.Error)
