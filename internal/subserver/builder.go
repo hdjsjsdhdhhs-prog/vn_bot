@@ -34,6 +34,20 @@ type builderEntry struct {
 	name        string
 	fingerprint string
 	country     string
+	protocol    string
+	// xray marks a full Xray config: it has no share link (link == "") and
+	// is renamed through its "remarks" field.
+	xray bool
+}
+
+// builderParseStats counts what parseBuilderSource could not turn into an
+// entry, so the catalogue sync can report a partial result.
+type builderParseStats struct {
+	// skipped are JSON/Clash servers that could not be parsed.
+	skipped int
+	// nonServerLines are non-empty lines of a link list that are neither a
+	// share link nor a "#" comment.
+	nonServerLines int
 }
 
 // builderSource is the parsed state of one successfully fetched source.
@@ -273,26 +287,66 @@ func sourceCatalogueCountries(ctx context.Context, db interfaces.SubscriptionRep
 // detection/normalization as the legacy pipeline and turns every server into
 // a builderEntry with a name, fingerprint and country.
 func parseBuilderSource(subID string, source database.ProviderSource, resp *NodeResponse, countries map[string]string) builderSource {
+	out, _ := parseBuilderSourceCounted(subID, source, resp, countries)
+	return out
+}
+
+// parseBuilderSourceCounted is parseBuilderSource that also reports what could
+// not be parsed. JSON elements are full Xray configs (served as raw JSON) or
+// flat 3x-ui server objects (converted to a share link for identity/naming).
+func parseBuilderSourceCounted(subID string, source database.ProviderSource, resp *NodeResponse, countries map[string]string) (builderSource, builderParseStats) {
 	headers := resp.Headers
 	if headers == nil {
 		headers = map[string]string{}
 	}
 
+	format := DetectFormat(resp.Body)
 	agg := aggregatedSources{allJSON: true}
-	aggregateFormat(&agg, DetectFormat(resp.Body), resp.Body, database.Node{ID: source.ID, Name: source.Name}, subID)
+	aggregateFormat(&agg, format, resp.Body, database.Node{ID: source.ID, Name: source.Name}, subID)
 
 	out := builderSource{source: source, headers: headers, allJSON: agg.allJSON && len(agg.jsonConfigs) > 0}
+	var stats builderParseStats
 
 	for _, link := range agg.items {
+		if !isValidServer(link) && !strings.HasPrefix(link, "#") {
+			stats.nonServerLines++
+		}
 		out.entries = append(out.entries, newBuilderEntry(source.ID, link, nil, EntryName(link), countries))
 	}
 
 	for _, raw := range agg.jsonConfigs {
+		if info, ok := parseXrayFullConfig(raw); ok {
+			// The link is only used when the builder answers with share
+			// links (mixed sources); identity stays the Xray fingerprint.
+			link, _ := xrayPrimaryLink(raw, info.name)
+			out.entries = append(out.entries, builderEntry{
+				sourceID:    source.ID,
+				link:        link,
+				raw:         raw,
+				name:        info.name,
+				fingerprint: info.fingerprint,
+				country:     database.EntryCountry(countries[info.fingerprint], info.name),
+				protocol:    info.protocol,
+				xray:        true,
+			})
+
+			continue
+		}
+
+		if isXrayFullConfig(raw) {
+			// A full Xray config without any usable proxy outbound.
+			stats.skipped++
+
+			continue
+		}
+
 		link, err := ConvertSingleJSONToLink(raw)
 		if err != nil {
 			logger.Debug("Skipping unconvertible builder JSON entry",
 				zap.String("sub_id", subID),
 				zap.Uint("provider_source_id", source.ID))
+
+			stats.skipped++
 
 			continue
 		}
@@ -309,7 +363,19 @@ func parseBuilderSource(subID string, source database.ProviderSource, resp *Node
 		out.entries = append(out.entries, newBuilderEntry(source.ID, link, raw, name, countries))
 	}
 
-	return out
+	disambiguateXrayFingerprints(out.entries, countries)
+
+	if stats.skipped > 0 || stats.nonServerLines > 0 {
+		logger.Warn("Provider source response partially parsed",
+			zap.String("sub_id", subID),
+			zap.Uint("provider_source_id", source.ID),
+			zap.String("format", format.String()),
+			zap.Int("entries", len(out.entries)),
+			zap.Int("skipped", stats.skipped),
+			zap.Int("non_server_lines", stats.nonServerLines))
+	}
+
+	return out, stats
 }
 
 func newBuilderEntry(sourceID uint, link string, raw json.RawMessage, name string, countries map[string]string) builderEntry {
@@ -322,6 +388,7 @@ func newBuilderEntry(sourceID uint, link string, raw json.RawMessage, name strin
 		name:        name,
 		fingerprint: fp,
 		country:     database.EntryCountry(countries[fp], name),
+		protocol:    linkProtocol(link),
 	}
 }
 
@@ -477,7 +544,22 @@ func assembleBuilderAggregate(b *database.SubscriptionBuilder, parsed []builderS
 
 	for _, pick := range picks {
 		if agg.allJSON && pick.entry.raw != nil {
-			agg.jsonConfigs = append(agg.jsonConfigs, renameJSONConfig(pick.entry.raw, pick.name))
+			if pick.entry.xray {
+				agg.jsonConfigs = append(agg.jsonConfigs, renameXrayConfig(pick.entry.raw, pick.name))
+			} else {
+				agg.jsonConfigs = append(agg.jsonConfigs, renameJSONConfig(pick.entry.raw, pick.name))
+			}
+
+			continue
+		}
+
+		if pick.entry.link == "" {
+			// A full Xray config whose primary outbound cannot be expressed
+			// as a share link; it is only served when every source is JSON.
+			logger.Debug("Skipping full Xray config in a share-link response",
+				zap.Uint("builder_id", b.ID),
+				zap.Uint("provider_source_id", pick.entry.sourceID))
+
 			continue
 		}
 

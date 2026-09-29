@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"gorm.io/gorm"
@@ -107,12 +108,73 @@ func (s *Service) PreviewBuilder(ctx context.Context, builderID uint) (*PreviewB
 	}
 
 	linked := make(map[uint]bool, len(b.Sources))
+	sourceIDs := make([]uint, 0, len(b.Sources))
 	for _, src := range b.Sources {
 		linked[src.SourceID] = true
+		sourceIDs = append(sourceIDs, src.SourceID)
 	}
 
+	// Same as /sub: disabled or unusable sources are skipped.
+	usable := make(map[uint]bool, len(sourceIDs))
+	if len(sourceIDs) > 0 {
+		var sources []ProviderSource
+		if err := s.db.WithContext(ctx).Where("id IN ?", sourceIDs).Find(&sources).Error; err != nil {
+			return nil, fmt.Errorf("preview load sources: %w", err)
+		}
+		for i := range sources {
+			if _, _, err := sources[i].RequestConfiguration(); err == nil {
+				usable[sources[i].ID] = true
+			}
+		}
+	}
+
+	// Same as /sub: an entry (source + fingerprint) is served once, at its
+	// first position.
+	seen := make(map[string]bool)
 	pos := 0
-	for _, item := range b.Items {
+	addMatched := func(itemID uint, kind string, sourceID uint, entry *ProviderSourceEntry, name string) {
+		key := fmt.Sprintf("%d|%s", sourceID, entry.Fingerprint)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		result.Items = append(result.Items, PreviewItem{
+			ItemID: itemID, Kind: kind, SourceID: sourceID, Entry: entry,
+			DisplayName: name, Status: FingerprintStatusMatched, Position: pos,
+		})
+		pos++
+		result.Total++
+	}
+
+	// Without rules /sub merges every entry of every linked source in source order.
+	if len(b.Items) == 0 {
+		for _, link := range b.Sources {
+			if !usable[link.SourceID] {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("source %d is disabled or unusable, skipped", link.SourceID))
+				continue
+			}
+			entries, err := s.GetSourceEntries(ctx, link.SourceID, "*")
+			if err != nil {
+				return nil, fmt.Errorf("preview source %d: %w", link.SourceID, err)
+			}
+			for i := range entries {
+				addMatched(0, PreviewKindSource, link.SourceID, &entries[i], entries[i].OriginalName)
+			}
+		}
+		return result, nil
+	}
+
+	items := make([]SubscriptionBuilderItem, len(b.Items))
+	copy(items, b.Items)
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Position != items[j].Position {
+			return items[i].Position < items[j].Position
+		}
+		return items[i].ID < items[j].ID
+	})
+
+	for _, item := range items {
 		if !item.Enabled {
 			continue
 		}
@@ -120,6 +182,11 @@ func (s *Service) PreviewBuilder(ctx context.Context, builderID uint) (*PreviewB
 		if !linked[item.SourceID] {
 			result.Warnings = append(result.Warnings,
 				fmt.Sprintf("item %d: source %d is not linked to the builder, rule ignored", item.ID, item.SourceID))
+			continue
+		}
+		if !usable[item.SourceID] {
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("item %d: source %d is disabled or unusable, rule skipped", item.ID, item.SourceID))
 			continue
 		}
 		switch item.Kind {
@@ -130,34 +197,28 @@ func (s *Service) PreviewBuilder(ctx context.Context, builderID uint) (*PreviewB
 			if err != nil {
 				return nil, fmt.Errorf("preview country item %d: %w", item.ID, err)
 			}
-			entries := make([]ProviderSourceEntry, 0, len(all))
 			for i := range all {
-				if CountryMatches(all[i].CountryCode, all[i].OriginalName, item.CountryCode) {
-					entries = append(entries, all[i])
+				if !CountryMatches(all[i].CountryCode, all[i].OriginalName, item.CountryCode) {
+					continue
 				}
-			}
-			for i := range entries {
-				name := entries[i].OriginalName
+				name := all[i].OriginalName
 				if item.CustomName != nil && *item.CustomName != "" {
 					name = *item.CustomName
 				}
-				result.Items = append(result.Items, PreviewItem{
-					ItemID:      item.ID,
-					Kind:        item.Kind,
-					SourceID:    item.SourceID,
-					Entry:       &entries[i],
-					DisplayName: name,
-					Status:      FingerprintStatusMatched,
-					Position:    pos,
-				})
-				pos++
-				result.Total++
+				addMatched(item.ID, item.Kind, item.SourceID, &all[i], name)
 			}
 
 		case BuilderItemKindNode:
 			res, err := s.ResolveNodeItem(ctx, item)
 			if err != nil {
 				return nil, fmt.Errorf("preview node item %d: %w", item.ID, err)
+			}
+			if res.Entry != nil && (res.Status == FingerprintStatusMatched || res.Status == FingerprintStatusFallback) {
+				key := fmt.Sprintf("%d|%s", item.SourceID, res.Entry.Fingerprint)
+				if seen[key] {
+					continue // already served by an earlier rule, like /sub
+				}
+				seen[key] = true
 			}
 			pi := PreviewItem{
 				ItemID:   item.ID,
@@ -197,3 +258,7 @@ func (s *Service) PreviewBuilder(ctx context.Context, builderID uint) (*PreviewB
 
 	return result, nil
 }
+
+// PreviewKindSource marks preview entries merged from a source because the
+// builder has no rules (every entry of every linked source is served).
+const PreviewKindSource = "source"

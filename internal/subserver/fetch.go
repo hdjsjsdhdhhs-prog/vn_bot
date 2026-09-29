@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -130,12 +132,35 @@ func FetchFromNode(ctx context.Context, url string) (*NodeResponse, error) {
 // sentinel so URLs and credential-bearing request details cannot escape into
 // client-visible errors or application logs.
 func FetchFromProviderSource(ctx context.Context, source database.ProviderSource) (*NodeResponse, error) {
+	resp, failure := fetchProviderSource(ctx, source)
+	if failure != "" {
+		return nil, ErrProviderSourceUnavailable
+	}
+
+	return resp, nil
+}
+
+// Stable, credential-free fetch failure codes reported to the admin catalogue
+// sync. They never contain the upstream URL, headers or response content.
+const (
+	fetchFailInvalidConfig  = "invalid_config"
+	fetchFailTimeout        = "timeout"
+	fetchFailUnreachable    = "unreachable"
+	fetchFailReadError      = "read_error"
+	fetchFailTooLarge       = "too_large"
+	fetchFailCredentialEcho = "credential_echo"
+)
+
+// fetchProviderSource performs the provider source request. On failure it
+// returns a stable failure code (see fetchFail*, or "http_<status>") and logs
+// only the source ID.
+func fetchProviderSource(ctx context.Context, source database.ProviderSource) (*NodeResponse, string) {
 	requestHeaders, sensitiveValues, err := validateProviderSourceConfiguration(source)
 	if err != nil {
 		logger.Warn("Provider source configuration is unusable",
 			zap.Uint("provider_source_id", source.ID))
 
-		return nil, ErrProviderSourceUnavailable
+		return nil, fetchFailInvalidConfig
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source.SubscriptionURL, nil)
@@ -143,7 +168,7 @@ func FetchFromProviderSource(ctx context.Context, source database.ProviderSource
 		logger.Warn("Failed to create provider source request",
 			zap.Uint("provider_source_id", source.ID))
 
-		return nil, ErrProviderSourceUnavailable
+		return nil, fetchFailInvalidConfig
 	}
 
 	for key, value := range requestHeaders {
@@ -166,14 +191,18 @@ func FetchFromProviderSource(ctx context.Context, source database.ProviderSource
 		logger.Warn("Provider source request failed",
 			zap.Uint("provider_source_id", source.ID))
 
-		return nil, ErrProviderSourceUnavailable
+		if ctx.Err() != nil || isTimeout(err) {
+			return nil, fetchFailTimeout
+		}
+
+		return nil, fetchFailUnreachable
 	}
 
 	if resp == nil || resp.Body == nil {
 		logger.Warn("Provider source returned no response body",
 			zap.Uint("provider_source_id", source.ID))
 
-		return nil, ErrProviderSourceUnavailable
+		return nil, fetchFailReadError
 	}
 
 	defer func() {
@@ -188,7 +217,7 @@ func FetchFromProviderSource(ctx context.Context, source database.ProviderSource
 			zap.Uint("provider_source_id", source.ID),
 			zap.Int("status", resp.StatusCode))
 
-		return nil, ErrProviderSourceUnavailable
+		return nil, fmt.Sprintf("http_%d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseSize+1))
@@ -196,7 +225,11 @@ func FetchFromProviderSource(ctx context.Context, source database.ProviderSource
 		logger.Warn("Failed to read provider source response",
 			zap.Uint("provider_source_id", source.ID))
 
-		return nil, ErrProviderSourceUnavailable
+		if ctx.Err() != nil || isTimeout(err) {
+			return nil, fetchFailTimeout
+		}
+
+		return nil, fetchFailReadError
 	}
 
 	if len(body) > config.MaxResponseSize {
@@ -204,14 +237,14 @@ func FetchFromProviderSource(ctx context.Context, source database.ProviderSource
 			zap.Uint("provider_source_id", source.ID),
 			zap.Int("limit", config.MaxResponseSize))
 
-		return nil, ErrProviderSourceUnavailable
+		return nil, fetchFailTooLarge
 	}
 
 	if containsSensitiveProviderValue(string(body), sensitiveValues) {
 		logger.Warn("Provider source response contained server-side credentials",
 			zap.Uint("provider_source_id", source.ID))
 
-		return nil, ErrProviderSourceUnavailable
+		return nil, fetchFailCredentialEcho
 	}
 
 	responseHeaders := make(map[string]string)
@@ -240,7 +273,13 @@ func FetchFromProviderSource(ctx context.Context, source database.ProviderSource
 		responseHeaders[lowerKey] = values[0]
 	}
 
-	return &NodeResponse{Body: body, Headers: responseHeaders}, nil
+	return &NodeResponse{Body: body, Headers: responseHeaders}, ""
+}
+
+// isTimeout reports whether err is a network timeout.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // validateProviderSourceConfiguration validates fields required by the runtime

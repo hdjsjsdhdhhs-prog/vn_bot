@@ -326,51 +326,8 @@ func (s *Service) SetSubscriptionBuilder(ctx context.Context, meta AdminConfigMe
 // (soft-delete). Entries in the list are upserted by fingerprint.
 // lastSyncStatus and lastSyncError are written to the provider_sources row.
 func (s *Service) UpsertSourceEntries(ctx context.Context, sourceID uint, entries []ProviderSourceEntry, syncStatus, syncError string) error {
-	now := time.Now().UTC()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Mark all existing entries as absent; we'll flip present=true for
-		// those that appear in the new list.
-		if err := tx.Model(&ProviderSourceEntry{}).
-			Where("source_id = ?", sourceID).
-			Updates(map[string]any{"present": false}).Error; err != nil {
-			return fmt.Errorf("mark entries absent: %w", err)
-		}
-
-		for i := range entries {
-			entries[i].SourceID = sourceID
-			entries[i].Present = true
-			entries[i].LastSeenAt = now
-			entries[i].UpstreamPosition = i
-
-			// Upsert by (source_id, fingerprint).
-			var existing ProviderSourceEntry
-			err := tx.Where("source_id = ? AND fingerprint = ?", sourceID, entries[i].Fingerprint).
-				First(&existing).Error
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				if err2 := tx.Create(&entries[i]).Error; err2 != nil {
-					return fmt.Errorf("insert source entry %q: %w", entries[i].Fingerprint, err2)
-				}
-			} else if err != nil {
-				return fmt.Errorf("lookup source entry %q: %w", entries[i].Fingerprint, err)
-			} else {
-				entries[i].ID = existing.ID
-				if err2 := tx.Save(&entries[i]).Error; err2 != nil {
-					return fmt.Errorf("update source entry %q: %w", entries[i].Fingerprint, err2)
-				}
-			}
-		}
-
-		// Update source sync metadata.
-		if err := tx.Model(&ProviderSource{}).Where("id = ?", sourceID).
-			Updates(map[string]any{
-				"last_sync_at":     now,
-				"last_sync_status": syncStatus,
-				"last_sync_error":  syncError,
-			}).Error; err != nil {
-			return fmt.Errorf("update source sync metadata: %w", err)
-		}
-		return nil
-	})
+	_, err := s.SyncSourceEntries(ctx, sourceID, entries, syncStatus, syncError)
+	return err
 }
 
 // ---------------------------------------------------------------------------

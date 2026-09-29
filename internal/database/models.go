@@ -95,10 +95,10 @@ type Subscription struct {
 	// (migration 045). NULL falls back to the plan's default builder.
 	SubscriptionBuilderID *uint `gorm:"column:subscription_builder_id;index"`
 	StartedAt             *time.Time
-	PricePaidCents   int64   `gorm:"default:0"`
-	Currency         *string `gorm:"size:3"`
-	Devices          string  `gorm:"type:text;default:'[]'"` // JSON array of {header_key: value} device entries
-	Ips              string  `gorm:"type:text;default:'[]'"` // JSON array of {ip: timestamp} entries
+	PricePaidCents        int64   `gorm:"default:0"`
+	Currency              *string `gorm:"size:3"`
+	Devices               string  `gorm:"type:text;default:'[]'"` // JSON array of {header_key: value} device entries
+	Ips                   string  `gorm:"type:text;default:'[]'"` // JSON array of {ip: timestamp} entries
 	// LastRequest — дата/время последнего запроса подписки через субсервер (/sub/:id).
 	// Обновляется best-effort при каждом запросе клиента. NULL до первого запроса.
 	LastRequest   *time.Time `gorm:"index"`
@@ -179,31 +179,34 @@ type ProviderSource struct {
 // the last catalogue refresh. Only metadata is stored; share links with
 // credentials are always fetched live from the upstream URL.
 // (migration 045)
+//
+// The JSON form is the admin wire shape (snake_case). Source is never
+// serialized: ProviderSource carries the upstream URL and credentials.
 type ProviderSourceEntry struct {
-	ID               uint      `gorm:"primaryKey;column:id"`
-	SourceID         uint      `gorm:"not null;index;column:source_id"`
-	Fingerprint      string    `gorm:"size:64;not null;column:fingerprint"`
-	OriginalName     string    `gorm:"size:255;not null;default:'';column:original_name"`
-	Protocol         string    `gorm:"size:32;not null;default:'';column:protocol"`
-	CountryCode      string    `gorm:"size:2;not null;default:'';column:country_code"`
-	UpstreamPosition int       `gorm:"not null;default:0;column:upstream_position"`
-	Present          bool      `gorm:"not null;default:true;column:present"`
-	LastSeenAt       time.Time `gorm:"not null;column:last_seen_at"`
+	ID               uint      `gorm:"primaryKey;column:id" json:"id"`
+	SourceID         uint      `gorm:"not null;index;column:source_id" json:"source_id"`
+	Fingerprint      string    `gorm:"size:64;not null;column:fingerprint" json:"fingerprint"`
+	OriginalName     string    `gorm:"size:255;not null;default:'';column:original_name" json:"original_name"`
+	Protocol         string    `gorm:"size:32;not null;default:'';column:protocol" json:"protocol"`
+	CountryCode      string    `gorm:"size:2;not null;default:'';column:country_code" json:"country_code"`
+	UpstreamPosition int       `gorm:"not null;default:0;column:upstream_position" json:"upstream_position"`
+	Present          bool      `gorm:"not null;default:true;column:present" json:"present"`
+	LastSeenAt       time.Time `gorm:"not null;column:last_seen_at" json:"last_seen_at"`
 
-	Source *ProviderSource `gorm:"foreignKey:SourceID"`
+	Source *ProviderSource `gorm:"foreignKey:SourceID" json:"-"`
 }
 
 // SubscriptionBuilder is an output configuration that selects and orders
 // entries from one or more ProviderSources. Plans reference a default builder;
 // individual subscriptions may override it. (migration 045)
 type SubscriptionBuilder struct {
-	ID           uint      `gorm:"primaryKey;column:id"`
-	Name         string    `gorm:"size:128;not null;uniqueIndex;column:name"`
-	Description  string    `gorm:"type:text;not null;default:'';column:description"`
-	Enabled      bool      `gorm:"not null;default:true;column:enabled"`
-	ProfileTitle string    `gorm:"size:128;not null;default:'';column:profile_title"`
-	SupportURL   string    `gorm:"size:512;not null;default:'';column:support_url"`
-	Announce     string    `gorm:"size:512;not null;default:'';column:announce"`
+	ID           uint   `gorm:"primaryKey;column:id"`
+	Name         string `gorm:"size:128;not null;uniqueIndex;column:name"`
+	Description  string `gorm:"type:text;not null;default:'';column:description"`
+	Enabled      bool   `gorm:"not null;default:true;column:enabled"`
+	ProfileTitle string `gorm:"size:128;not null;default:'';column:profile_title"`
+	SupportURL   string `gorm:"size:512;not null;default:'';column:support_url"`
+	Announce     string `gorm:"size:512;not null;default:'';column:announce"`
 	// Version is incremented on every update and used for optimistic locking.
 	Version   int       `gorm:"not null;default:1;column:version"`
 	CreatedAt time.Time `gorm:"not null;autoCreateTime;column:created_at"`

@@ -148,6 +148,14 @@ func initServices(cfg *config.Config, dbService *database.Service, deps *runtime
 	handler.SetOrderService(orderService)
 	adminService := service.NewAdminService(dbService, subService, syncSvc)
 	builderService := service.NewBuilderService(dbService)
+	// Source catalogue sync fetches and parses on the server with the /sub parser.
+	builderService.SetCatalogueFetcher(func(ctx context.Context, src database.ProviderSource) (*service.FetchedCatalogue, error) {
+		c, err := subserver.FetchSourceCatalogue(ctx, src)
+		if err != nil {
+			return nil, err
+		}
+		return &service.FetchedCatalogue{Format: c.Format, Entries: c.Entries, Skipped: c.Skipped, Duplicates: c.Duplicates}, nil
+	})
 
 	return &appServices{subService: subService, subServer: subServer, handler: handler, orderService: orderService, syncService: syncSvc, adminService: adminService, builderService: builderService}
 }

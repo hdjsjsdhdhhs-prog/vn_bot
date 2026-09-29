@@ -213,6 +213,8 @@ export function errorText(error: unknown): string {
     case 'invalid_response': return 'Не удалось прочитать ответ сервера.';
     case 'invalid_request': return 'Сервер отклонил параметры запроса. Измените условия поиска.';
     case 'service_unavailable': return 'Сервис временно недоступен. Попробуйте позже.';
+    case 'invalid_source': return 'Проверьте параметры источника.';
+    case 'sync_in_progress': return 'Источник уже синхронизируется. Дождитесь завершения.';
     default: return 'Не удалось выполнить действие. Попробуйте ещё раз.';
   }
 }
@@ -465,9 +467,9 @@ export class AdminApi {
     return { authenticated: payload.authenticated };
   }
 
-  async #send(method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE', path: string, body?: string): Promise<unknown> {
+  async #send(method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE', path: string, body?: string, timeoutMs = REQUEST_TIMEOUT_MS): Promise<unknown> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (method !== 'GET' && this.#csrf) headers[CSRF_HEADER] = this.#csrf;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -509,10 +511,12 @@ export class AdminApi {
     return data as unknown as AdminSource;
   }
 
-  async createSource(input: CreateSourceInput): Promise<AdminSource> {
-    const data = await this.#send('POST', '/admin/api/sources', JSON.stringify(input));
-    if (!isRecord(data)) throw new ApiError('invalid_response');
-    return data as unknown as AdminSource;
+  /** Creates a source; the server runs the initial catalogue sync right away. */
+  async createSource(input: CreateSourceInput): Promise<SourceCreated> {
+    const data = await this.#send('POST', '/admin/api/sources', JSON.stringify(input), SOURCE_SYNC_TIMEOUT_MS);
+    if (!isRecord(data) || !isSource(data.source)) throw new ApiError('invalid_response');
+    const sync = data.sync === null || data.sync === undefined ? null : parseSyncResult(data.sync);
+    return { source: data.source, sync };
   }
 
   async updateSource(id: number, input: UpdateSourceInput): Promise<AdminSource> {
@@ -533,17 +537,27 @@ export class AdminApi {
     return data as unknown as AdminSource;
   }
 
+  /** Present entries of a source (optionally one country), in upstream order. */
   async listSourceEntries(id: number, country = '*'): Promise<readonly SourceEntry[]> {
     const params = `?country=${encodeURIComponent(country)}`;
     const data = await this.#send('GET', `/admin/api/sources/${id}/entries${params}`);
-    if (!isRecord(data) || !Array.isArray(data.entries)) throw new ApiError('invalid_response');
-    return data.entries as SourceEntry[];
+    if (!isRecord(data) || !Array.isArray(data.entries) || !data.entries.every(isSourceEntry)) throw new ApiError('invalid_response');
+    return data.entries;
   }
 
-  async refreshSource(id: number, input: RefreshSourceInput): Promise<AdminSource> {
-    const data = await this.#send('POST', `/admin/api/sources/${id}/refresh`, JSON.stringify(input));
-    if (!isRecord(data)) throw new ApiError('invalid_response');
-    return data as unknown as AdminSource;
+  /** Every catalogue entry of a source, including those that disappeared upstream. */
+  async listAllSourceEntries(id: number): Promise<readonly SourceEntry[]> {
+    const data = await this.#send('GET', `/admin/api/sources/${id}/entries?all=1`);
+    if (!isRecord(data) || !Array.isArray(data.entries) || !data.entries.every(isSourceEntry)) throw new ApiError('invalid_response');
+    return data.entries;
+  }
+
+  /**
+   * Server-side catalogue sync: the backend fetches and parses the upstream.
+   * A failed fetch is a result with status "error", not a thrown error.
+   */
+  async syncSource(id: number): Promise<SourceSyncResult> {
+    return parseSyncResult(await this.#send('POST', `/admin/api/sources/${id}/refresh`, '{}', SOURCE_SYNC_TIMEOUT_MS));
   }
 
   // ---------------------------------------------------------------------------
@@ -714,17 +728,81 @@ export class AdminApi {
 // Builder / Source types (used by api methods above)
 // =============================================================================
 
+/** database.SourceCatalogueStats: the present catalogue of ONE source. */
+export interface SourceCatalogue {
+  readonly entries: number;
+  readonly countries: number;
+  readonly no_country: number;
+  readonly absent: number;
+  readonly by_country: readonly { readonly code: string; readonly count: number }[];
+  readonly protocols: Readonly<Record<string, number>>;
+}
+
 export interface AdminSource {
   readonly id: number;
   readonly name: string;
+  /** Expected response format: auto | json | base64 | plain | clash. */
   readonly type: string;
   readonly description: string;
   readonly enabled: boolean;
   readonly last_sync_at: string | null;
+  /** '' (never synced) | ok | partial | error. */
   readonly last_sync_status: string;
+  /** Stable code: failure code (error) or "skipped:N" (partial). */
   readonly last_sync_error: string;
+  readonly catalogue: SourceCatalogue;
   readonly created_at: string;
   readonly updated_at: string;
+}
+
+/** service.SourceSyncResult. */
+export interface SourceSyncResult {
+  readonly source: AdminSource;
+  readonly status: 'ok' | 'partial' | 'error';
+  readonly error: string;
+  readonly format: string;
+  readonly added: number;
+  readonly updated: number;
+  readonly removed: number;
+  readonly total: number;
+  readonly skipped: number;
+  readonly duplicates: number;
+}
+
+export interface SourceCreated {
+  readonly source: AdminSource;
+  /** Initial sync; null only when the server could not run it. */
+  readonly sync: SourceSyncResult | null;
+}
+
+/** Server sync timeout (30 s) plus transport margin. */
+const SOURCE_SYNC_TIMEOUT_MS = 35_000;
+
+function isCatalogue(v: unknown): v is SourceCatalogue {
+  return isRecord(v) && isCount(v.entries) && isCount(v.countries) && isCount(v.no_country) && isCount(v.absent) &&
+    Array.isArray(v.by_country) && v.by_country.every(c => isRecord(c) && typeof c.code === 'string' && isCount(c.count)) &&
+    isRecord(v.protocols) && Object.values(v.protocols).every(isCount);
+}
+
+function isSource(v: unknown): v is AdminSource {
+  return isRecord(v) && isCount(v.id) && typeof v.name === 'string' && typeof v.type === 'string' &&
+    typeof v.enabled === 'boolean' && (v.last_sync_at === null || typeof v.last_sync_at === 'string') &&
+    typeof v.last_sync_status === 'string' && typeof v.last_sync_error === 'string' && isCatalogue(v.catalogue);
+}
+
+function isSourceEntry(v: unknown): v is SourceEntry {
+  return isRecord(v) && isCount(v.id) && isCount(v.source_id) && typeof v.fingerprint === 'string' &&
+    typeof v.original_name === 'string' && typeof v.protocol === 'string' && typeof v.country_code === 'string' &&
+    isCount(v.upstream_position) && typeof v.present === 'boolean' && typeof v.last_seen_at === 'string';
+}
+
+function parseSyncResult(v: unknown): SourceSyncResult {
+  if (!isRecord(v) || !isSource(v.source) || (v.status !== 'ok' && v.status !== 'partial' && v.status !== 'error') ||
+    typeof v.error !== 'string' || typeof v.format !== 'string' ||
+    ![v.added, v.updated, v.removed, v.total, v.skipped, v.duplicates].every(isCount)) {
+    throw new ApiError('invalid_response');
+  }
+  return v as unknown as SourceSyncResult;
 }
 
 export interface SourceEntry {
@@ -754,12 +832,6 @@ export interface UpdateSourceInput {
   readonly name: string;
   readonly description: string;
   readonly type: string;
-}
-
-export interface RefreshSourceInput {
-  readonly entries: readonly { fingerprint: string; original_name: string; protocol: string; country_code: string }[];
-  readonly sync_status: string;
-  readonly sync_error: string;
 }
 
 export interface BuilderSource {

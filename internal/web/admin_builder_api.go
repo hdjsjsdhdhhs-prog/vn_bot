@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strings"
 
 	"github.com/kereal/rs8kvn_bot/internal/database"
 	"github.com/kereal/rs8kvn_bot/internal/service"
@@ -74,11 +75,7 @@ func (a *adminAPI) builderUpdateSource(w http.ResponseWriter, r *http.Request, i
 		Type:        body.Type,
 	})
 	if err != nil {
-		if errors.Is(err, database.ErrProviderSourceNotFound) {
-			writeAdminError(w, http.StatusNotFound, "not_found")
-			return
-		}
-		a.internal(w, "builder/source/update", err)
+		a.writeSourceError(w, "builder/source/update", err)
 		return
 	}
 	writeAdminJSON(w, http.StatusOK, view)
@@ -400,7 +397,7 @@ func (a *adminAPI) builderCreateSource(w http.ResponseWriter, r *http.Request) {
 	if !decodeAdminJSON(w, r, &body) {
 		return
 	}
-	view, err := a.builderSvc.CreateSource(r.Context(), service.CreateSourceInput{
+	view, sync, err := a.builderSvc.CreateSource(r.Context(), service.CreateSourceInput{
 		Name:            body.Name,
 		Description:     body.Description,
 		Type:            body.Type,
@@ -411,10 +408,14 @@ func (a *adminAPI) builderCreateSource(w http.ResponseWriter, r *http.Request) {
 		Enabled:         body.Enabled,
 	})
 	if err != nil {
-		a.internal(w, "builder/source/create", err)
+		a.writeSourceError(w, "builder/source/create", err)
 		return
 	}
-	writeAdminJSON(w, http.StatusCreated, view)
+	// sync is the initial catalogue sync (null only when it could not run).
+	writeAdminJSON(w, http.StatusCreated, struct {
+		Source *service.SourceView       `json:"source"`
+		Sync   *service.SourceSyncResult `json:"sync"`
+	}{view, sync})
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +424,22 @@ func (a *adminAPI) builderCreateSource(w http.ResponseWriter, r *http.Request) {
 
 func (a *adminAPI) builderListSourceEntries(w http.ResponseWriter, r *http.Request, sourceID uint) {
 	if !a.builderSvcOK(w) {
+		return
+	}
+	// ?all=1 lists every entry including those that disappeared upstream.
+	if r.URL.Query().Get("all") == "1" {
+		entries, err := a.builderSvc.ListAllSourceEntries(r.Context(), sourceID)
+		if err != nil {
+			a.writeSourceError(w, "builder/source/entries", err)
+			return
+		}
+		if entries == nil {
+			entries = []database.ProviderSourceEntry{}
+		}
+		writeAdminJSON(w, http.StatusOK, struct {
+			SourceID uint                           `json:"source_id"`
+			Entries  []database.ProviderSourceEntry `json:"entries"`
+		}{sourceID, entries})
 		return
 	}
 	// Optional ?country= filter; "*" = all countries.
@@ -445,52 +462,49 @@ func (a *adminAPI) builderListSourceEntries(w http.ResponseWriter, r *http.Reque
 	}{sourceID, entries})
 }
 
-// refreshSourceRequest carries pre-parsed entries from the caller. The admin
-// UI is responsible for fetching and parsing the upstream feed; the backend
-// only stores the result and updates sync metadata.
-type refreshSourceRequest struct {
-	// Entries is the parsed catalogue from the upstream feed.
-	Entries []refreshEntryInput `json:"entries"`
-	// SyncStatus is a short stable code: "ok" | "fetch_error" | "parse_error".
-	SyncStatus string `json:"sync_status"`
-	// SyncError is a credential-free error description (max 64 chars).
-	SyncError string `json:"sync_error"`
-}
-
-type refreshEntryInput struct {
-	Fingerprint  string `json:"fingerprint"`
-	OriginalName string `json:"original_name"`
-	Protocol     string `json:"protocol"`
-	CountryCode  string `json:"country_code"`
-}
-
+// builderRefreshSource runs a server-side catalogue sync: the backend fetches
+// the upstream URL, parses it and stores the catalogue. The caller never
+// supplies entries; the body must be empty or "{}". A failed fetch/parse is a
+// committed outcome (status=error, previous catalogue kept) and answers 200.
 func (a *adminAPI) builderRefreshSource(w http.ResponseWriter, r *http.Request, sourceID uint) {
 	if !a.builderSvcOK(w) {
 		return
 	}
-	var body refreshSourceRequest
-	if !decodeAdminJSON(w, r, &body) {
-		return
-	}
-	entries := make([]database.ProviderSourceEntry, 0, len(body.Entries))
-	for _, e := range body.Entries {
-		entries = append(entries, database.ProviderSourceEntry{
-			Fingerprint:  e.Fingerprint,
-			OriginalName: e.OriginalName,
-			Protocol:     e.Protocol,
-			CountryCode:  e.CountryCode,
-		})
-	}
-	view, err := a.builderSvc.RefreshSource(r.Context(), sourceID, entries, body.SyncStatus, body.SyncError)
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64))
 	if err != nil {
-		if errors.Is(err, database.ErrProviderSourceNotFound) {
-			writeAdminError(w, http.StatusNotFound, "not_found")
-			return
-		}
-		a.internal(w, "builder/source/refresh", err)
+		writeAdminError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, view)
+	if body := strings.TrimSpace(string(raw)); body != "" && body != "{}" {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, err := a.builderSvc.SyncSource(r.Context(), sourceID)
+	if err != nil {
+		a.writeSourceError(w, "builder/source/refresh", err)
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, result)
+}
+
+// writeSourceError maps source create/update/sync failures to stable codes.
+func (a *adminAPI) writeSourceError(w http.ResponseWriter, route string, err error) {
+	var fieldErr *service.SourceFieldError
+	switch {
+	case errors.As(err, &fieldErr):
+		writeAdminJSON(w, http.StatusBadRequest, struct {
+			Error string `json:"error"`
+			Field string `json:"field"`
+		}{"invalid_source", fieldErr.Field})
+	case errors.Is(err, database.ErrProviderSourceNotFound):
+		writeAdminError(w, http.StatusNotFound, "not_found")
+	case errors.Is(err, database.ErrProviderSourceSyncInProgress):
+		writeAdminError(w, http.StatusConflict, "sync_in_progress")
+	case errors.Is(err, service.ErrCatalogueFetcherUnavailable):
+		writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
+	default:
+		a.internal(w, route, err)
+	}
 }
 
 // ---------------------------------------------------------------------------

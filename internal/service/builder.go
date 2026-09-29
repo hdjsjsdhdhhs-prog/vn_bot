@@ -2,8 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/kereal/rs8kvn_bot/internal/database"
@@ -38,7 +42,13 @@ type BuilderRepository interface {
 
 	// Source creation
 	CreateProviderSourceAdmin(ctx context.Context, src database.ProviderSource) (*database.ProviderSource, error)
-	UpsertSourceEntries(ctx context.Context, sourceID uint, entries []database.ProviderSourceEntry, syncStatus, syncError string) error
+
+	// Source catalogue (sync + statistics)
+	SyncSourceEntries(ctx context.Context, sourceID uint, entries []database.ProviderSourceEntry, syncStatus, syncError string) (database.SourceSyncCounts, error)
+	MarkSourceSyncFailed(ctx context.Context, sourceID uint, syncError string) error
+	ListSourceEntriesAll(ctx context.Context, sourceID uint) ([]database.ProviderSourceEntry, error)
+	SourceCatalogueStatsAll(ctx context.Context) (map[uint]database.SourceCatalogueStats, error)
+	SourceCatalogueStatsFor(ctx context.Context, sourceID uint) (database.SourceCatalogueStats, error)
 
 	// Builder enable/disable
 	SetBuilderEnabled(ctx context.Context, id uint, enabled bool) (*database.SubscriptionBuilder, error)
@@ -49,16 +59,44 @@ type BuilderRepository interface {
 
 var _ BuilderRepository = (*database.Service)(nil)
 
+// FetchedCatalogue is one fetched and parsed provider source response.
+type FetchedCatalogue struct {
+	Format     string
+	Entries    []database.ProviderSourceEntry
+	Skipped    int
+	Duplicates int
+}
+
+// SourceCatalogueFetcher fetches and parses a provider source on the server
+// (subserver.FetchSourceCatalogue in production). A failure should carry a
+// stable, credential-free code via a SyncCode() string method.
+type SourceCatalogueFetcher func(ctx context.Context, source database.ProviderSource) (*FetchedCatalogue, error)
+
+// ErrCatalogueFetcherUnavailable is returned when no fetcher is wired.
+var ErrCatalogueFetcherUnavailable = errors.New("source catalogue fetcher is not configured")
+
+// sourceSyncTimeout bounds one catalogue sync (fetch + parse + store).
+const sourceSyncTimeout = 30 * time.Second
+
 // BuilderService is the application boundary for Subscription Builder
 // management. It owns no authentication: callers must have authorized the
 // actor before invoking it.
 type BuilderService struct {
-	repo BuilderRepository
+	repo    BuilderRepository
+	fetcher SourceCatalogueFetcher
+
+	syncMu  sync.Mutex
+	syncing map[uint]bool
 }
 
 // NewBuilderService wires the builder boundary.
 func NewBuilderService(repo BuilderRepository) *BuilderService {
-	return &BuilderService{repo: repo}
+	return &BuilderService{repo: repo, syncing: make(map[uint]bool)}
+}
+
+// SetCatalogueFetcher wires the server-side source fetcher/parser.
+func (s *BuilderService) SetCatalogueFetcher(f SourceCatalogueFetcher) {
+	s.fetcher = f
 }
 
 // ---------------------------------------------------------------------------
@@ -68,31 +106,47 @@ func NewBuilderService(repo BuilderRepository) *BuilderService {
 // SourceView is the browser-safe projection of a ProviderSource.
 // SubscriptionURL, HWID, UserAgent and Headers are intentionally omitted.
 type SourceView struct {
-	ID             uint       `json:"id"`
-	Name           string     `json:"name"`
+	ID   uint   `json:"id"`
+	Name string `json:"name"`
+	// Type is the expected response format (database.SourceFormats); legacy
+	// free-text values are reported as "auto".
 	Type           string     `json:"type"`
 	Description    string     `json:"description"`
 	Enabled        bool       `json:"enabled"`
 	LastSyncAt     *time.Time `json:"last_sync_at"`
 	LastSyncStatus string     `json:"last_sync_status"`
 	LastSyncError  string     `json:"last_sync_error"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	// Catalogue summarizes the entries stored by the last successful sync.
+	Catalogue database.SourceCatalogueStats `json:"catalogue"`
+	CreatedAt time.Time                     `json:"created_at"`
+	UpdatedAt time.Time                     `json:"updated_at"`
 }
 
 func sourceViewOf(s *database.ProviderSource) SourceView {
 	return SourceView{
 		ID:             s.ID,
 		Name:           s.Name,
-		Type:           s.Type,
+		Type:           database.NormalizeSourceFormat(s.Type),
 		Description:    s.Description,
 		Enabled:        s.Enabled,
 		LastSyncAt:     s.LastSyncAt,
 		LastSyncStatus: s.LastSyncStatus,
 		LastSyncError:  s.LastSyncError,
+		Catalogue:      database.SourceCatalogueStats{ByCountry: []database.SourceCountryCount{}, Protocols: map[string]int{}},
 		CreatedAt:      s.CreatedAt,
 		UpdatedAt:      s.UpdatedAt,
 	}
+}
+
+// sourceView returns the projection with the current catalogue statistics.
+func (s *BuilderService) sourceView(ctx context.Context, src *database.ProviderSource) (*SourceView, error) {
+	v := sourceViewOf(src)
+	stats, err := s.repo.SourceCatalogueStatsFor(ctx, src.ID)
+	if err != nil {
+		return nil, fmt.Errorf("source catalogue stats: %w", err)
+	}
+	v.Catalogue = stats
+	return &v, nil
 }
 
 // BuilderView is the browser-safe projection of a SubscriptionBuilder.
@@ -168,15 +222,24 @@ func builderViewOf(b *database.SubscriptionBuilder) BuilderView {
 // Source operations
 // ---------------------------------------------------------------------------
 
-// ListSources returns all provider sources (credentials stripped).
+// ListSources returns all provider sources (credentials stripped) with the
+// statistics of their own catalogue.
 func (s *BuilderService) ListSources(ctx context.Context) ([]SourceView, error) {
 	sources, err := s.repo.ListProviderSources(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list sources: %w", err)
 	}
+	stats, err := s.repo.SourceCatalogueStatsAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list sources: %w", err)
+	}
 	views := make([]SourceView, 0, len(sources))
 	for i := range sources {
-		views = append(views, sourceViewOf(&sources[i]))
+		v := sourceViewOf(&sources[i])
+		if st, ok := stats[sources[i].ID]; ok {
+			v.Catalogue = st
+		}
+		views = append(views, v)
 	}
 	return views, nil
 }
@@ -187,8 +250,7 @@ func (s *BuilderService) GetSource(ctx context.Context, id uint) (*SourceView, e
 	if err != nil {
 		return nil, err // ErrProviderSourceNotFound propagates as-is
 	}
-	v := sourceViewOf(src)
-	return &v, nil
+	return s.sourceView(ctx, src)
 }
 
 // UpdateSourceInput holds the mutable admin fields for a ProviderSource.
@@ -201,15 +263,19 @@ type UpdateSourceInput struct {
 // UpdateSource updates the non-credential metadata of a provider source.
 // Credentials are NOT updated here — they are managed out-of-band.
 func (s *BuilderService) UpdateSource(ctx context.Context, id uint, in UpdateSourceInput) (*SourceView, error) {
+	name, format, err := validateSourceMeta(in.Name, in.Type)
+	if err != nil {
+		return nil, err
+	}
 	// Load current to preserve credentials.
 	current, err := s.repo.GetProviderSourceByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	updated, err := s.repo.UpdateProviderSource(ctx, id, database.ProviderSourceUpdateInput{
-		Name:            in.Name,
-		Description:     in.Description,
-		Type:            in.Type,
+		Name:            name,
+		Description:     strings.TrimSpace(in.Description),
+		Type:            format,
 		SubscriptionURL: current.SubscriptionURL,
 		HWID:            current.HWID,
 		UserAgent:       current.UserAgent,
@@ -218,8 +284,7 @@ func (s *BuilderService) UpdateSource(ctx context.Context, id uint, in UpdateSou
 	if err != nil {
 		return nil, fmt.Errorf("update source: %w", err)
 	}
-	v := sourceViewOf(updated)
-	return &v, nil
+	return s.sourceView(ctx, updated)
 }
 
 // SetSourceEnabled enables or disables a provider source.
@@ -228,8 +293,16 @@ func (s *BuilderService) SetSourceEnabled(ctx context.Context, id uint, enabled 
 	if err != nil {
 		return nil, err
 	}
-	v := sourceViewOf(src)
-	return &v, nil
+	return s.sourceView(ctx, src)
+}
+
+// ListAllSourceEntries returns every catalogue entry of a source, including
+// entries that disappeared upstream (present=false).
+func (s *BuilderService) ListAllSourceEntries(ctx context.Context, sourceID uint) ([]database.ProviderSourceEntry, error) {
+	if _, err := s.repo.GetProviderSourceByID(ctx, sourceID); err != nil {
+		return nil, err
+	}
+	return s.repo.ListSourceEntriesAll(ctx, sourceID)
 }
 
 // ListSourceEntries returns the present catalogue entries for a source.
@@ -488,55 +561,204 @@ type CreateSourceInput struct {
 	Enabled         bool
 }
 
-// CreateSource creates a new ProviderSource. Credentials are accepted and
-// stored; they are never returned to the browser (SourceView strips them).
-func (s *BuilderService) CreateSource(ctx context.Context, in CreateSourceInput) (*SourceView, error) {
-	headers := in.Headers
+// SourceFieldError names the invalid field of a source create/update. It wraps
+// database.ErrProviderSourceInvalid and never contains the submitted value.
+type SourceFieldError struct {
+	Field string
+}
+
+func (e *SourceFieldError) Error() string { return "invalid provider source field: " + e.Field }
+func (e *SourceFieldError) Unwrap() error { return database.ErrProviderSourceInvalid }
+
+// validateSourceMeta checks the name and the format (empty = auto).
+func validateSourceMeta(name, format string) (string, string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || len([]rune(name)) > 255 {
+		return "", "", &SourceFieldError{Field: "name"}
+	}
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		format = database.SourceFormatAuto
+	}
+	if !database.ValidSourceFormat(format) {
+		return "", "", &SourceFieldError{Field: "type"}
+	}
+	return name, format, nil
+}
+
+// validateSourceRequest checks the fetch configuration with the same rules as
+// the runtime fetch (database.ProviderSource.RequestConfiguration) and names
+// the offending field.
+func validateSourceRequest(src database.ProviderSource) error {
+	u, err := url.Parse(strings.TrimSpace(src.SubscriptionURL))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.Fragment != "" {
+		return &SourceFieldError{Field: "subscription_url"}
+	}
+	probe := src
+	probe.Enabled = true
+	if _, _, err := probe.RequestConfiguration(); err != nil {
+		if raw := strings.TrimSpace(src.Headers); raw != "" && raw != "{}" {
+			var headers map[string]string
+			if json.Unmarshal([]byte(raw), &headers) != nil {
+				return &SourceFieldError{Field: "headers"}
+			}
+		}
+		probe.Headers = "{}"
+		if _, _, err := probe.RequestConfiguration(); err == nil {
+			return &SourceFieldError{Field: "headers"}
+		}
+		probe.HWID = ""
+		if _, _, err := probe.RequestConfiguration(); err == nil {
+			return &SourceFieldError{Field: "hwid"}
+		}
+		return &SourceFieldError{Field: "user_agent"}
+	}
+	return nil
+}
+
+// CreateSource creates a new ProviderSource and immediately runs the initial
+// catalogue sync. Credentials are accepted and stored; they are never
+// returned to the browser (SourceView strips them). The source is created
+// even when the initial sync fails: the sync result reports the error and
+// the admin can fix the upstream and sync again.
+func (s *BuilderService) CreateSource(ctx context.Context, in CreateSourceInput) (*SourceView, *SourceSyncResult, error) {
+	name, format, err := validateSourceMeta(in.Name, in.Type)
+	if err != nil {
+		return nil, nil, err
+	}
+	headers := strings.TrimSpace(in.Headers)
 	if headers == "" {
 		headers = "{}"
 	}
 	src := database.ProviderSource{
-		Name:            in.Name,
-		Description:     in.Description,
-		Type:            in.Type,
-		SubscriptionURL: in.SubscriptionURL,
-		HWID:            in.HWID,
-		UserAgent:       in.UserAgent,
+		Name:            name,
+		Description:     strings.TrimSpace(in.Description),
+		Type:            format,
+		SubscriptionURL: strings.TrimSpace(in.SubscriptionURL),
+		HWID:            strings.TrimSpace(in.HWID),
+		UserAgent:       strings.TrimSpace(in.UserAgent),
 		Headers:         headers,
 		Enabled:         in.Enabled,
 	}
+	if err := validateSourceRequest(src); err != nil {
+		return nil, nil, err
+	}
 	created, err := s.repo.CreateProviderSourceAdmin(ctx, src)
 	if err != nil {
-		return nil, fmt.Errorf("create source: %w", err)
+		return nil, nil, fmt.Errorf("create source: %w", err)
 	}
-	v := sourceViewOf(created)
-	return &v, nil
+
+	result, err := s.SyncSource(ctx, created.ID)
+	if err != nil {
+		// The source exists; only the sync could not run (e.g. no fetcher,
+		// database error). Report the created source without a sync result.
+		view, viewErr := s.sourceView(ctx, created)
+		if viewErr != nil {
+			return nil, nil, viewErr
+		}
+		return view, nil, nil
+	}
+	return &result.Source, result, nil
 }
 
-// RefreshSource triggers a catalogue refresh for a provider source. In the
-// current implementation the refresh is synchronous and best-effort: the
-// caller supplies the parsed entries; the service upserts them and updates
-// the sync metadata. A full async fetch pipeline is out of scope for this
-// backend phase.
-//
-// entries must already be parsed from the upstream feed by the caller.
-// syncStatus should be "ok" on success or a short error code on failure.
-// syncError is a stable, credential-free error description (max 64 chars).
-func (s *BuilderService) RefreshSource(ctx context.Context, sourceID uint, entries []database.ProviderSourceEntry, syncStatus, syncError string) (*SourceView, error) {
-	// Verify source exists.
-	if _, err := s.repo.GetProviderSourceByID(ctx, sourceID); err != nil {
-		return nil, err
+// SourceSyncResult is the outcome of one catalogue sync.
+type SourceSyncResult struct {
+	Source SourceView `json:"source"`
+	// Status is database.SourceSync*: ok | partial | error.
+	Status string `json:"status"`
+	// Error is the stable failure code (status=error) or "skipped:N"
+	// (status=partial). It never contains the URL or credentials.
+	Error  string `json:"error"`
+	Format string `json:"format"`
+	database.SourceSyncCounts
+	// Skipped counts servers of the response that could not be parsed.
+	Skipped int `json:"skipped"`
+	// Duplicates counts repeated servers merged into one entry.
+	Duplicates int `json:"duplicates"`
+}
+
+// SyncSource fetches the upstream URL on the server, parses it with the /sub
+// parser, stores the catalogue (fingerprints, countries, protocols) and
+// updates the sync status. On a fetch/parse failure the previous catalogue is
+// kept and the source is marked status=error with a stable code.
+func (s *BuilderService) SyncSource(ctx context.Context, sourceID uint) (*SourceSyncResult, error) {
+	if s.fetcher == nil {
+		return nil, ErrCatalogueFetcherUnavailable
 	}
-	if err := s.repo.UpsertSourceEntries(ctx, sourceID, entries, syncStatus, syncError); err != nil {
-		return nil, fmt.Errorf("refresh source entries: %w", err)
-	}
-	// Reload to return updated sync metadata.
 	src, err := s.repo.GetProviderSourceByID(ctx, sourceID)
 	if err != nil {
-		return nil, fmt.Errorf("reload source after refresh: %w", err)
+		return nil, err
 	}
-	v := sourceViewOf(src)
-	return &v, nil
+	if !s.beginSync(sourceID) {
+		return nil, database.ErrProviderSourceSyncInProgress
+	}
+	defer s.endSync(sourceID)
+
+	syncCtx, cancel := context.WithTimeout(ctx, sourceSyncTimeout)
+	defer cancel()
+
+	catalogue, fetchErr := s.fetcher(syncCtx, *src)
+	if fetchErr != nil {
+		code := "internal"
+		var coded interface{ SyncCode() string }
+		if errors.As(fetchErr, &coded) {
+			code = coded.SyncCode()
+		} else if syncCtx.Err() != nil {
+			code = "timeout"
+		}
+		if err := s.repo.MarkSourceSyncFailed(ctx, sourceID, code); err != nil {
+			return nil, fmt.Errorf("record sync failure: %w", err)
+		}
+		return s.syncResult(ctx, sourceID, &SourceSyncResult{Status: database.SourceSyncError, Error: code})
+	}
+
+	status, detail := database.SourceSyncOK, ""
+	if catalogue.Skipped > 0 {
+		status, detail = database.SourceSyncPartial, fmt.Sprintf("skipped:%d", catalogue.Skipped)
+	}
+	counts, err := s.repo.SyncSourceEntries(ctx, sourceID, catalogue.Entries, status, detail)
+	if err != nil {
+		return nil, fmt.Errorf("store source catalogue: %w", err)
+	}
+	return s.syncResult(ctx, sourceID, &SourceSyncResult{
+		Status: status, Error: detail, Format: catalogue.Format, SourceSyncCounts: counts,
+		Skipped: catalogue.Skipped, Duplicates: catalogue.Duplicates,
+	})
+}
+
+func (s *BuilderService) syncResult(ctx context.Context, sourceID uint, r *SourceSyncResult) (*SourceSyncResult, error) {
+	src, err := s.repo.GetProviderSourceByID(ctx, sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("reload source after sync: %w", err)
+	}
+	view, err := s.sourceView(ctx, src)
+	if err != nil {
+		return nil, err
+	}
+	r.Source = *view
+	if r.Status == database.SourceSyncError {
+		r.Total = view.Catalogue.Entries // the kept catalogue
+	}
+	return r, nil
+}
+
+func (s *BuilderService) beginSync(id uint) bool {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	if s.syncing == nil {
+		s.syncing = make(map[uint]bool)
+	}
+	if s.syncing[id] {
+		return false
+	}
+	s.syncing[id] = true
+	return true
+}
+
+func (s *BuilderService) endSync(id uint) {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	delete(s.syncing, id)
 }
 
 // ---------------------------------------------------------------------------

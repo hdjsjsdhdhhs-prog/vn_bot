@@ -3,7 +3,7 @@ import {
   AdminApi, ApiError, errorText, limits, newRequestKey, RENEW_MAX_DAYS,
   type AdminNode, type AdminPlan, type AdminSubscription, type Dashboard, type Mutation, type MutationAction,
   type MutationOutcome, type SubscriptionStatus, type UserDetail, type UsersPage, type UsersQuery,
-  type AdminSource, type AdminBuilder, type BuilderItem,
+  type AdminSource, type AdminBuilder, type BuilderItem, type SourceEntry, type SourceSyncResult,
   type CreateSourceInput, type UpdateSourceInput,
   type CreateBuilderInput, type UpdateBuilderInput, type UpsertBuilderItemInput, type SetBuilderInput,
   TARIFF_LIMITS, type AdminTariff, type TariffPlan, type TariffOutcome,
@@ -13,6 +13,12 @@ import {
   featuresFromText, formFromTariff, formatTariffPrice, isRetired, moveItem, parsePriceInput, pluralRu, reorderIds, sameForm,
   termsChanged, validateTariffForm, type FieldErrors, type TariffField, type TariffForm,
 } from './tariffs';
+import {
+  COUNTRY_CODE, EMPTY_FILTER, RESOLUTION_LABELS, SOURCE_FORMATS, SYNC_STATE_LABELS, builderSourcesSummary,
+  catalogueSummary, countriesLabel, countryCount, countryLabel, detectedFormatLabel, filterEntries, flagEmoji,
+  formatLabel, normalizeFormat, pickableEntries, previewSummary, protocolsOf, resolveNode, ruleSummary,
+  serversLabel, shortFingerprint, syncErrorText, syncResultMessage, syncState, type EntryFilter, type SyncState,
+} from './sources';
 
 // ---------------------------------------------------------------------------
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
@@ -192,9 +198,11 @@ const SECTIONS: readonly Section[] = [
 // Routes: #/overview, #/users, #/users/{telegram_id}, #/audit. Only canonical
 // positive Telegram IDs open a user, matching the API route.
 // Tariffs: #/tariffs, #/tariffs/new, #/tariffs/{product_id}.
-interface Route { section: Section; userId: number | null; tariffId: number | 'new' | null }
+// Sources: #/sources, #/sources/{source_id} (catalogue of one source).
+interface Route { section: Section; userId: number | null; tariffId: number | 'new' | null; sourceId: number | null }
 const USER_ROUTE = /^users\/([1-9][0-9]{0,15})$/;
 const TARIFF_ROUTE = /^tariffs\/(new|[1-9][0-9]{0,15})$/;
+const SOURCE_ROUTE = /^sources\/([1-9][0-9]{0,15})$/;
 
 function currentRoute(): Route {
   const path = location.hash.replace(/^#\/?/, '');
@@ -202,15 +210,21 @@ function currentRoute(): Route {
   const users = SECTIONS.find(section => section.id === 'users');
   if (match && users) {
     const id = Number(match[1]);
-    if (Number.isSafeInteger(id)) return { section: users, userId: id, tariffId: null };
+    if (Number.isSafeInteger(id)) return { section: users, userId: id, tariffId: null, sourceId: null };
   }
   const tariff = TARIFF_ROUTE.exec(path);
   const tariffs = SECTIONS.find(section => section.id === 'tariffs');
   if (tariff && tariffs) {
     const id = tariff[1] === 'new' ? 'new' : Number(tariff[1]);
-    if (id === 'new' || Number.isSafeInteger(id)) return { section: tariffs, userId: null, tariffId: id };
+    if (id === 'new' || Number.isSafeInteger(id)) return { section: tariffs, userId: null, tariffId: id, sourceId: null };
   }
-  return { section: SECTIONS.find(section => section.id === path) ?? SECTIONS[0], userId: null, tariffId: null };
+  const source = SOURCE_ROUTE.exec(path);
+  const sources = SECTIONS.find(section => section.id === 'sources');
+  if (source && sources) {
+    const id = Number(source[1]);
+    if (Number.isSafeInteger(id)) return { section: sources, userId: null, tariffId: null, sourceId: id };
+  }
+  return { section: SECTIONS.find(section => section.id === path) ?? SECTIONS[0], userId: null, tariffId: null, sourceId: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +947,51 @@ interface TariffEditorView {
   desc: HTMLElement;
 }
 
+interface SourceDetailView {
+  id: number;
+  body: HTMLElement;
+  refresh: HTMLButtonElement;
+  updated: HTMLElement;
+  title: HTMLElement;
+  desc: HTMLElement;
+  source: AdminSource | null;
+  entries: readonly SourceEntry[] | null;
+  filter: EntryFilter;
+  syncing: boolean;
+  /** Sync progress/outcome, announced politely; survives repaints of body. */
+  status: HTMLElement;
+  sync: HTMLButtonElement;
+}
+
+/** What a builder rule is read against: every source and the builder's selection. */
+interface RuleContext {
+  sources: () => readonly AdminSource[];
+  selectedIds: () => readonly number[];
+}
+
+function enabledBadge(enabled: boolean): HTMLElement {
+  return el('span', enabled ? 'badge badge-active' : 'badge badge-disabled', enabled ? 'Включён' : 'Отключён');
+}
+
+const SYNC_BADGE_CLASS: Readonly<Record<SyncState, string>> = {
+  never: 'badge badge-disabled', ok: 'badge badge-active', partial: 'badge badge-warn', error: 'badge badge-danger',
+};
+
+function syncBadge(state: SyncState): HTMLElement {
+  return el('span', SYNC_BADGE_CLASS[state], SYNC_STATE_LABELS[state]);
+}
+
+/** "Последняя синхронизация: …" (or the last failed attempt). */
+function lastSyncText(src: AdminSource): string {
+  if (!src.last_sync_at) return 'Синхронизации ещё не было';
+  const at = formatDateTime(src.last_sync_at);
+  return syncState(src) === 'error' ? `Последняя попытка: ${at}` : `Последняя синхронизация: ${at}`;
+}
+
+const protocolsText = (protocols: Readonly<Record<string, number>>) =>
+  Object.entries(protocols).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([name, n]) => `${name} ${formatCount(n)}`).join(' · ') || '—';
+
 class AdminApp {
   private view: 'boot' | 'fatal' | 'login' | 'app' = 'boot';
   private shell: Shell | null = null;
@@ -964,6 +1023,11 @@ class AdminApp {
   private sourcesCache: readonly AdminSource[] | null = null;
   private sourcesRequest = 0;
   private sourcesView: { body: HTMLElement; refresh: HTMLButtonElement } | null = null;
+  // Source details (#/sources/{id}): one source and its catalogue.
+  private sourceDetailView: SourceDetailView | null = null;
+  private sourceDetailRequest = 0;
+  // Outcome of the last sync per source, shown on its row and detail page.
+  private syncNotices = new Map<number, Notice>();
   // Builders section state
   private buildersCache: readonly AdminBuilder[] | null = null;
   private buildersRequest = 0;
@@ -1285,8 +1349,9 @@ class AdminApp {
 
   private renderSection(focus: boolean) {
     if (!this.shell) return;
-    const { section, userId, tariffId } = currentRoute();
-    const canonical = userId !== null ? `#/users/${userId}` : tariffId !== null ? `#/tariffs/${tariffId}` : `#/${section.id}`;
+    const { section, userId, tariffId, sourceId } = currentRoute();
+    const canonical = userId !== null ? `#/users/${userId}` : tariffId !== null ? `#/tariffs/${tariffId}`
+      : sourceId !== null ? `#/sources/${sourceId}` : `#/${section.id}`;
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
     for (const [id, link] of this.shell.links) {
       if (id === section.id) link.setAttribute('aria-current', 'page');
@@ -1302,6 +1367,8 @@ class AdminApp {
     this.usersView = null;
     this.detailView = null;
     this.sourcesView = null;
+    this.sourceDetailView = null;
+    this.sourceDetailRequest++;
     this.buildersView = null;
     this.tariffsView = null;
     this.tariffEditorView = null;
@@ -1348,6 +1415,12 @@ class AdminApp {
     } else if (section.id === 'tariffs') {
       page.append(header, this.buildTariffsSection(header));
       load = () => this.loadTariffs();
+    } else if (sourceId !== null) {
+      const back = el('a', 'back-link');
+      back.href = '#/sources';
+      back.append(icon('back'), el('span', '', 'Назад к источникам'));
+      page.append(back, header, this.buildSourceDetail(sourceId, header, title, desc));
+      load = () => this.loadSourceDetail();
     } else if (section.id === 'sources') {
       page.append(header, this.buildSourcesSection(header));
       load = () => this.loadSources();
@@ -2526,47 +2599,102 @@ class AdminApp {
 
   private paintSources(body: HTMLElement, sources: readonly AdminSource[], updated: HTMLElement) {
     setLoading(body, null);
-    const at = new Date();
-    updated.textContent = `Обновлено в ${clockSeconds(at)}`;
+    updated.textContent = `Обновлено в ${clockSeconds(new Date())}`;
     if (sources.length === 0) {
+      const add = button('Добавить источник', 'btn btn-primary btn-sm', 'plus');
+      add.addEventListener('click', () => this.openSourceEditor(null));
       body.replaceChildren(messagePanel('sources', 'Источников пока нет',
-        'Добавьте внешнюю подписку-источник VPN-конфигураций, чтобы построители могли её использовать.', 'status'));
+        'Добавьте подписку провайдера: сервер скачает её, разберёт серверы и страны, и построители смогут их использовать.', 'status', add));
       return;
     }
     const panel = el('section', 'panel');
     panel.setAttribute('aria-labelledby', 'sources-list-title');
-    panel.append(panelHead('sources-list-title', 'Источники', formatCount(sources.length)));
+    const total = sources.reduce((n, s) => n + s.catalogue.entries, 0);
+    panel.append(panelHead('sources-list-title', 'Источники', `${formatCount(sources.length)} · ${serversLabel(total)} всего`));
     const list = el('ul', 'source-list');
     for (const src of sources) list.append(this.sourceRow(src));
-    panel.append(list);
+    panel.append(list,
+      el('p', 'panel-note', 'Каталог каждого источника хранится отдельно. Серверы разных источников объединяются только в построителе.'));
     body.replaceChildren(panel);
   }
 
   private sourceRow(src: AdminSource): HTMLElement {
+    const state = syncState(src);
     const item = el('li', 'source-item');
+    item.dataset.sourceId = String(src.id);
+    item.setAttribute('aria-label', src.name);
     const info = el('div', 'source-info');
     const nameRow = el('div', 'source-name-row');
-    const name = el('span', 'source-name', src.name);
-    const badge = el('span', src.enabled ? 'badge badge-active' : 'badge badge-disabled',
-      src.enabled ? 'Активен' : 'Отключён');
-    nameRow.append(name, badge);
-    const meta = el('p', 'source-meta');
-    meta.textContent = [
-      src.type,
-      src.last_sync_at ? `Синхр. ${formatDateTime(src.last_sync_at)}` : 'Не синхронизирован',
-      src.last_sync_status && src.last_sync_status !== 'ok' ? `⚠ ${src.last_sync_status}` : '',
-    ].filter(Boolean).join(' · ');
-    info.append(nameRow, meta);
+    const name = el('a', 'source-name', src.name);
+    name.href = `#/sources/${src.id}`;
+    nameRow.append(name, enabledBadge(src.enabled), syncBadge(state));
+    const stats = el('p', 'source-stats', state === 'never' && src.catalogue.entries === 0
+      ? 'Каталог ещё не загружен' : catalogueSummary(src.catalogue));
+    const meta = el('p', 'source-meta', `${formatLabel(src.type)} · ${lastSyncText(src)}`);
+    info.append(nameRow, stats, meta);
+    if ((state === 'error' || state === 'partial') && src.last_sync_error) {
+      info.append(el('p', state === 'error' ? 'source-error' : 'source-warn', syncErrorText(src.last_sync_error)));
+    }
     if (src.description) info.append(el('p', 'source-desc', src.description));
+    const last = this.syncNotices.get(src.id);
+    if (last) info.append(notice(last));
 
     const acts = el('div', 'source-actions');
+    const open = el('a', 'btn btn-secondary btn-xs');
+    open.href = `#/sources/${src.id}`;
+    open.setAttribute('aria-label', `Каталог «${src.name}»`);
+    open.append(el('span', 'btn-label', 'Каталог'));
+    const sync = button('Синхронизировать', 'btn btn-secondary btn-xs', 'refresh');
+    sync.setAttribute('aria-label', `Синхронизировать «${src.name}»`);
+    sync.addEventListener('click', () => void this.syncFromList(src, sync));
     const editBtn = button('Изменить', 'btn btn-secondary btn-xs', 'edit');
+    editBtn.setAttribute('aria-label', `Изменить «${src.name}»`);
     editBtn.addEventListener('click', () => this.openSourceEditor(src));
     const toggleBtn = button(src.enabled ? 'Отключить' : 'Включить', 'btn btn-secondary btn-xs');
+    toggleBtn.setAttribute('aria-label', `${src.enabled ? 'Отключить' : 'Включить'} «${src.name}»`);
     toggleBtn.addEventListener('click', () => void this.toggleSource(src, toggleBtn));
-    acts.append(editBtn, toggleBtn);
+    acts.append(open, sync, editBtn, toggleBtn);
     item.append(info, acts);
     return item;
+  }
+
+  /** Keeps the list cache current and repaints the list if it is open. */
+  private replaceSource(updated: AdminSource) {
+    if (this.sourcesCache) {
+      this.sourcesCache = this.sourcesCache.some(s => s.id === updated.id)
+        ? this.sourcesCache.map(s => s.id === updated.id ? updated : s)
+        : [...this.sourcesCache, updated];
+    }
+    const view = this.sourcesView;
+    if (view && this.sourcesCache) {
+      const updatedEl = view.refresh.closest('.page-actions')?.querySelector<HTMLElement>('.updated') ?? el('p', 'updated');
+      this.paintSources(view.body, this.sourcesCache, updatedEl);
+    }
+  }
+
+  /** Records the outcome of a sync for the row and the detail page. */
+  private applySyncResult(result: SourceSyncResult) {
+    const message = syncResultMessage(result);
+    const format = result.status !== 'error' && result.format ? ` Формат ответа: ${detectedFormatLabel(result.format)}.` : '';
+    this.syncNotices.set(result.source.id, { tone: message.tone, text: message.text + format });
+    this.replaceSource(result.source);
+  }
+
+  private async syncFromList(src: AdminSource, btn: HTMLButtonElement) {
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    setLabel(btn, 'Синхронизируем…');
+    try {
+      const result = await this.api.syncSource(src.id);
+      this.applySyncResult(result);
+      this.toast(result.status === 'error' ? `«${src.name}»: синхронизация не удалась.` : `«${src.name}» синхронизирован.`);
+    } catch (error) {
+      if (await this.endIfSignedOut(error, () => this.sourcesView !== null)) return;
+      this.toast(`Не удалось синхронизировать «${src.name}». ${errorText(error)}`);
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+      setLabel(btn, 'Синхронизировать');
+    }
   }
 
   private async toggleSource(src: AdminSource, btn: HTMLButtonElement) {
@@ -2574,16 +2702,13 @@ class AdminApp {
     btn.setAttribute('aria-busy', 'true');
     try {
       const updated = src.enabled ? await this.api.disableSource(src.id) : await this.api.enableSource(src.id);
-      if (this.sourcesCache) {
-        this.sourcesCache = this.sourcesCache.map(s => s.id === updated.id ? updated : s);
-        const view = this.sourcesView;
-        if (view) {
-          const dummy = el('p', 'updated');
-          this.paintSources(view.body, this.sourcesCache, dummy);
-        }
+      this.replaceSource(updated);
+      if (this.sourceDetailView?.id === updated.id) {
+        this.sourceDetailView.source = updated;
+        this.paintSourceDetail(this.sourceDetailView);
       }
     } catch (error) {
-      if (await this.endIfSignedOut(error, () => this.sourcesView !== null)) return;
+      if (await this.endIfSignedOut(error, () => this.sourcesView !== null || this.sourceDetailView !== null)) return;
       this.toast(`Не удалось изменить статус источника. ${errorText(error)}`);
       btn.disabled = false;
       btn.removeAttribute('aria-busy');
@@ -2630,51 +2755,83 @@ class AdminApp {
 
     const mkInput = (id: string, labelText: string, value = '', type = 'text', hint?: string) => {
       const inp = el('input', 'input');
-      Object.assign(inp, { id, type, value, spellcheck: false });
+      Object.assign(inp, { id, type, value, spellcheck: false, autocomplete: 'off' });
       const f = field(labelText, inp);
       if (hint) f.root.append(el('p', 'field-hint', hint));
       return { inp, ...f };
     };
 
-    const nameF = mkInput('src-name', 'Название', src?.name ?? '');
+    const nameF = mkInput('src-name', 'Название', src?.name ?? '', 'text', 'Например: «Liberty — 20 стран». Видно только в панели.');
     const descF = mkInput('src-desc', 'Описание', src?.description ?? '');
-    const typeF = mkInput('src-type', 'Тип', src?.type ?? 'xui', 'text', 'Например: xui, proxman');
-    const urlF = mkInput('src-url', 'URL подписки', '', 'url', 'Полный URL внешней подписки');
-    const hwidF = mkInput('src-hwid', 'HWID', '', 'text', 'Идентификатор устройства (если требуется)');
-    const uaF = mkInput('src-ua', 'User-Agent', '', 'text');
-    const headersF = mkInput('src-headers', 'Заголовки', '', 'text', 'Дополнительные HTTP-заголовки');
+
+    // ProviderSource.type is the expected response format, not a provider kind.
+    const typeSel = el('select', 'input');
+    typeSel.id = 'src-type';
+    for (const f of SOURCE_FORMATS) typeSel.append(option(f.value, f.label));
+    typeSel.value = normalizeFormat(src?.type ?? 'auto');
+    const typeF = field('Формат подписки', typeSel);
+    const typeHint = el('p', 'field-hint');
+    const syncTypeHint = () => {
+      typeHint.textContent = `${SOURCE_FORMATS.find(f => f.value === typeSel.value)?.hint ?? ''} Если ответ придёт в другом формате, синхронизация сообщит об этом.`;
+    };
+    typeSel.addEventListener('change', syncTypeHint);
+    syncTypeHint();
+    typeF.root.append(typeHint);
+
+    const urlF = mkInput('src-url', 'URL подписки', '', 'url',
+      'Полный адрес подписки провайдера (http:// или https://). Хранится только на сервере и не показывается в панели.');
+    const hwidF = mkInput('src-hwid', 'HWID', '', 'text', 'Идентификатор устройства, если провайдер его требует (заголовок X-HWID).');
+    const uaF = mkInput('src-ua', 'User-Agent', '', 'text', 'Пусто — стандартный. Некоторые провайдеры отдают формат в зависимости от клиента (например, Happ).');
+    const headersF = mkInput('src-headers', 'Дополнительные заголовки', '', 'text',
+      'JSON-объект, например {"Authorization": "Bearer …"}. Значения только записываются и не показываются.');
 
     const enabledChk = el('input', 'checkbox');
     enabledChk.type = 'checkbox';
     enabledChk.id = 'src-enabled';
     enabledChk.checked = src?.enabled ?? true;
-    const enabledLabel = el('label', 'checkbox-label', 'Активен');
+    const enabledLabel = el('label', 'checkbox-label', 'Включён: построители могут использовать источник');
     enabledLabel.htmlFor = 'src-enabled';
     const enabledRow = el('div', 'checkbox-row');
     enabledRow.append(enabledChk, enabledLabel);
-
-    const isCreate = isNew;
-    if (!isCreate) {
-      urlF.root.hidden = true;
-      hwidF.root.hidden = true;
-      uaF.root.hidden = true;
-      headersF.root.hidden = true;
-    }
 
     const statusEl = el('div', 'modal-status');
     statusEl.setAttribute('role', 'alert');
     const showStatus = (n: Notice | null) => statusEl.replaceChildren(...(n ? [notice(n)] : []));
 
     const cancel = button('Отмена', 'btn btn-secondary');
-    const save = button(isNew ? 'Создать' : 'Сохранить', 'btn btn-primary');
+    const saveLabel = isNew ? 'Создать и синхронизировать' : 'Сохранить';
+    const save = button(saveLabel, 'btn btn-primary');
     const acts = el('div', 'modal-actions');
     acts.append(cancel, save);
 
     const body = el('div', 'modal-body');
     body.append(title, nameF.root, descF.root, typeF.root);
-    if (isCreate) body.append(urlF.root, hwidF.root, uaF.root, headersF.root);
+    if (isNew) {
+      body.append(urlF.root, hwidF.root, uaF.root, headersF.root,
+        el('p', 'field-hint', 'После создания сервер сразу скачает подписку и построит каталог серверов.'));
+    } else {
+      body.append(el('p', 'field-hint', 'URL и учётные данные изменить здесь нельзя: они только записываются при создании.'));
+    }
     body.append(enabledRow, statusEl, acts);
     dialog.append(body);
+
+    const fields: Readonly<Record<string, { setError: (t: string) => void; focus: () => void }>> = {
+      name: { setError: nameF.setError, focus: () => nameF.inp.focus() },
+      type: { setError: typeF.setError, focus: () => typeSel.focus() },
+      subscription_url: { setError: urlF.setError, focus: () => urlF.inp.focus() },
+      headers: { setError: headersF.setError, focus: () => headersF.inp.focus() },
+      hwid: { setError: hwidF.setError, focus: () => hwidF.inp.focus() },
+      user_agent: { setError: uaF.setError, focus: () => uaF.inp.focus() },
+    };
+    const FIELD_ERRORS: Readonly<Record<string, string>> = {
+      name: 'Введите название (до 255 символов).',
+      type: 'Выберите формат из списка.',
+      subscription_url: 'Нужен полный адрес http:// или https:// без #фрагмента.',
+      headers: 'Заголовки — JSON-объект {"Имя": "значение"}: имена без пробелов, значения без переносов строк.',
+      hwid: 'HWID не должен содержать переносов строк и управляющих символов.',
+      user_agent: 'User-Agent не должен содержать переносов строк и управляющих символов.',
+    };
+    const clearErrors = () => { for (const f of Object.values(fields)) f.setError(''); };
 
     let submitting = false;
     const handle = {
@@ -2693,45 +2850,63 @@ class AdminApp {
 
     save.addEventListener('click', async () => {
       if (submitting) return;
-      nameF.setError(''); descF.setError('');
+      clearErrors();
+      showStatus(null);
       const name = nameF.inp.value.trim();
-      if (!name) { nameF.setError('Введите название.'); nameF.inp.focus(); return; }
+      if (!name) { nameF.setError(FIELD_ERRORS.name); nameF.inp.focus(); return; }
+      const url = urlF.inp.value.trim();
+      if (isNew && !/^https?:\/\/[^\s/#]+/i.test(url)) { urlF.setError(FIELD_ERRORS.subscription_url); urlF.inp.focus(); return; }
+      const headers = headersF.inp.value.trim();
+      if (isNew && headers) {
+        let ok = false;
+        try { const parsed: unknown = JSON.parse(headers); ok = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed); } catch { ok = false; }
+        if (!ok) { headersF.setError(FIELD_ERRORS.headers); headersF.inp.focus(); return; }
+      }
       submitting = true;
       save.disabled = true; save.setAttribute('aria-busy', 'true');
-      setLabel(save, 'Сохраняем…');
-      showStatus(null);
+      setLabel(save, isNew ? 'Создаём и синхронизируем…' : 'Сохраняем…');
+      if (isNew) showStatus({ tone: 'info', text: 'Сервер скачивает подписку и строит каталог…' });
       try {
-        let updated: AdminSource;
         if (isNew) {
           const input: CreateSourceInput = {
-            name, description: descF.inp.value.trim(), type: typeF.inp.value.trim() || 'xui',
-            subscription_url: urlF.inp.value.trim(), hwid: hwidF.inp.value.trim(),
-            user_agent: uaF.inp.value.trim(), headers: headersF.inp.value.trim(),
+            name, description: descF.inp.value.trim(), type: typeSel.value,
+            subscription_url: url, hwid: hwidF.inp.value.trim(),
+            user_agent: uaF.inp.value.trim(), headers,
             enabled: enabledChk.checked,
           };
-          updated = await this.api.createSource(input);
+          const created = await this.api.createSource(input);
+          if (!isOpen()) return;
+          if (created.sync) this.applySyncResult(created.sync);
+          else this.replaceSource(created.source);
+          close();
+          this.toast('Источник создан.');
+          location.hash = `#/sources/${created.source.id}`;
         } else {
-          const input: UpdateSourceInput = {
-            name, description: descF.inp.value.trim(), type: typeF.inp.value.trim() || src!.type,
-          };
-          updated = await this.api.updateSource(src!.id, input);
+          const input: UpdateSourceInput = { name, description: descF.inp.value.trim(), type: typeSel.value };
+          const updated = await this.api.updateSource(src!.id, input);
+          if (!isOpen()) return;
+          this.replaceSource(updated);
+          if (this.sourceDetailView?.id === updated.id) {
+            this.sourceDetailView.source = updated;
+            this.paintSourceDetail(this.sourceDetailView);
+          }
+          close();
+          this.toast('Источник обновлён.');
         }
-        if (!isOpen()) return;
-        if (isNew) {
-          this.sourcesCache = this.sourcesCache ? [...this.sourcesCache, updated] : [updated];
-        } else {
-          this.sourcesCache = this.sourcesCache?.map(s => s.id === updated.id ? updated : s) ?? null;
-        }
-        close();
-        void this.loadSources();
-        this.toast(isNew ? 'Источник создан.' : 'Источник обновлён.');
       } catch (error) {
         if (!isOpen()) return;
         submitting = false;
         save.disabled = false; save.removeAttribute('aria-busy');
-        setLabel(save, isNew ? 'Создать' : 'Сохранить');
+        setLabel(save, saveLabel);
         if (await this.endIfSignedOut(error, isOpen)) return;
-        showStatus({ tone: 'error', text: `Не удалось сохранить. ${errorText(error)}` });
+        const target = error instanceof ApiError && error.code === 'invalid_source' ? fields[error.field] : undefined;
+        if (target) {
+          target.setError(FIELD_ERRORS[(error as ApiError).field]);
+          target.focus();
+          showStatus(null);
+        } else {
+          showStatus({ tone: 'error', text: `Не удалось сохранить. ${errorText(error)}` });
+        }
       }
     });
 
@@ -2739,6 +2914,246 @@ class AdminApp {
     this.root.append(dialog);
     dialog.showModal();
     nameF.inp.focus();
+  }
+
+  // Source details (#/sources/{id}) --------------------------------------------
+
+  private buildSourceDetail(id: number, header: HTMLElement, title: HTMLElement, desc: HTMLElement): HTMLElement {
+    const { actions, refresh, updated } = refreshActions(() => void this.loadSourceDetail());
+    const sync = button('Синхронизировать', 'btn btn-primary btn-sm', 'refresh');
+    sync.addEventListener('click', () => void this.syncFromDetail());
+    actions.prepend(sync);
+    header.classList.add('has-actions');
+    header.append(actions);
+    title.textContent = `Источник #${id}`;
+    desc.textContent = 'Каталог серверов по последней синхронизации.';
+
+    const wrap = el('div', 'source-detail');
+    const status = el('div', 'source-sync-status');
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    const body = el('div', 'source-detail-body');
+    wrap.append(status, body);
+    this.sourceDetailView = {
+      id, body, refresh, updated, title, desc, source: null, entries: null,
+      filter: { ...EMPTY_FILTER }, syncing: false, status, sync,
+    };
+    setLoading(body, 'Загружаем источник');
+    body.replaceChildren(skeletonPanel(4), skeletonPanel(8));
+    return wrap;
+  }
+
+  private async loadSourceDetail() {
+    const view = this.sourceDetailView;
+    if (!view) return;
+    const request = ++this.sourceDetailRequest;
+    const current = () => this.sourceDetailView === view && request === this.sourceDetailRequest;
+    setRefreshBusy(view.refresh, true);
+    try {
+      const [source, entries] = await Promise.all([this.api.getSource(view.id), this.api.listAllSourceEntries(view.id)]);
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      view.source = source;
+      view.entries = entries;
+      this.paintSourceDetail(view);
+      view.updated.textContent = `Обновлено в ${clockSeconds(new Date())}`;
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      setLoading(view.body, null);
+      if (error instanceof ApiError && error.status === 404) {
+        const back = el('a', 'btn btn-secondary btn-sm');
+        back.href = '#/sources';
+        back.append(el('span', 'btn-label', 'К списку источников'));
+        view.sync.disabled = true;
+        view.body.replaceChildren(messagePanel('sources', `Источника #${view.id} нет`, 'Возможно, он был удалён.', 'status', back));
+      } else if (view.source) {
+        this.toast(`Не удалось обновить источник. ${errorText(error)}`);
+      } else {
+        view.body.replaceChildren(messagePanel('alert', 'Не удалось загрузить источник', errorText(error), 'alert',
+          retryButton(() => void this.loadSourceDetail())));
+      }
+    } finally {
+      if (current()) setRefreshBusy(view.refresh, false);
+    }
+  }
+
+  private async syncFromDetail() {
+    const view = this.sourceDetailView;
+    if (!view || view.syncing) return;
+    view.syncing = true;
+    view.sync.disabled = true;
+    view.sync.setAttribute('aria-busy', 'true');
+    setLabel(view.sync, 'Синхронизируем…');
+    view.status.replaceChildren(notice({ tone: 'info', text: 'Синхронизация: сервер скачивает и разбирает подписку…' }));
+    const current = () => this.sourceDetailView === view;
+    try {
+      const result = await this.api.syncSource(view.id);
+      if (!current()) return;
+      this.applySyncResult(result);
+      view.source = result.source;
+      view.entries = await this.api.listAllSourceEntries(view.id);
+      if (!current()) return;
+      // Cleared before the repaint: it shows the sync outcome only when idle.
+      view.syncing = false;
+      this.paintSourceDetail(view);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      view.status.replaceChildren(notice({ tone: 'error', text: `Не удалось запустить синхронизацию. ${errorText(error)}` }));
+    } finally {
+      if (current()) {
+        view.syncing = false;
+        view.sync.disabled = false;
+        view.sync.removeAttribute('aria-busy');
+        setLabel(view.sync, 'Синхронизировать');
+      }
+    }
+  }
+
+  private paintSourceDetail(view: SourceDetailView) {
+    const src = view.source;
+    if (!src) return;
+    const entries = view.entries ?? [];
+    setLoading(view.body, null);
+    view.title.textContent = src.name;
+    view.desc.textContent = `${formatLabel(src.type)} · ${src.enabled ? 'включён' : 'отключён'}${src.description ? ` · ${src.description}` : ''}`;
+    document.title = `${src.name} · Источники · RS8 Admin`;
+    const last = this.syncNotices.get(src.id);
+    view.status.replaceChildren(...(last && !view.syncing ? [notice(last)] : []));
+
+    const state = syncState(src);
+    const c = src.catalogue;
+
+    // Summary --------------------------------------------------------------
+    const summary = el('section', 'panel');
+    summary.setAttribute('aria-labelledby', 'src-summary-title');
+    const facts = el('dl', 'facts');
+    const syncValue = el('span', 'source-sync-value');
+    syncValue.append(syncBadge(state));
+    facts.append(
+      fact('Серверы', serversLabel(c.entries), c.absent > 0 ? `Исчезли из подписки: ${formatCount(c.absent)}` : undefined),
+      fact('Страны', countriesLabel(c.countries), c.no_country > 0 ? `Без страны: ${formatCount(c.no_country)}` : undefined),
+      fact('Протоколы', protocolsText(c.protocols)),
+      fact('Формат', formatLabel(src.type)),
+      fact('Синхронизация', syncValue, (state === 'error' || state === 'partial') ? syncErrorText(src.last_sync_error) : undefined,
+        state === 'error' ? 'is-danger' : ''),
+      fact('Когда', src.last_sync_at ? formatDateTime(src.last_sync_at) : 'Ещё не было',
+        state === 'error' ? 'Показан каталог последней успешной синхронизации' : undefined),
+    );
+    const manage = el('div', 'source-detail-actions');
+    const editBtn = button('Изменить', 'btn btn-secondary btn-sm', 'edit');
+    editBtn.addEventListener('click', () => this.openSourceEditor(src));
+    const toggleBtn = button(src.enabled ? 'Отключить' : 'Включить', 'btn btn-secondary btn-sm');
+    toggleBtn.addEventListener('click', () => void this.toggleSource(src, toggleBtn));
+    manage.append(editBtn, toggleBtn);
+    summary.append(panelHead('src-summary-title', 'Сводка', catalogueSummary(c)), facts, manage);
+
+    // Countries ------------------------------------------------------------
+    const countries = el('section', 'panel');
+    countries.setAttribute('aria-labelledby', 'src-countries-title');
+    countries.append(panelHead('src-countries-title', 'Страны', countriesLabel(c.countries)));
+    const chips = el('ul', 'country-chips');
+    const chip = (code: string, label: string, count: number) => {
+      const li = el('li');
+      const b = button(`${label} · ${formatCount(count)}`, 'chip country-chip');
+      b.dataset.country = code;
+      b.setAttribute('aria-pressed', String(view.filter.country === code));
+      b.addEventListener('click', () => {
+        view.filter = { ...view.filter, country: view.filter.country === code ? '' : code };
+        this.paintSourceDetail(view);
+        this.sourceDetailView?.body.querySelector<HTMLButtonElement>(`.country-chip[data-country="${code}"]`)?.focus();
+      });
+      li.append(b);
+      return li;
+    };
+    for (const { code, count } of c.by_country) chips.append(chip(code, `${flagEmoji(code)} ${code}`.trim(), count));
+    if (c.no_country > 0) chips.append(chip('-', 'Без страны', c.no_country));
+    if (c.by_country.length === 0 && c.no_country === 0) countries.append(el('p', 'panel-note', 'Серверов в каталоге нет.'));
+    else countries.append(chips);
+
+    // Servers --------------------------------------------------------------
+    const servers = el('section', 'panel');
+    servers.setAttribute('aria-labelledby', 'src-servers-title');
+    const absent = entries.filter(e => !e.present).length;
+    servers.append(panelHead('src-servers-title', 'Серверы', serversLabel(entries.length - absent)));
+
+    const toolbar = el('div', 'toolbar source-filters');
+    const countrySel = el('select', 'input');
+    countrySel.id = 'src-filter-country';
+    countrySel.append(option('', 'Все страны'));
+    for (const { code, count } of c.by_country) countrySel.append(option(code, `${flagEmoji(code)} ${code} (${formatCount(count)})`));
+    if (c.no_country > 0) countrySel.append(option('-', `Без страны (${formatCount(c.no_country)})`));
+    countrySel.value = view.filter.country;
+    const protocolSel = el('select', 'input');
+    protocolSel.id = 'src-filter-protocol';
+    protocolSel.append(option('', 'Все протоколы'));
+    for (const p of protocolsOf(entries)) protocolSel.append(option(p, p));
+    protocolSel.value = view.filter.protocol;
+    const search = el('input', 'input');
+    Object.assign(search, { id: 'src-filter-q', type: 'search', value: view.filter.query, placeholder: 'Имя сервера', spellcheck: false });
+    const absentChk = el('input', 'checkbox');
+    absentChk.type = 'checkbox';
+    absentChk.id = 'src-filter-absent';
+    absentChk.checked = view.filter.showAbsent;
+    const absentLabel = el('label', 'checkbox-label', `Показывать исчезнувшие (${formatCount(absent)})`);
+    absentLabel.htmlFor = absentChk.id;
+    const absentRow = el('div', 'checkbox-row');
+    absentRow.append(absentChk, absentLabel);
+    toolbar.append(field('Страна', countrySel).root, field('Протокол', protocolSel).root, field('Поиск по имени', search).root, absentRow);
+
+    const shown = el('p', 'source-filter-count');
+    shown.setAttribute('aria-live', 'polite');
+    const table = el('table', 'table source-entries');
+    table.append(el('caption', 'sr-only', `Серверы источника ${src.name}`),
+      headRow([['#', 'num'], ['Сервер', ''], ['Страна', ''], ['Протокол', ''], ['Fingerprint', 'col-lg'], ['В подписке', '']]));
+    const tbody = el('tbody');
+    table.append(tbody);
+    const tableWrap = el('div', 'table-wrap');
+    tableWrap.append(table);
+
+    const renderRows = () => {
+      const list = filterEntries(entries, view.filter);
+      shown.textContent = `Показано ${formatCount(list.length)} из ${formatCount(view.filter.showAbsent ? entries.length : entries.length - absent)}`;
+      tbody.replaceChildren(...list.map(e => {
+        const tr = el('tr', e.present ? '' : 'is-absent');
+        const fp = el('code', 'fingerprint', shortFingerprint(e.fingerprint));
+        fp.title = e.fingerprint;
+        tr.append(
+          cell('#', e.present ? String(e.upstream_position + 1) : '—', 'num'),
+          cell('Сервер', e.original_name || '(без имени)'),
+          cell('Страна', e.country_code ? `${flagEmoji(e.country_code)} ${e.country_code}` : '—'),
+          cell('Протокол', e.protocol || '—'),
+          cell('Fingerprint', fp, 'col-lg'),
+          cell('В подписке', e.present ? 'Да' : `Исчез · ${formatDateTime(e.last_seen_at)}`),
+        );
+        return tr;
+      }));
+      if (list.length === 0) {
+        const tr = el('tr');
+        const td = el('td', 'empty-row', entries.length === 0 ? 'Каталог пуст. Нажмите «Синхронизировать».' : 'Нет серверов под выбранные фильтры.');
+        td.colSpan = 6;
+        tr.append(td);
+        tbody.append(tr);
+      }
+    };
+    const onFilter = () => {
+      view.filter = {
+        country: countrySel.value, protocol: protocolSel.value, query: search.value, showAbsent: absentChk.checked,
+      };
+      for (const b of view.body.querySelectorAll<HTMLButtonElement>('.country-chip')) {
+        b.setAttribute('aria-pressed', String(b.dataset.country === view.filter.country));
+      }
+      renderRows();
+    };
+    countrySel.addEventListener('change', onFilter);
+    protocolSel.addEventListener('change', onFilter);
+    search.addEventListener('input', onFilter);
+    absentChk.addEventListener('change', onFilter);
+    renderRows();
+    servers.append(toolbar, shown, tableWrap);
+
+    view.body.replaceChildren(summary, countries, servers);
   }
 
   // ===========================================================================
@@ -2882,6 +3297,13 @@ class AdminApp {
     let selectedSourceIds: number[] = b?.sources?.slice().sort((a, x) => a.position - x.position).map(s => s.source_id) ?? [];
     // Items (rules) — local copy for drag-reorder
     let localItems: BuilderItem[] = b?.items?.slice().sort((a, x) => a.position - x.position) ?? [];
+    // Rules stored on the server: those removed locally are deleted on save.
+    let serverItemIds = new Set(localItems.map(it => it.id).filter(id => id > 0));
+    // Assigned below; the source picker repaints the rules (their warnings
+    // depend on which sources are linked).
+    let renderItems: () => void = () => {};
+    // Preview always reflects the SAVED builder, exactly like /sub.
+    const previewNote = el('p', 'field-hint preview-note');
 
     // ---- Dialog shell ----
     const dialog = el('dialog', 'modal modal-editor');
@@ -2894,7 +3316,11 @@ class AdminApp {
     const unsavedBadge = el('span', 'badge badge-warn unsaved-badge');
     unsavedBadge.textContent = 'Несохранённые изменения';
     unsavedBadge.hidden = true;
-    const markUnsaved = () => { unsaved = true; unsavedBadge.hidden = false; };
+    const markUnsaved = () => {
+      unsaved = true;
+      unsavedBadge.hidden = false;
+      previewNote.textContent = 'Есть несохранённые изменения: предпросмотр показывает сохранённую версию. Сохраните, чтобы увидеть результат.';
+    };
 
     // ---- Basic fields ----
     const mkInp = (id: string, labelText: string, value = '', hint?: string) => {
@@ -2932,6 +3358,17 @@ class AdminApp {
     sourcesPanel.append(sourcesPanelHead);
 
     const sourcesListEl = el('ul', 'sources-picker');
+    sourcesListEl.setAttribute('aria-label', 'Источники построителя');
+    const sourcesTotal = el('p', 'sources-total');
+    sourcesTotal.setAttribute('aria-live', 'polite');
+    const sourceMeta = (src: AdminSource) => {
+      const meta = el('span', 'source-pick-meta');
+      const state = syncState(src);
+      meta.append(el('span', 'source-pick-stats', state === 'never' && src.catalogue.entries === 0
+        ? 'каталог не загружен' : catalogueSummary(src.catalogue)), syncBadge(state));
+      if (!src.enabled) meta.append(enabledBadge(false));
+      return meta;
+    };
     const renderSourcesPicker = () => {
       sourcesListEl.replaceChildren();
       const allSources = this.sourcesCache ?? [];
@@ -2946,57 +3383,77 @@ class AdminApp {
         dragHandle.append(icon('drag'));
         dragHandle.setAttribute('aria-hidden', 'true');
         const lbl = el('span', 'source-pick-name', src.name);
-        const bdg = el('span', src.enabled ? 'badge badge-active' : 'badge badge-disabled',
-          src.enabled ? 'Активен' : 'Отключён');
         const removeBtn = button('Убрать', 'btn btn-secondary btn-xs');
+        removeBtn.setAttribute('aria-label', `Убрать «${src.name}»`);
         removeBtn.addEventListener('click', () => {
           selectedSourceIds = selectedSourceIds.filter(id => id !== src.id);
           markUnsaved();
           renderSourcesPicker();
         });
-        li.append(dragHandle, lbl, bdg, removeBtn);
+        li.append(dragHandle, lbl, sourceMeta(src), removeBtn);
         sourcesListEl.append(li);
       }
       for (const src of unselected) {
         const li = el('li', 'source-pick-item');
         li.dataset.srcId = String(src.id);
         const lbl = el('span', 'source-pick-name', src.name);
-        const bdg = el('span', src.enabled ? 'badge badge-active' : 'badge badge-disabled',
-          src.enabled ? 'Активен' : 'Отключён');
         const addBtn = button('Добавить', 'btn btn-primary btn-xs');
+        addBtn.setAttribute('aria-label', `Добавить «${src.name}»`);
         addBtn.addEventListener('click', () => {
           selectedSourceIds = [...selectedSourceIds, src.id];
           markUnsaved();
           renderSourcesPicker();
         });
-        li.append(lbl, bdg, addBtn);
+        li.append(lbl, sourceMeta(src), addBtn);
         sourcesListEl.append(li);
       }
       if (allSources.length === 0) {
-        sourcesListEl.append(el('li', 'source-pick-empty', 'Источники не загружены. Обновите страницу.'));
+        sourcesListEl.append(el('li', 'source-pick-empty', this.sourcesCache ? 'Источников нет. Добавьте их в разделе «Источники».' : 'Загружаем источники…'));
       }
+      // Sources are merged only here: the total is the sum of the selected
+      // catalogues, countries are counted once across them.
+      const total = builderSourcesSummary(selected);
+      const skipped = total.disabled > 0 ? ` Отключённые (${formatCount(total.disabled)}) не учитываются: сборка их пропускает.` : '';
+      sourcesTotal.textContent = selected.length === 0 ? 'Источники не выбраны.'
+        : `Итого: ${serversLabel(total.entries)} · ${countriesLabel(total.countries)} (уникальных) из ${formatCount(selected.length)} ${pluralRu(selected.length, 'источника', 'источников', 'источников')}.${skipped}`;
       setupDragReorder(sourcesListEl, 'source-pick-selected', (newOrder) => {
         selectedSourceIds = newOrder.map(Number);
         markUnsaved();
+        renderSourcesPicker();
       });
+      renderItems();
     };
     renderSourcesPicker();
-    sourcesPanel.append(sourcesListEl);
+    if (!this.sourcesCache) {
+      void this.api.listSources().then(sources => {
+        this.sourcesCache = sources;
+        if (dialog.isConnected) renderSourcesPicker();
+      }).catch(() => {
+        if (dialog.isConnected) sourcesListEl.replaceChildren(el('li', 'source-pick-empty', 'Не удалось загрузить источники. Закройте редактор и повторите.'));
+      });
+    }
+    sourcesPanel.append(sourcesListEl, sourcesTotal);
 
     // ---- Items (rules) panel ----
     const itemsPanel = el('section', 'editor-panel');
     itemsPanel.setAttribute('aria-labelledby', 'be-items-title');
     const itemsPanelHead = panelHead('be-items-title', 'Правила');
-    itemsPanelHead.append(el('p', 'panel-note', 'Правила определяют, какие серверы и страны включаются в подписку и в каком порядке.'));
+    itemsPanelHead.append(el('p', 'panel-note',
+      'Правила определяют, какие серверы и страны включаются в подписку и в каком порядке. Без правил в подписку попадают все серверы подключённых источников.'));
     itemsPanel.append(itemsPanelHead);
 
     const itemsListEl = el('ul', 'items-list');
+    itemsListEl.setAttribute('aria-label', 'Правила построителя');
     const addItemBtn = button('Добавить правило', 'btn btn-secondary btn-sm', 'plus');
+    const ruleContext: RuleContext = {
+      sources: () => this.sourcesCache ?? [],
+      selectedIds: () => selectedSourceIds,
+    };
 
-    const renderItems = () => {
+    renderItems = () => {
       itemsListEl.replaceChildren();
       if (localItems.length === 0) {
-        itemsListEl.append(el('li', 'items-empty', 'Правил пока нет. Добавьте страну или конкретный узел.'));
+        itemsListEl.append(el('li', 'items-empty', 'Правил пока нет. Добавьте страну или конкретный сервер.'));
       }
       for (let i = 0; i < localItems.length; i++) {
         const item = localItems[i];
@@ -3004,7 +3461,7 @@ class AdminApp {
           localItems = updated;
           markUnsaved();
           renderItems();
-        }, currentBuilder, isNew));
+        }, ruleContext));
       }
       setupDragReorder(itemsListEl, 'item-row', (newOrder) => {
         const reordered = newOrder.map(idx => localItems[Number(idx)]);
@@ -3016,7 +3473,7 @@ class AdminApp {
     renderItems();
 
     addItemBtn.addEventListener('click', () => {
-      this.openItemEditor(null, currentBuilder, selectedSourceIds, (newItem) => {
+      this.openItemEditor(null, ruleContext, (newItem) => {
         localItems = [...localItems, { ...newItem, position: localItems.length }];
         markUnsaved();
         renderItems();
@@ -3033,7 +3490,7 @@ class AdminApp {
     previewBtn.disabled = isNew;
     previewBtn.title = isNew ? 'Сначала сохраните построитель' : '';
     previewBtn.addEventListener('click', () => void this.runPreview(currentBuilder, previewBody, previewBtn));
-    previewPanel.append(previewBody, previewBtn);
+    previewPanel.append(previewNote, previewBody, previewBtn);
 
     // ---- Status / actions ----
     const statusEl = el('div', 'modal-status');
@@ -3092,7 +3549,9 @@ class AdminApp {
 
       try {
         let saved: AdminBuilder;
-        if (isNew) {
+        // A new builder is created once; later saves in the same editor update it.
+        const creating = currentBuilder === null;
+        if (creating) {
           const input: CreateBuilderInput = {
             request_key: newRequestKey(),
             name, description: descF.inp.value.trim(),
@@ -3119,13 +3578,21 @@ class AdminApp {
         if (!isOpen()) return;
 
         // Save sources order
-        if (selectedSourceIds.length > 0 || !isNew) {
+        if (selectedSourceIds.length > 0 || !creating) {
           await this.api.setBuilderSources(saved.id, selectedSourceIds);
         }
 
+        // Rules removed in the editor are deleted, so Preview and /sub match
+        // what the editor shows.
+        const keptIds = new Set(localItems.map(it => it.id));
+        for (const id of serverItemIds) {
+          if (!keptIds.has(id)) await this.api.deleteBuilderItem(saved.id, id);
+        }
+        serverItemIds = new Set([...serverItemIds].filter(id => keptIds.has(id)));
+
         // Save items (upsert all, then reorder)
+        const upserted: BuilderItem[] = [];
         if (localItems.length > 0) {
-          const upserted: BuilderItem[] = [];
           for (const item of localItems) {
             const inp: UpsertBuilderItemInput = {
               id: item.id > 0 ? item.id : undefined,
@@ -3146,9 +3613,15 @@ class AdminApp {
             await this.api.reorderBuilderItems(saved.id, upserted.map(it => it.id));
           }
         }
+        // The server ids replace the local placeholders: a second save updates
+        // these rules instead of creating copies.
+        localItems = upserted.map((it, pos) => ({ ...it, position: pos }));
+        serverItemIds = new Set(localItems.map(it => it.id));
 
         if (!isOpen()) return;
         currentBuilder = saved;
+        previewNote.textContent = '';
+        renderItems();
         unsaved = false;
         unsavedBadge.hidden = true;
         titleEl.textContent = `Построитель: ${saved.name}`;
@@ -3156,13 +3629,13 @@ class AdminApp {
         previewBtn.title = '';
 
         // Update cache
-        if (isNew) {
+        if (creating) {
           this.buildersCache = this.buildersCache ? [...this.buildersCache, saved] : [saved];
         } else {
           this.buildersCache = this.buildersCache?.map(x => x.id === saved.id ? saved : x) ?? null;
         }
         void this.loadBuilders();
-        this.toast(isNew ? 'Построитель создан.' : 'Построитель сохранён.');
+        this.toast(creating ? 'Построитель создан.' : 'Построитель сохранён.');
         submitting = false;
         saveBtn.disabled = false; saveBtn.removeAttribute('aria-busy');
         setLabel(saveBtn, 'Сохранить');
@@ -3171,7 +3644,7 @@ class AdminApp {
         if (!isOpen()) return;
         submitting = false;
         saveBtn.disabled = false; saveBtn.removeAttribute('aria-busy');
-        setLabel(saveBtn, isNew ? 'Создать' : 'Сохранить');
+        setLabel(saveBtn, currentBuilder === null ? 'Создать' : 'Сохранить');
         if (await this.endIfSignedOut(error, isOpen)) return;
         const code = error instanceof ApiError ? error.code : '';
         const status = error instanceof ApiError ? error.status : 0;
@@ -3193,99 +3666,244 @@ class AdminApp {
   }
 
   // ---- Item row in builder editor ----
+  // A rule reads against the real catalogue of its source: a country rule
+  // shows how many servers it yields now, a rule on an unlinked or disabled
+  // source says it serves nothing.
   private buildItemRow(
     item: BuilderItem,
     index: number,
     allItems: BuilderItem[],
     onChange: (updated: BuilderItem[]) => void,
-    _builder: AdminBuilder | null,
-    _isNew: boolean,
+    ctx: RuleContext,
   ): HTMLElement {
-    const li = el('li', 'item-row');
+    const summary = ruleSummary(item, ctx.sources(), ctx.selectedIds());
+    const li = el('li', item.enabled ? 'item-row' : 'item-row is-disabled');
     li.draggable = true;
     li.dataset.dragIdx = String(index);
+    li.dataset.kind = item.kind;
+    li.setAttribute('aria-label', summary.title);
 
     const dragHandle = el('span', 'drag-handle');
     dragHandle.append(icon('drag'));
     dragHandle.setAttribute('aria-hidden', 'true');
 
-    const kindBadge = el('span', item.kind === 'country' ? 'badge badge-country' : 'badge badge-node',
-      item.kind === 'country' ? '🌍 Страна' : '🖥 Узел');
-
-    const nameEl = el('span', 'item-name');
-    if (item.kind === 'country') {
-      nameEl.textContent = item.custom_name || item.country_code || '—';
-    } else {
-      nameEl.textContent = item.custom_name || item.original_name || item.fingerprint || '—';
-    }
-
-    const enabledBadge = el('span', item.enabled ? 'badge badge-active' : 'badge badge-disabled',
-      item.enabled ? 'Вкл' : 'Выкл');
+    const body = el('div', 'item-body');
+    const head = el('div', 'item-head');
+    head.append(
+      el('span', item.kind === 'country' ? 'tag tag-on' : 'tag', item.kind === 'country' ? 'Страна' : 'Сервер'),
+      el('span', 'item-name', summary.title),
+    );
+    if (!item.enabled) head.append(el('span', 'tag', 'Выключено'));
+    body.append(head, el('p', 'item-detail', summary.detail));
+    if (summary.warning) body.append(el('p', 'item-warn', summary.warning));
 
     const editBtn = button('Изменить', 'btn btn-secondary btn-xs', 'edit');
+    editBtn.setAttribute('aria-label', `Изменить правило «${summary.title}»`);
     editBtn.addEventListener('click', () => {
-      this.openItemEditor(item, _builder, [], (updated) => {
+      this.openItemEditor(item, ctx, (updated) => {
         onChange(allItems.map((it, i) => i === index ? { ...updated, position: it.position } : it));
       });
     });
 
     const deleteBtn = button('Удалить', 'btn btn-secondary btn-xs', 'trash');
+    deleteBtn.setAttribute('aria-label', `Удалить правило «${summary.title}»`);
     deleteBtn.addEventListener('click', () => {
       if (!window.confirm('Удалить правило?')) return;
-      // If item has a real id, delete from server on next save (handled by caller)
+      // The builder editor deletes it on the server on the next save.
       onChange(allItems.filter((_, i) => i !== index).map((it, pos) => ({ ...it, position: pos })));
     });
 
     const acts = el('div', 'item-actions');
     acts.append(editBtn, deleteBtn);
 
-    li.append(dragHandle, kindBadge, nameEl, enabledBadge, acts);
+    li.append(dragHandle, body, acts);
     return li;
   }
 
   // ---- Item editor sub-dialog ----
-  private openItemEditor(
-    item: BuilderItem | null,
-    _builder: AdminBuilder | null,
-    _sourceIds: number[],
-    onSave: (item: BuilderItem) => void,
-  ) {
+  // Source, country and server come from the source catalogues; nothing is
+  // typed by hand except an ISO code for a country not in the catalogue yet.
+  private openItemEditor(item: BuilderItem | null, ctx: RuleContext, onSave: (item: BuilderItem) => void) {
     const isNew = item === null;
-    const dialog = el('dialog', 'modal modal-wide');
+    const dialog = el('dialog', 'modal modal-wide rule-editor');
     dialog.setAttribute('aria-labelledby', 'ie-title');
+    const close = () => { if (dialog.open) dialog.close(); dialog.remove(); };
 
     const titleEl = el('h2', 'modal-title', isNew ? 'Новое правило' : 'Изменить правило');
     titleEl.id = 'ie-title';
 
-    // Kind selector
+    // The builder's sources in their order, plus the rule's own source when
+    // it was unlinked meanwhile (so the rule can be moved to a linked one).
+    const all = ctx.sources();
+    const selectedIds = ctx.selectedIds();
+    const choices = selectedIds.map(id => all.find(s => s.id === id)).filter((s): s is AdminSource => s !== undefined);
+    if (item && !choices.some(s => s.id === item.source_id)) {
+      const own = all.find(s => s.id === item.source_id);
+      if (own) choices.push(own);
+    }
+
     const kindSel = el('select', 'input');
     kindSel.id = 'ie-kind';
-    const optCountry = el('option', '', 'Страна');
-    optCountry.value = 'country';
-    const optNode = el('option', '', 'Узел');
-    optNode.value = 'node';
-    kindSel.append(optCountry, optNode);
+    kindSel.append(option('country', 'Страна — все её серверы (динамически)'), option('node', 'Конкретный сервер'));
     kindSel.value = item?.kind ?? 'country';
-    const kindField = el('div', 'field');
-    const kindLabel = el('label', 'field-label', 'Тип правила');
-    kindLabel.htmlFor = 'ie-kind';
-    kindField.append(kindLabel, el('div', 'control', ''));
-    kindField.querySelector('.control')!.append(kindSel);
+    const kindF = field('Тип правила', kindSel);
+
+    const sourceSel = el('select', 'input');
+    sourceSel.id = 'ie-source';
+    for (const s of choices) {
+      const unlinked = selectedIds.includes(s.id) ? '' : ' (не подключён)';
+      sourceSel.append(option(String(s.id), `${s.name} — ${catalogueSummary(s.catalogue)}${unlinked}`));
+    }
+    sourceSel.value = String(item?.source_id ?? choices[0]?.id ?? '');
+    const sourceF = field('Источник', sourceSel);
+    const sourceHint = el('p', 'field-hint');
+    sourceF.root.append(sourceHint);
+    const currentSource = () => choices.find(s => String(s.id) === sourceSel.value);
+
+    // ---- Country rule ----
+    const OTHER = '*other';
+    const countrySel = el('select', 'input');
+    countrySel.id = 'ie-country';
+    const countryF = field('Страна', countrySel);
+    const countryHint = el('p', 'field-hint rule-live');
+    countryHint.setAttribute('aria-live', 'polite');
+    countryF.root.append(countryHint);
+    const otherInp = el('input', 'input');
+    Object.assign(otherInp, { id: 'ie-country-other', type: 'text', maxLength: 2, placeholder: 'Например: NL', spellcheck: false, autocomplete: 'off' });
+    const otherF = field('Код страны (ISO 3166-1 alpha-2)', otherInp);
+    otherF.root.append(el('p', 'field-hint', 'Правило начнёт работать, когда серверы этой страны появятся в источнике.'));
+    let countryValue = item?.kind === 'country' ? item.country_code.toUpperCase() : '';
+    const chosenCountry = () => (countrySel.value === OTHER ? otherInp.value.trim().toUpperCase() : countrySel.value);
+    const syncCountry = () => {
+      otherF.root.hidden = kindSel.value !== 'country' || countrySel.value !== OTHER;
+      const code = chosenCountry();
+      countryHint.textContent = COUNTRY_CODE.test(code)
+        ? `Динамическое правило: при каждой сборке подписки берутся все серверы ${countryLabel(code)} из источника. Сейчас в каталоге: ${serversLabel(countryCount(currentSource(), code))}.`
+        : '';
+    };
+    const fillCountries = () => {
+      const list = currentSource()?.catalogue.by_country ?? [];
+      countrySel.replaceChildren(...list.map(({ code, count }) => option(code, `${countryLabel(code)} — ${serversLabel(count)}`)),
+        option(OTHER, 'Другая страна…'));
+      if (countryValue && list.some(c => c.code === countryValue)) countrySel.value = countryValue;
+      else if (countryValue) { countrySel.value = OTHER; otherInp.value = countryValue; }
+      else countrySel.value = list[0]?.code ?? OTHER;
+      syncCountry();
+    };
+    countrySel.addEventListener('change', () => {
+      countryValue = chosenCountry();
+      countryF.setError(''); otherF.setError('');
+      syncCountry();
+    });
+    otherInp.addEventListener('input', () => {
+      countryValue = chosenCountry();
+      otherF.setError('');
+      syncCountry();
+    });
+
+    // ---- Node rule: pick a server from the source catalogue ----
+    const nodeBox = el('div', 'field rule-node');
+    const nodeLabel = el('p', 'field-label', 'Сервер');
+    nodeLabel.id = 'ie-node-label';
+    const nodeChosen = el('p', 'rule-node-chosen');
+    nodeChosen.setAttribute('aria-live', 'polite');
+    const nodeSearch = el('input', 'input');
+    Object.assign(nodeSearch, { id: 'ie-node-q', type: 'search', placeholder: 'Поиск по имени', spellcheck: false, autocomplete: 'off' });
+    nodeSearch.setAttribute('aria-label', 'Поиск сервера по имени');
+    const nodeCountry = el('select', 'input');
+    nodeCountry.id = 'ie-node-country';
+    nodeCountry.setAttribute('aria-label', 'Страна сервера');
+    const nodeTools = el('div', 'rule-node-tools');
+    nodeTools.append(nodeSearch, nodeCountry);
+    const nodeList = el('ul', 'entry-pick');
+    nodeList.setAttribute('aria-labelledby', nodeLabel.id);
+    const nodeCount = el('p', 'field-hint');
+    const nodeError = el('p', 'field-error');
+    nodeBox.append(nodeLabel, nodeChosen, nodeTools, nodeList, nodeCount, nodeError);
+
+    let picked: { sourceId: number; fingerprint: string; original_name: string } | null =
+      item?.kind === 'node' ? { sourceId: item.source_id, fingerprint: item.fingerprint, original_name: item.original_name } : null;
+    let entries: readonly SourceEntry[] | null = null;
+    let entriesFor = 0;
+    let entriesRequest = 0;
+
+    const paintNodes = () => {
+      const src = currentSource();
+      const mine = picked && src && picked.sourceId === src.id ? picked : null;
+      const res = mine && entries ? resolveNode(mine.fingerprint, mine.original_name, entries) : null;
+      if (!mine) {
+        nodeChosen.textContent = 'Сервер не выбран.';
+        nodeChosen.className = 'rule-node-chosen';
+      } else {
+        const name = mine.original_name || shortFingerprint(mine.fingerprint);
+        nodeChosen.textContent = `Выбран: ${name}${res ? ` · ${RESOLUTION_LABELS[res.status]}` : ''}`;
+        nodeChosen.className = res && (res.status === 'missing' || res.status === 'conflict') ? 'rule-node-chosen is-danger' : 'rule-node-chosen';
+      }
+      if (!entries) return;
+      const { shown, total } = pickableEntries(entries, nodeSearch.value, nodeCountry.value);
+      nodeList.replaceChildren(...shown.map(e => {
+        const li = el('li');
+        const pick = el('button', 'entry-pick-item');
+        pick.type = 'button';
+        pick.dataset.fingerprint = e.fingerprint;
+        pick.setAttribute('aria-pressed', String(res?.entry?.fingerprint === e.fingerprint));
+        pick.append(el('span', 'entry-pick-name', e.original_name || '(без имени)'),
+          el('span', 'entry-pick-meta', [e.country_code ? countryLabel(e.country_code) : 'Без страны', e.protocol].filter(Boolean).join(' · ')));
+        pick.addEventListener('click', () => {
+          picked = { sourceId: e.source_id, fingerprint: e.fingerprint, original_name: e.original_name };
+          nodeError.textContent = '';
+          paintNodes();
+          nodeList.querySelector<HTMLButtonElement>(`[data-fingerprint="${CSS.escape(e.fingerprint)}"]`)?.focus();
+        });
+        li.append(pick);
+        return li;
+      }));
+      if (total === 0) {
+        nodeList.append(el('li', 'entry-pick-empty',
+          entries.length === 0 ? 'Каталог источника пуст. Синхронизируйте источник.' : 'Нет серверов под выбранный фильтр.'));
+      }
+      nodeCount.textContent = total > shown.length
+        ? `Показаны первые ${formatCount(shown.length)} из ${formatCount(total)}. Уточните поиск.`
+        : `Серверов: ${formatCount(total)}`;
+    };
+
+    const loadEntries = async () => {
+      const src = currentSource();
+      if (!src) return;
+      if (entries && entriesFor === src.id) { paintNodes(); return; }
+      const request = ++entriesRequest;
+      entries = null;
+      nodeCount.textContent = '';
+      nodeList.replaceChildren(el('li', 'entry-pick-empty', 'Загружаем серверы источника…'));
+      paintNodes();
+      try {
+        const list = await this.api.listSourceEntries(src.id);
+        if (request !== entriesRequest || !dialog.isConnected) return;
+        entries = list;
+        entriesFor = src.id;
+        nodeCountry.replaceChildren(option('', 'Все страны'),
+          ...src.catalogue.by_country.map(({ code, count }) => option(code, `${countryLabel(code)} (${formatCount(count)})`)));
+        if (src.catalogue.no_country > 0) nodeCountry.append(option('-', `Без страны (${formatCount(src.catalogue.no_country)})`));
+        paintNodes();
+      } catch (error) {
+        if (request !== entriesRequest || !dialog.isConnected) return;
+        if (await this.endIfSignedOut(error, () => dialog.isConnected)) { close(); return; }
+        nodeList.replaceChildren(el('li', 'entry-pick-empty', `Не удалось загрузить серверы. ${errorText(error)}`));
+      }
+    };
+    nodeSearch.addEventListener('input', paintNodes);
+    nodeCountry.addEventListener('change', paintNodes);
 
     const mkInp = (id: string, labelText: string, value = '', hint?: string) => {
       const inp = el('input', 'input');
-      Object.assign(inp, { id, type: 'text', value, spellcheck: false });
+      Object.assign(inp, { id, type: 'text', value, spellcheck: false, autocomplete: 'off' });
       const f = field(labelText, inp);
       if (hint) f.root.append(el('p', 'field-hint', hint));
       return { inp, ...f };
     };
-
-    const countryF = mkInp('ie-country', 'Код страны (ISO 3166-1 alpha-2)', item?.country_code ?? '', 'Например: RU, DE, US');
-    const fingerprintF = mkInp('ie-fingerprint', 'Fingerprint узла', item?.fingerprint ?? '');
-    const origNameF = mkInp('ie-orig-name', 'Оригинальное имя', item?.original_name ?? '');
-    const customNameF = mkInp('ie-custom-name', 'Пользовательское имя', item?.custom_name ?? '', 'Если задано, заменяет оригинальное имя в подписке.');
-    const descF = mkInp('ie-desc', 'Описание', item?.description ?? '');
-    const sourceIdF = mkInp('ie-source-id', 'ID источника', String(item?.source_id ?? 0), 'Числовой ID источника (0 = любой)');
+    const customNameF = mkInp('ie-custom-name', 'Своё имя', item?.custom_name ?? '',
+      'Если задано, заменяет имя сервера в подписке (для правила страны — у каждого её сервера).');
+    const descF = mkInp('ie-desc', 'Описание', item?.description ?? '', 'Видно только в панели.');
 
     const enabledChk = el('input', 'checkbox');
     enabledChk.type = 'checkbox';
@@ -3296,14 +3914,24 @@ class AdminApp {
     const enabledRow = el('div', 'checkbox-row');
     enabledRow.append(enabledChk, enabledLabel);
 
-    const updateVisibility = () => {
+    const syncSource = () => {
+      const src = currentSource();
+      sourceHint.textContent = !src ? ''
+        : !selectedIds.includes(src.id) ? 'Источник не подключён к построителю: такое правило не применяется. Выберите подключённый источник.'
+          : !src.enabled ? 'Источник отключён: сборка его пропускает.'
+            : syncState(src) === 'never' ? 'Источник ещё не синхронизирован: каталог пуст.'
+              : `Каталог: ${catalogueSummary(src.catalogue)} · ${lastSyncText(src)}`;
+      fillCountries();
+    };
+    const updateKind = () => {
       const isCountry = kindSel.value === 'country';
       countryF.root.hidden = !isCountry;
-      fingerprintF.root.hidden = isCountry;
-      origNameF.root.hidden = isCountry;
+      nodeBox.hidden = isCountry;
+      syncCountry();
+      if (!isCountry) void loadEntries();
     };
-    kindSel.addEventListener('change', updateVisibility);
-    updateVisibility();
+    sourceSel.addEventListener('change', () => { syncSource(); if (kindSel.value === 'node') void loadEntries(); });
+    kindSel.addEventListener('change', updateKind);
 
     const statusEl = el('div', 'modal-status');
     statusEl.setAttribute('role', 'alert');
@@ -3314,78 +3942,113 @@ class AdminApp {
     acts.append(cancelBtn, saveBtn);
 
     const body = el('div', 'modal-body');
-    body.append(titleEl, kindField, countryF.root, fingerprintF.root, origNameF.root,
-      customNameF.root, descF.root, sourceIdF.root, enabledRow, statusEl, acts);
+    if (choices.length === 0) {
+      saveBtn.disabled = true;
+      body.append(titleEl, notice({ tone: 'info', text: 'Сначала добавьте в построитель хотя бы один источник: правила выбирают серверы из его каталога.' }), acts);
+    } else {
+      body.append(titleEl, kindF.root, sourceF.root, countryF.root, otherF.root, nodeBox,
+        customNameF.root, descF.root, enabledRow, statusEl, acts);
+      syncSource();
+      updateKind();
+    }
     dialog.append(body);
 
-    const close = () => { if (dialog.open) dialog.close(); dialog.remove(); };
     cancelBtn.addEventListener('click', close);
     dialog.addEventListener('cancel', e => { e.preventDefault(); close(); });
 
     saveBtn.addEventListener('click', () => {
+      const src = currentSource();
+      if (!src) return;
       const kind = kindSel.value as 'country' | 'node';
-      const sourceId = parseInt(sourceIdF.inp.value.trim(), 10);
-      const result: BuilderItem = {
+      let countryCode = '';
+      if (kind === 'country') {
+        countryCode = chosenCountry();
+        if (!COUNTRY_CODE.test(countryCode)) {
+          const target = countrySel.value === OTHER ? otherF : countryF;
+          target.setError('Укажите двухбуквенный код страны латиницей, например DE.');
+          (countrySel.value === OTHER ? otherInp : countrySel).focus();
+          return;
+        }
+      }
+      const node = kind === 'node' && picked && picked.sourceId === src.id ? picked : null;
+      if (kind === 'node' && !node) {
+        nodeError.textContent = 'Выберите сервер из списка.';
+        nodeSearch.focus();
+        return;
+      }
+      onSave({
         id: item?.id ?? 0,
         kind,
-        source_id: Number.isFinite(sourceId) ? sourceId : 0,
-        country_code: kind === 'country' ? countryF.inp.value.trim().toUpperCase() : '',
-        fingerprint: kind === 'node' ? fingerprintF.inp.value.trim() : '',
-        original_name: kind === 'node' ? origNameF.inp.value.trim() : '',
+        source_id: src.id,
+        country_code: countryCode,
+        fingerprint: node?.fingerprint ?? '',
+        original_name: node?.original_name ?? '',
         custom_name: customNameF.inp.value.trim() || null,
         description: descF.inp.value.trim(),
         position: item?.position ?? 0,
         enabled: enabledChk.checked,
-      };
-      onSave(result);
+      });
       close();
     });
 
     document.body.append(dialog);
     dialog.showModal();
-    (kindSel.value === 'country' ? countryF.inp : fingerprintF.inp).focus();
+    kindSel.focus();
   }
 
   // ---- Preview ----
+  // Dry run of the SAVED builder by the backend against the stored catalogue,
+  // with the same rules /sub applies.
   private async runPreview(builder: AdminBuilder | null, body: HTMLElement, btn: HTMLButtonElement) {
     if (!builder) return;
     btn.disabled = true;
     btn.setAttribute('aria-busy', 'true');
     body.replaceChildren(el('p', 'preview-loading', 'Загружаем предпросмотр…'));
+    const sourceName = (id: number) => this.sourcesCache?.find(s => s.id === id)?.name ?? `Источник #${id}`;
     try {
       const preview = await this.api.previewBuilder(builder.id);
       body.replaceChildren();
-
-      if (preview.warnings && preview.warnings.length > 0) {
-        const warnBox = el('div', 'preview-warnings');
-        for (const w of preview.warnings) warnBox.append(el('p', 'preview-warn', `⚠ ${w}`));
-        body.append(warnBox);
-      }
+      const sum = previewSummary(preview);
 
       const stats = el('p', 'preview-stats');
       stats.textContent = [
-        `Всего: ${preview.total}`,
-        preview.missing > 0 ? `Не найдено: ${preview.missing}` : '',
-        preview.conflicts > 0 ? `Конфликтов: ${preview.conflicts}` : '',
+        `В подписке: ${serversLabel(sum.servers)} · ${countriesLabel(sum.countries)}`,
+        preview.missing > 0 ? `не найдено: ${formatCount(preview.missing)}` : '',
+        preview.conflicts > 0 ? `неоднозначно: ${formatCount(preview.conflicts)}` : '',
       ].filter(Boolean).join(' · ');
       body.append(stats);
+      if (sum.bySource.length > 1) {
+        body.append(el('p', 'preview-sources',
+          sum.bySource.map(s => `${sourceName(s.sourceId)}: ${formatCount(s.count)}`).join(' · ')));
+      }
+
+      if (preview.warnings && preview.warnings.length > 0) {
+        const warnBox = el('div', 'preview-warnings');
+        for (const w of preview.warnings) warnBox.append(el('p', 'preview-warn', w));
+        body.append(warnBox);
+      }
 
       if (preview.items.length === 0) {
-        body.append(el('p', 'preview-empty', 'Предпросмотр пуст — нет подходящих узлов.'));
+        body.append(el('p', 'preview-empty', 'Предпросмотр пуст — нет подходящих серверов.'));
       } else {
-        const list = el('ul', 'preview-list');
+        const list = el('ol', 'preview-list');
+        list.setAttribute('aria-label', 'Серверы подписки');
         for (const pi of preview.items) {
           const li = el('li', `preview-item preview-${pi.status}`);
-          const pos = el('span', 'preview-pos', String(pi.position + 1));
+          const served = pi.status === 'matched' || pi.status === 'fallback';
+          const pos = el('span', 'preview-pos', served ? String(pi.position + 1) : '—');
           const name = el('span', 'preview-name', pi.display_name || pi.entry?.original_name || '—');
-          const statusBadge = el('span', `badge preview-status-badge preview-status-${pi.status}`, pi.status);
-          const country = el('span', 'preview-country', pi.entry?.country_code ?? '');
-          li.append(pos, name, country, statusBadge);
+          const code = pi.entry?.country_code ?? '';
+          const country = el('span', 'preview-country', code ? countryLabel(code) : '');
+          const origin = el('span', 'preview-origin', sourceName(pi.source_id));
+          const statusBadge = el('span', `tag preview-status-${pi.status}`, RESOLUTION_LABELS[pi.status] ?? pi.status);
+          li.append(pos, name, country, origin, statusBadge);
           list.append(li);
         }
         body.append(list);
       }
     } catch (error) {
+      if (await this.endIfSignedOut(error, () => body.isConnected)) return;
       body.replaceChildren(el('p', 'preview-error', `Ошибка предпросмотра: ${errorText(error)}`));
     } finally {
       btn.disabled = false;
