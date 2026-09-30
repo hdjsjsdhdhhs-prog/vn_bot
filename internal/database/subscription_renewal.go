@@ -21,10 +21,12 @@ var (
 // Each successful call is a distinct extension (not an idempotent payment API).
 // No identity, plan, source, purchase, traffic, or provisioning fields change.
 func (s *Service) RenewSubscription(ctx context.Context, id uint, days int) (*Subscription, error) {
-	return s.renewSubscription(ctx, map[string]any{"id": id}, days)
+	return s.renewSubscription(ctx, map[string]any{"id": id}, days, JournalActorSystem)
 }
 
-func (s *Service) renewSubscription(ctx context.Context, selector map[string]any, days int) (*Subscription, error) {
+// renewSubscription journals the extension with actor: the customer for the
+// owner-scoped path, the system for trusted ID-based callers.
+func (s *Service) renewSubscription(ctx context.Context, selector map[string]any, days int, actor string) (*Subscription, error) {
 	if days <= 0 || days > MaxSubscriptionRenewalDays {
 		return nil, ErrInvalidRenewalDays
 	}
@@ -57,9 +59,18 @@ func (s *Service) renewSubscription(ctx context.Context, selector map[string]any
 		if result.Error != nil {
 			return fmt.Errorf("update subscription renewal: %w", result.Error)
 		}
+		before := JournalStateOf(&renewed)
 		// No associations are preloaded: the internal result carries no source
 		// credentials. Publish the committed snapshot only after commit succeeds.
-		return tx.First(&renewed, renewed.ID).Error
+		if err := tx.First(&renewed, renewed.ID).Error; err != nil {
+			return err
+		}
+		recordJournal(ctx, tx, JournalRecord{
+			Type: JournalRenewed, Actor: actor, Subscription: &renewed,
+			Description: "Подписка продлена на " + journalDays(days),
+			Before:      before, After: JournalStateOf(&renewed), Extra: map[string]any{"days": days},
+		})
+		return nil
 	})
 	if err != nil {
 		return nil, err

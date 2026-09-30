@@ -7,6 +7,8 @@ import {
   type CreateSourceInput, type UpdateSourceInput,
   type CreateBuilderInput, type UpdateBuilderInput, type UpsertBuilderItemInput, type SetBuilderInput,
   TARIFF_LIMITS, type AdminTariff, type TariffPlan, type TariffOutcome,
+  JOURNAL_EVENT_TYPES, PLAN_KINDS, type JournalEvent, type JournalEventType, type JournalPage, type JournalQuery,
+  type JournalState, type PlanKind,
 } from './api';
 import {
   BADGE_PRESETS, DURATION_PRESETS, SERVER_FIELDS, TARIFF_CURRENCIES, botButtonLabel, catalogueOrder, durationLabel,
@@ -153,8 +155,8 @@ const byteLength = (value: string) => new TextEncoder().encode(value).length;
 const clock = (date: Date) => date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 
 // ---------------------------------------------------------------------------
-// Sections. Overview reads /admin/api/dashboard, Users reads /admin/api/users;
-// Audit is still a page frame with a placeholder until its stage lands.
+// Sections. Overview reads /admin/api/dashboard, Users reads /admin/api/users,
+// the Journal (route #/audit) reads /admin/api/journal.
 
 type SectionId = 'overview' | 'users' | 'tariffs' | 'audit' | 'sources' | 'builders';
 interface Section {
@@ -187,11 +189,7 @@ const SECTIONS: readonly Section[] = [
   },
   {
     id: 'audit', label: 'Журнал',
-    description: 'История изменений, выполненных из панели.',
-    placeholder: {
-      title: 'Журнал появится на следующем этапе',
-      text: 'Здесь будут записи о продлениях, отключениях и изменениях сроков подписок.',
-    },
+    description: 'История действий пользователей, администраторов и системы: регистрации, подписки и платежи. Записи создаются автоматически и не редактируются.',
   },
 ];
 
@@ -748,6 +746,155 @@ function detailSkeleton(): HTMLElement[] {
 }
 
 // ---------------------------------------------------------------------------
+// Journal. Rows come from GET /admin/api/journal: append-only events written
+// by the backend in the transaction of each action. Only fields the response
+// carries are shown; filters and page live in memory, never in the URL.
+
+const JOURNAL_LABELS: Readonly<Record<JournalEventType, string>> = {
+  user_registered: 'Регистрация',
+  trial_started: 'Пробная подписка активирована',
+  trial_bound: 'Пробная подписка привязана',
+  trial_expired: 'Пробная подписка истекла',
+  subscription_reconnected: 'Подписка подключена повторно',
+  free_activated: 'Бесплатная подписка активирована',
+  paid_activated: 'Платная подписка активирована',
+  plan_changed: 'Тариф изменён',
+  subscription_renewed: 'Продление',
+  expiry_changed: 'Срок действия изменён',
+  subscription_expired: 'Подписка истекла',
+  subscription_disabled: 'Подписка отключена',
+  subscription_enabled: 'Подписка включена',
+  subscription_revoked: 'Подписка отозвана',
+  payment_succeeded: 'Успешная оплата',
+  payment_failed: 'Неуспешная оплата',
+  payment_refunded: 'Возврат платежа',
+};
+
+const JOURNAL_GROUPS: readonly { label: string; types: readonly JournalEventType[] }[] = [
+  { label: 'Пользователи', types: ['user_registered', 'trial_started', 'trial_bound', 'trial_expired'] },
+  {
+    label: 'Подписки',
+    types: ['subscription_reconnected', 'free_activated', 'paid_activated', 'plan_changed', 'subscription_renewed',
+      'expiry_changed', 'subscription_expired', 'subscription_disabled', 'subscription_enabled', 'subscription_revoked'],
+  },
+  { label: 'Платежи', types: ['payment_succeeded', 'payment_failed', 'payment_refunded'] },
+];
+
+const PLAN_KIND_LABELS: Readonly<Record<PlanKind, string>> = { free: 'Бесплатная', trial: 'Пробная', paid: 'Платная' };
+const ACTOR_LABELS: Readonly<Record<string, string>> = { user: 'Пользователь', admin: 'Администратор', system: 'Система' };
+const OUTCOME_LABELS: Readonly<Record<string, string>> = { success: 'Успешно', failed: 'Ошибка', rejected: 'Отклонено' };
+// Outcome swatches reuse the status ramp: accent for success, danger for failure.
+const OUTCOME_TONES: Readonly<Record<string, string>> = { success: 'tone-active', failed: 'tone-failed', rejected: 'tone-paused' };
+const ACTOR_NAME_LABELS: Readonly<Record<string, string>> = { platega: 'Platega', telegram_stars: 'Telegram Stars', bot: 'Telegram-бот' };
+
+const journalLabel = (type: string) => (JOURNAL_LABELS as Readonly<Record<string, string>>)[type] ?? type;
+const planKindLabel = (kind: string) => (PLAN_KIND_LABELS as Readonly<Record<string, string>>)[kind] ?? '';
+const actorNameLabel = (name: string) => ACTOR_NAME_LABELS[name] ?? name;
+const parseJournalType = (value: string): JournalEventType | '' =>
+  (JOURNAL_EVENT_TYPES as readonly string[]).includes(value) ? value as JournalEventType : '';
+const parsePlanKind = (value: string): PlanKind | '' =>
+  (PLAN_KINDS as readonly string[]).includes(value) ? value as PlanKind : '';
+const dateTimeSecondsFormat = new Intl.DateTimeFormat('ru-RU', {
+  day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
+});
+
+const JOURNAL_COLUMNS = [
+  ['Дата и время', 'col-date'], ['Пользователь', 'col-user'], ['Событие', ''], ['Подписка и тариф', 'col-md'],
+  ['Инициатор', 'col-md'], ['Статус', 'col-status'],
+] as const;
+
+interface JournalListState {
+  /** Last applied query; the page size is the server default. */
+  query: JournalQuery;
+  /** Search box text, possibly not applied yet. */
+  draft: string;
+  /** Period inputs (local calendar days, YYYY-MM-DD) behind query.from/to. */
+  fromDate: string;
+  toDate: string;
+  page: JournalPage | null;
+  pageQuery: JournalQuery | null;
+  at: Date | null;
+}
+
+interface JournalView {
+  results: HTMLElement;
+  refresh: HTMLButtonElement;
+  updated: HTMLElement;
+  summary: HTMLElement;
+  search: HTMLInputElement;
+  clear: HTMLButtonElement;
+  type: HTMLSelectElement;
+  kind: HTMLSelectElement;
+  from: HTMLInputElement;
+  to: HTMLInputElement;
+  setError: (text: string) => void;
+  pagerFocus: 'prev' | 'next' | null;
+}
+
+function initialJournalState(): JournalListState {
+  return {
+    query: { q: '', type: '', planKind: '', from: '', to: '', offset: 0 },
+    draft: '', fromDate: '', toDate: '', page: null, pageQuery: null, at: null,
+  };
+}
+
+const sameJournalQuery = (a: JournalQuery, b: JournalQuery) =>
+  a.q === b.q && a.type === b.type && a.planKind === b.planKind && a.from === b.from && a.to === b.to && a.offset === b.offset;
+
+/** Start of a local calendar day (plus days) as the RFC 3339 instant the API takes. */
+function dayStart(value: string, plusDays = 0): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return '';
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + plusDays);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/** Who the event is about: a linked customer, an anonymous trial or nobody known. */
+function journalSubject(event: JournalEvent): { text: string; anon: boolean } {
+  if (event.username) return { text: handle(event.username), anon: false };
+  if (event.telegram_id > 0) return { text: `Пользователь ${event.telegram_id}`, anon: false };
+  if (event.telegram_id < 0) return { text: 'Анонимный посетитель', anon: true };
+  return { text: 'Не указан', anon: true };
+}
+
+function outcomeBadge(outcome: string): HTMLElement {
+  const node = el('span', 'status');
+  node.append(el('span', `swatch ${OUTCOME_TONES[outcome] ?? 'tone-unknown'}`), el('span', '', OUTCOME_LABELS[outcome] ?? outcome));
+  return node;
+}
+
+function actorText(event: JournalEvent): string {
+  return ACTOR_LABELS[event.actor] ?? event.actor;
+}
+
+function planText(event: JournalEvent): string {
+  if (!event.plan_name) return 'Тариф не указан';
+  const kind = planKindLabel(event.plan_kind);
+  return kind ? `${event.plan_name} · ${kind}` : event.plan_name;
+}
+
+function stateValue(state: JournalState | null, pick: 'status' | 'expiry' | 'plan'): string | null {
+  if (!state) return null;
+  switch (pick) {
+    case 'status': return statusLabel(state.status);
+    case 'expiry': return state.expires_at ? formatDateTime(state.expires_at) : 'Бессрочно';
+    case 'plan': return state.plan_name || (state.plan_id ? `Тариф #${state.plan_id}` : 'Нет');
+  }
+}
+
+/** "before → after", or the single value with a note when it did not change. */
+function changeNode(before: string | null, after: string | null): HTMLElement {
+  const node = el('span', 'change');
+  if (before !== null && after !== null && before !== after) {
+    node.append(el('span', 'change-old', before), el('span', 'change-arrow', '→'), el('span', '', after));
+  } else {
+    node.append(el('span', '', after ?? before ?? 'Нет данных'));
+    if (before !== null && after !== null) node.append(el('span', 'change-same', 'без изменений'));
+  }
+  return node;
+}
+
+// ---------------------------------------------------------------------------
 // Subscription management. Availability mirrors database.applyAdminAction so
 // only meaningful actions are offered; the backend stays the authority and
 // its rejections are reported, never second-guessed. disable is a pause:
@@ -1015,6 +1162,11 @@ class AdminApp {
   private detailCache: { id: number; data: UserDetail; at: Date } | null = null;
   private detailView: DetailView | null = null;
   private detailRequest = 0;
+  // Journal list state (filters, page, last snapshot); like the users list it
+  // survives navigation within the session and never reaches the URL.
+  private journalState: JournalListState = initialJournalState();
+  private journalView: JournalView | null = null;
+  private journalRequest = 0;
   // The open confirmation dialog, if any, and the outcome of the last
   // management action shown on the subscription page it belongs to.
   private dialog: { dismiss: () => void } | null = null;
@@ -1091,6 +1243,7 @@ class AdminApp {
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
+    this.journalView = null;
     window.clearTimeout(this.searchTimer);
     window.clearInterval(this.countdownTimer);
     window.clearTimeout(this.toastTimer);
@@ -1146,6 +1299,7 @@ class AdminApp {
     this.signedInAt = null;
     this.dashboard = null;
     this.usersState = initialUsersState();
+    this.journalState = initialJournalState();
     this.detailCache = null;
     this.manageNotice = null;
     this.tariffsCache = null;
@@ -1366,6 +1520,8 @@ class AdminApp {
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
+    this.journalView = null;
+    this.journalRequest++;
     this.sourcesView = null;
     this.sourceDetailView = null;
     this.sourceDetailRequest++;
@@ -1427,6 +1583,9 @@ class AdminApp {
     } else if (section.id === 'builders') {
       page.append(header, this.buildBuildersSection(header));
       load = () => this.loadBuilders();
+    } else if (section.id === 'audit') {
+      page.append(header, this.buildJournal(header));
+      load = () => this.loadJournal();
     } else if (section.placeholder) {
       const empty = el('section', 'panel empty');
       empty.setAttribute('aria-labelledby', 'empty-title');
@@ -1832,6 +1991,399 @@ class AdminApp {
     this.usersState.lastOpened = null;
     if (opened === null || !this.usersView) return null;
     return this.usersView.results.querySelector<HTMLElement>(`a[data-user='${opened}']`);
+  }
+
+  // Journal -----------------------------------------------------------------
+
+  private buildJournal(header: HTMLElement): HTMLElement {
+    const { actions, refresh, updated } = refreshActions(() => void this.loadJournal());
+    header.classList.add('has-actions');
+    header.append(actions);
+    const state = this.journalState;
+
+    const search = el('input', 'input search-input');
+    Object.assign(search, {
+      id: 'journal-search', name: 'q', type: 'search', value: state.draft, autocomplete: 'off', spellcheck: false,
+      placeholder: 'Telegram ID, ID подписки или @username', maxLength: limits.queryBytes,
+    });
+    search.setAttribute('enterkeyhint', 'search');
+    const searchLabel = el('label', 'sr-only', 'Поиск по пользователю');
+    searchLabel.htmlFor = search.id;
+    const clear = el('button', 'icon-button search-clear');
+    clear.type = 'button';
+    clear.setAttribute('aria-label', 'Очистить поиск');
+    clear.append(icon('close'));
+    clear.hidden = search.value === '';
+    const searchBox = el('div', 'search');
+    searchBox.append(icon('search'), search, clear);
+
+    const type = el('select', 'input select-input');
+    type.id = 'journal-type';
+    type.append(option('', 'Все события'));
+    for (const group of JOURNAL_GROUPS) {
+      const optgroup = el('optgroup');
+      optgroup.label = group.label;
+      optgroup.append(...group.types.map(item => option(item, JOURNAL_LABELS[item])));
+      type.append(optgroup);
+    }
+    type.value = state.query.type;
+    const typeCaption = el('label', 'sr-only', 'Тип события');
+    typeCaption.htmlFor = type.id;
+    const typeBox = el('div', 'select');
+    typeBox.append(type, icon('chevron'));
+
+    const kind = el('select', 'input select-input');
+    kind.id = 'journal-kind';
+    kind.append(option('', 'Все типы подписок'), ...PLAN_KINDS.map(item => option(item, PLAN_KIND_LABELS[item])));
+    kind.value = state.query.planKind;
+    const kindCaption = el('label', 'sr-only', 'Тип подписки');
+    kindCaption.htmlFor = kind.id;
+    const kindBox = el('div', 'select');
+    kindBox.append(kind, icon('chevron'));
+
+    const period = el('div', 'period');
+    period.setAttribute('role', 'group');
+    period.setAttribute('aria-label', 'Период');
+    const dateInput = (id: string, value: string, label: string) => {
+      const input = el('input', 'input date-input');
+      Object.assign(input, { id, type: 'date', value });
+      const caption = el('label', 'period-label', label);
+      caption.htmlFor = id;
+      period.append(caption, input);
+      return input;
+    };
+    const from = dateInput('journal-from', state.fromDate, 'С');
+    const to = dateInput('journal-to', state.toDate, 'по');
+
+    const summary = el('p', 'toolbar-meta');
+    summary.setAttribute('aria-live', 'polite');
+    const toolbar = el('div', 'toolbar journal-toolbar');
+    toolbar.setAttribute('role', 'search');
+    toolbar.append(searchLabel, searchBox, typeCaption, typeBox, kindCaption, kindBox, period, summary);
+
+    const error = el('p', 'field-error');
+    error.id = 'journal-filter-error';
+    error.setAttribute('role', 'alert');
+    const setError = (text: string) => { error.textContent = text; };
+    const results = el('div', 'results');
+    const view: JournalView = { results, refresh, updated, summary, search, clear, type, kind, from, to, setError, pagerFocus: null };
+    this.journalView = view;
+
+    // Typing waits for a pause; Enter, clearing, selects and dates apply at once.
+    const submit = (delay: number) => {
+      window.clearTimeout(this.searchTimer);
+      const run = () => this.applyJournalFilters(view);
+      if (delay > 0) this.searchTimer = window.setTimeout(run, delay);
+      else run();
+    };
+    search.addEventListener('input', () => {
+      this.journalState.draft = search.value;
+      clear.hidden = search.value === '';
+      submit(SEARCH_DEBOUNCE_MS);
+    });
+    search.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submit(0);
+      } else if (event.key === 'Escape' && search.value !== '') {
+        event.preventDefault();
+        search.value = '';
+        clear.hidden = true;
+        this.journalState.draft = '';
+        submit(0);
+      }
+    });
+    clear.addEventListener('click', () => {
+      search.value = '';
+      clear.hidden = true;
+      this.journalState.draft = '';
+      search.focus();
+      submit(0);
+    });
+    for (const control of [type, kind, from, to]) control.addEventListener('change', () => submit(0));
+
+    if (state.page && state.pageQuery && state.at) this.paintJournal(view, state.page, state.pageQuery, state.at);
+    else this.paintJournalSkeleton(view);
+
+    const wrap = el('div', 'users journal');
+    wrap.append(toolbar, error, results);
+    return wrap;
+  }
+
+  /** Reads the filter controls; a changed filter always restarts from the first page. */
+  private applyJournalFilters(view: JournalView) {
+    if (this.journalView !== view) return;
+    const q = view.search.value.trim();
+    if (byteLength(q) > limits.queryBytes) {
+      view.setError('Запрос слишком длинный. Сократите его.');
+      return;
+    }
+    const fromDate = view.from.value;
+    const toDate = view.to.value;
+    if (fromDate && toDate && fromDate > toDate) {
+      view.setError('Начало периода позже его окончания.');
+      return;
+    }
+    view.setError('');
+    this.journalState.fromDate = fromDate;
+    this.journalState.toDate = toDate;
+    // The end date is inclusive for the reader: the query ends at the next midnight.
+    const next: JournalQuery = {
+      q, type: parseJournalType(view.type.value), planKind: parsePlanKind(view.kind.value),
+      from: fromDate ? dayStart(fromDate) : '', to: toDate ? dayStart(toDate, 1) : '', offset: 0,
+    };
+    const current = this.journalState.query;
+    if (sameJournalQuery({ ...current, offset: 0 }, next) && current.offset === 0) return;
+    this.journalState.query = next;
+    void this.loadJournal();
+  }
+
+  private paintJournalSkeleton(view: JournalView) {
+    setLoading(view.results, 'Загружаем журнал');
+    view.results.replaceChildren(usersSkeleton());
+    view.summary.textContent = '';
+    view.updated.textContent = '';
+  }
+
+  private paintJournalError(view: JournalView, error: unknown) {
+    setLoading(view.results, null);
+    view.results.replaceChildren(messagePanel('alert', 'Не удалось загрузить журнал', errorText(error), 'alert',
+      retryButton(() => void this.loadJournal())));
+    view.summary.textContent = '';
+    view.updated.textContent = '';
+  }
+
+  private paintJournal(view: JournalView, page: JournalPage, query: JournalQuery, at: Date) {
+    setLoading(view.results, null);
+    const filtered = query.q !== '' || query.type !== '' || query.planKind !== '' || query.from !== '' || query.to !== '';
+    view.summary.textContent = page.total > 0 ? `${filtered ? 'Найдено' : 'Всего'}: ${formatCount(page.total)}` : '';
+    view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
+    if (page.events.length === 0) {
+      view.results.replaceChildren(this.journalEmpty(view, filtered));
+      return;
+    }
+    const active = document.activeElement;
+    const focused = active instanceof HTMLElement && view.results.contains(active) ? active.dataset.event : undefined;
+
+    const panel = el('section', 'panel users-panel');
+    panel.setAttribute('aria-label', 'События журнала');
+    const table = el('table', 'table table-cards users-table journal-table');
+    table.append(el('caption', 'sr-only', 'Журнал событий, от новых к старым'), headRow(JOURNAL_COLUMNS));
+    const body = el('tbody');
+    for (const event of page.events) body.append(this.journalRow(event));
+    table.append(body);
+    const wrap = el('div', 'table-wrap');
+    wrap.append(table);
+    panel.append(wrap, this.journalPager(view, page));
+    view.results.replaceChildren(panel);
+
+    if (focused) panel.querySelector<HTMLElement>(`button[data-event='${focused}']`)?.focus({ preventScroll: true });
+    const direction = view.pagerFocus;
+    view.pagerFocus = null;
+    if (direction) {
+      const [prev, next] = panel.querySelectorAll<HTMLButtonElement>('.pager-nav .btn');
+      const target = direction === 'prev' ? (prev?.disabled ? next : prev) : (next?.disabled ? prev : next);
+      view.results.scrollIntoView({ block: 'start' });
+      target?.focus({ preventScroll: true });
+    }
+  }
+
+  private journalEmpty(view: JournalView, filtered: boolean): HTMLElement {
+    if (!filtered) {
+      return messagePanel('audit', 'Событий пока нет',
+        'Записи появятся автоматически при регистрации пользователей, изменениях подписок и оплатах.', 'status');
+    }
+    const reset = button('Сбросить фильтры', 'btn btn-secondary btn-sm');
+    reset.addEventListener('click', () => {
+      view.search.value = '';
+      view.clear.hidden = true;
+      view.type.value = '';
+      view.kind.value = '';
+      view.from.value = '';
+      view.to.value = '';
+      this.journalState.draft = '';
+      this.applyJournalFilters(view);
+      view.search.focus();
+    });
+    const hint = /^[0-9]+$/.test(this.journalState.query.q) ? ' Числовой запрос ищет точное совпадение Telegram ID или ID подписки.' : '';
+    return messagePanel('search', 'События не найдены', `Нет событий по выбранным условиям.${hint}`, 'status', reset);
+  }
+
+  private journalRow(event: JournalEvent): HTMLTableRowElement {
+    const subject = journalSubject(event);
+    const user = el('span', subject.anon ? 'user-link is-anon' : 'user-link', subject.text);
+    const userCell = cell('Пользователь', user, 'col-user');
+    if (event.telegram_id > 0) userCell.append(el('span', 'cell-note', String(event.telegram_id)));
+
+    // The event name is the keyboard entry point of the row.
+    const open = el('button', 'journal-open', journalLabel(event.event_type));
+    open.type = 'button';
+    open.dataset.event = String(event.id);
+    open.addEventListener('click', () => this.openJournalEvent(event, open));
+    const what = cell('Событие', open, 'cell-wrap');
+    what.append(el('span', 'cell-note', event.description));
+
+    const plan = cell('Подписка и тариф', event.subscription_id ? `#${event.subscription_id}` : 'Без подписки', 'col-md');
+    plan.append(el('span', 'cell-note', planText(event)));
+    const actor = cell('Инициатор', actorText(event), 'col-md');
+    if (event.actor_name) actor.append(el('span', 'cell-note', actorNameLabel(event.actor_name)));
+    const date = cell('Дата и время', formatDateTime(event.created_at), 'col-date');
+    date.title = dateTimeSecondsFormat.format(new Date(event.created_at));
+
+    const row = el('tr', 'row-link');
+    row.append(date, userCell, what, plan, actor, cell('Статус', outcomeBadge(event.outcome), 'col-status'));
+    row.addEventListener('click', clickEvent => {
+      if (clickEvent.target instanceof Element && clickEvent.target.closest('button, a')) return;
+      if (document.getSelection()?.type === 'Range') return;
+      open.click();
+    });
+    return row;
+  }
+
+  private journalPager(view: JournalView, page: JournalPage): HTMLElement {
+    const foot = el('div', 'pager');
+    const from = page.offset + 1;
+    const to = page.offset + page.events.length;
+    foot.append(el('p', 'pager-range', `С ${formatCount(from)} по ${formatCount(to)} из ${formatCount(page.total)}`));
+    const pages = Math.ceil(page.total / page.limit);
+    if (pages <= 1) return foot;
+    const nav = el('nav', 'pager-nav');
+    nav.setAttribute('aria-label', 'Страницы журнала');
+    const prev = button('Предыдущая', 'btn btn-secondary btn-sm', 'prev');
+    const next = button('Следующая', 'btn btn-secondary btn-sm');
+    next.append(icon('next'));
+    prev.disabled = page.offset === 0;
+    next.disabled = page.offset + page.limit >= page.total;
+    const go = (offset: number, direction: 'prev' | 'next') => {
+      view.pagerFocus = direction;
+      this.journalState.query = { ...this.journalState.query, offset };
+      void this.loadJournal();
+    };
+    prev.addEventListener('click', () => go(Math.max(0, page.offset - page.limit), 'prev'));
+    next.addEventListener('click', () => go(page.offset + page.limit, 'next'));
+    const current = Math.floor(page.offset / page.limit) + 1;
+    nav.append(el('p', 'pager-page', `Страница ${formatCount(current)} из ${formatCount(pages)}`), prev, next);
+    foot.append(nav);
+    return foot;
+  }
+
+  /**
+   * Loads the current journal query. A stale response is dropped; a failed
+   * refresh of the page on screen keeps it and raises a toast. Reading never
+   * changes the journal: refreshing the page cannot create events.
+   */
+  private async loadJournal() {
+    const view = this.journalView;
+    if (!view) return;
+    const state = this.journalState;
+    const query = state.query;
+    const request = ++this.journalRequest;
+    const current = () => this.journalView === view && request === this.journalRequest;
+    setRefreshBusy(view.refresh, true);
+    if (state.page) view.results.setAttribute('aria-busy', 'true');
+    else this.paintJournalSkeleton(view);
+    try {
+      const page = await this.api.journal(query);
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      // New events can shift the list: step back when the page ran empty.
+      const last = page.total > 0 ? Math.floor((page.total - 1) / page.limit) * page.limit : 0;
+      if (page.events.length === 0 && query.offset > last) {
+        state.query = { ...query, offset: last };
+        void this.loadJournal();
+        return;
+      }
+      state.page = page;
+      state.pageQuery = query;
+      state.at = new Date();
+      this.paintJournal(view, page, query, state.at);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      if (state.page && state.pageQuery && sameJournalQuery(state.pageQuery, query)) {
+        view.results.removeAttribute('aria-busy');
+        this.toast(`Не удалось обновить журнал. ${errorText(error)}`);
+      } else {
+        this.paintJournalError(view, error);
+      }
+    } finally {
+      if (current()) setRefreshBusy(view.refresh, false);
+    }
+  }
+
+  /** Read-only details of one event; the journal offers no way to edit it. */
+  private openJournalEvent(event: JournalEvent, trigger: HTMLElement) {
+    if (this.dialog || this.view !== 'app') return;
+    const dialog = el('dialog', 'modal modal-wide');
+    dialog.setAttribute('aria-labelledby', 'journal-dialog-title');
+    dialog.setAttribute('aria-describedby', 'journal-dialog-text');
+    const heading = el('h2', 'modal-title', journalLabel(event.event_type));
+    heading.id = 'journal-dialog-title';
+    const text = el('p', 'modal-text', event.description);
+    text.id = 'journal-dialog-text';
+
+    const list = el('dl', 'summary');
+    const row = (label: string, value: string | Node) => {
+      const item = el('div', 'summary-row');
+      const data = el('dd');
+      data.append(value);
+      item.append(el('dt', '', label), data);
+      list.append(item);
+    };
+    row('Дата и время', dateTimeSecondsFormat.format(new Date(event.created_at)));
+    row('Статус', outcomeBadge(event.outcome));
+    const subject = journalSubject(event);
+    if (event.telegram_id > 0) {
+      const link = el('a', 'inline-link', `${subject.text} · ${event.telegram_id}`);
+      link.href = `#/users/${event.telegram_id}`;
+      row('Пользователь', link);
+    } else {
+      row('Пользователь', subject.text);
+    }
+    row('Подписка', event.subscription_id ? `#${event.subscription_id}` : 'Без подписки');
+    row('Тариф', planText(event));
+    row('Инициатор', event.actor_name ? `${actorText(event)} · ${actorNameLabel(event.actor_name)}` : actorText(event));
+    if (event.order_id !== null) row('Заказ', `#${event.order_id}`);
+    if (event.amount_cents !== null) row('Сумма', formatPrice(event.amount_cents, event.currency));
+    const days = event.details.days;
+    if (typeof days === 'number' && Number.isSafeInteger(days) && days > 0) row('Дней', formatCount(days));
+    if (event.before || event.after) {
+      row('Статус подписки', changeNode(stateValue(event.before, 'status'), stateValue(event.after, 'status')));
+      row('Действует до', changeNode(stateValue(event.before, 'expiry'), stateValue(event.after, 'expiry')));
+      row('Тариф подписки', changeNode(stateValue(event.before, 'plan'), stateValue(event.after, 'plan')));
+    }
+    row('ID события', `#${event.id}`);
+
+    const body = el('div', 'modal-body');
+    body.append(heading, text, list);
+    if (event.details.backfill === true) {
+      body.append(el('p', 'field-hint', 'Запись восстановлена из истории при обновлении системы: время и состав данных соответствуют сохранённым фактам.'));
+    }
+    const close = button('Закрыть', 'btn btn-secondary');
+    const actions = el('div', 'modal-actions');
+    actions.append(close);
+    body.append(actions);
+    dialog.append(body);
+
+    const handle = {
+      dismiss: () => {
+        if (dialog.open) dialog.close();
+        dialog.remove();
+      },
+    };
+    const finish = () => {
+      if (this.dialog === handle) this.dialog = null;
+      handle.dismiss();
+      if (trigger.isConnected) trigger.focus();
+    };
+    close.addEventListener('click', finish);
+    dialog.addEventListener('cancel', cancelEvent => { cancelEvent.preventDefault(); finish(); });
+    // A click on the backdrop (outside the dialog box) closes it too.
+    dialog.addEventListener('click', clickEvent => { if (clickEvent.target === dialog) finish(); });
+    this.dialog = handle;
+    this.root.append(dialog);
+    dialog.showModal();
+    close.focus();
   }
 
   // User detail -------------------------------------------------------------

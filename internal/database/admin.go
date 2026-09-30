@@ -296,9 +296,11 @@ func (s *Service) AdminMutateSubscription(ctx context.Context, m AdminMutation) 
 		if err := tx.Create(&entry).Error; err != nil {
 			return fmt.Errorf("record admin audit: %w", err)
 		}
+		priorSub := sub
 		if err := tx.First(&sub, sub.ID).Error; err != nil {
 			return fmt.Errorf("reload subscription after admin mutation: %w", err)
 		}
+		recordJournal(ctx, tx, adminMutationJournal(m, &priorSub, &sub, entry, applyErr))
 		result = AdminMutationResult{Subscription: &sub, Audit: entry}
 		domainErr = applyErr
 		return nil
@@ -307,6 +309,57 @@ func (s *Service) AdminMutateSubscription(ctx context.Context, m AdminMutation) 
 		return nil, err
 	}
 	return &result, domainErr
+}
+
+var adminJournalTypes = map[AdminAction]JournalEventType{
+	AdminActionRenew:        JournalRenewed,
+	AdminActionChangeExpiry: JournalExpiryChanged,
+	AdminActionDisable:      JournalDisabled,
+	AdminActionEnable:       JournalEnabled,
+}
+
+var adminRejectionTexts = map[string]string{
+	AdminErrorCodeInvalidState:        "состояние подписки не допускает это действие",
+	AdminErrorCodeSubscriptionExpired: "срок приостановленной подписки уже истёк",
+	AdminErrorCodePerpetual:           "у бессрочной подписки нет срока для продления",
+	AdminErrorCodeInvalidExpiry:       "недопустимая дата окончания",
+}
+
+// adminMutationJournal describes one audited admin mutation. A recorded
+// rejection is journaled too (outcome rejected); it is keyed by the audit row,
+// so a replayed request key never adds a second entry.
+func adminMutationJournal(m AdminMutation, before, after *Subscription, entry AdminAuditLog, applyErr error) JournalRecord {
+	var description string
+	switch m.Action {
+	case AdminActionRenew:
+		description = "Администратор продлил подписку на " + journalDays(m.Days)
+	case AdminActionChangeExpiry:
+		description = "Администратор изменил срок действия подписки"
+	case AdminActionDisable:
+		description = "Администратор отключил подписку"
+	default:
+		description = "Администратор включил подписку"
+	}
+	rec := JournalRecord{
+		Type: adminJournalTypes[m.Action], Actor: JournalActorAdmin, ActorName: m.Actor, Subscription: after,
+		Description: description, Before: JournalStateOf(before), After: JournalStateOf(after),
+		Extra:    map[string]any{"audit_id": entry.ID, "action": string(m.Action)},
+		DedupKey: journalKey("admin_audit", entry.ID), At: entry.CreatedAt,
+	}
+	if m.Action == AdminActionRenew {
+		rec.Extra["days"] = m.Days
+	}
+	if applyErr != nil {
+		code := AdminErrorCode(applyErr)
+		rec.Outcome = JournalOutcomeRejected
+		rec.Extra["error_code"] = code
+		reason := adminRejectionTexts[code]
+		if reason == "" {
+			reason = "действие отклонено"
+		}
+		rec.Description = description + " — отклонено: " + reason
+	}
+	return rec
 }
 
 // applyAdminAction is the single lifecycle policy for admin mutations. It is a

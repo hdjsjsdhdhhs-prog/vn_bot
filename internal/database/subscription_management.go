@@ -51,5 +51,5 @@ func (s *Service) RenewCustomerSubscription(ctx context.Context, telegramID int6
 	if telegramID <= 0 {
 		return nil, ErrSubscriptionNotFound
 	}
-	return s.renewSubscription(ctx, map[string]any{"telegram_id": telegramID}, days)
+	return s.renewSubscription(ctx, map[string]any{"telegram_id": telegramID}, days, JournalActorUser)
 }

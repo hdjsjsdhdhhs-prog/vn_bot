@@ -53,7 +53,13 @@ func (s *Service) CreateTrialSubscription(ctx context.Context, inviteCode, subsc
 
 	sub.ExpiresAt = &expiryTime
 
-	err = createSubscriptionWithToken(s.db.WithContext(ctx), sub)
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := createSubscriptionWithToken(tx, sub); err != nil {
+			return err
+		}
+		recordJournal(ctx, tx, subscriptionCreatedJournal(sub))
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create trial subscription: %w", err)
 	}
@@ -178,6 +184,15 @@ func (s *Service) BindTrialSubscription(ctx context.Context, subscriptionID stri
 			return fmt.Errorf("trial subscription not found or already activated: %w", ErrTrialAlreadyActivated)
 		}
 
+		before := JournalStateOf(&sub)
+		bound := sub
+		bound.TelegramID, bound.Username, bound.PlanID, bound.ExpiresAt = telegramID, username, freePlanID, nil
+		recordJournal(ctx, tx, JournalRecord{
+			Type: JournalTrialBound, Actor: JournalActorUser, Subscription: &bound,
+			Description: "Пробная подписка привязана к Telegram и переведена на бесплатный тариф",
+			Before:      before, After: JournalStateOf(&bound), DedupKey: journalKey("trial_bound", sub.ID),
+		})
+
 		return nil
 	})
 	if err != nil {
@@ -209,15 +224,30 @@ func (s *Service) ClaimExpiredTrials(ctx context.Context, hours int) ([]Subscrip
 
 	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
 	var subs []Subscription
-	result := s.db.WithContext(ctx).Raw(
-		`UPDATE subscriptions
-		 SET status = ?
-		 WHERE plan_id = ? AND telegram_id < 0 AND status IN (?, ?) AND created_at < ?
-		 RETURNING id, client_id, subscription_id, plan_id, telegram_id, status`,
-		SubscriptionStatusExpired, trialPlan.ID, SubscriptionStatusActive, SubscriptionStatusExpired, cutoff,
-	).Scan(&subs)
-	if result.Error != nil {
-		return nil, fmt.Errorf("failed to claim expired trials: %w", result.Error)
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Raw(
+			`UPDATE subscriptions
+			 SET status = ?
+			 WHERE plan_id = ? AND telegram_id < 0 AND status IN (?, ?) AND created_at < ?
+			 RETURNING id, client_id, subscription_id, plan_id, telegram_id, status`,
+			SubscriptionStatusExpired, trialPlan.ID, SubscriptionStatusActive, SubscriptionStatusExpired, cutoff,
+		).Scan(&subs)
+		if result.Error != nil {
+			return result.Error
+		}
+		// Rows already expired by an earlier (partially failed) cleanup are
+		// claimed again; the dedup key records each trial's expiry once.
+		for i := range subs {
+			recordJournal(ctx, tx, JournalRecord{
+				Type: JournalTrialExpired, Actor: JournalActorSystem, Subscription: &subs[i],
+				Description: "Срок пробной подписки истёк, доступ отключён",
+				After:       JournalStateOf(&subs[i]), DedupKey: journalKey("trial_expired", subs[i].ID),
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to claim expired trials: %w", err)
 	}
 
 	rateLimitCutoff := time.Now().Add(-1*time.Hour + 1*time.Second)

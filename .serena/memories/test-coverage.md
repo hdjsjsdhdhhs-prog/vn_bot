@@ -46,6 +46,16 @@
 ### P3 — Низкое
 5. utils/markdown.go — EscapeMarkdown
 
+## Журнал (2026-09-29)
+- `internal/database/journal_test.go` — регистрация, trial start/bind/expire (dedup при повторном claim), paid activation/renewal/replay CAS, expiration once per term, renew customer/system, admin mutations + replay + rejected, payment failed/chargeback без дублей, append-only триггеры, best-effort SAVEPOINT, сортировка/фильтры/пагинация, backfill миграции 047.
+- `internal/service/journal_test.go` — повторный /start без дублей, реанимация, /setplan, /del (история переживает удаление), orphan revoke, валидация фильтров AdminService.
+- `internal/web/admin_journal_api_test.go`, `frontend/admin/browser/journal.spec.ts`.
+
+## Окружение Windows-машины разработчика
+- go-sqlite3 требует cgo: `set CGO_ENABLED=1 && set PATH=C:\msys64\ucrt64\bin;%PATH%` перед `go test`.
+- vitest падает на всех сьютах («reading 'config'»), если cwd с маленькой буквой диска (`d:\`); запускать из `D:\...\frontend`.
+- `gofmt -l` на CRLF-чекауте помечает все файлы — проверять копию с LF.
+
 ## Количество тестовых файлов
 
 Количество тестовых файлов меняется вместе с кодом; не использовать историческое число ниже как текущую метрику.

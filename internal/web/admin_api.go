@@ -62,6 +62,16 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.get(w, r, func(w http.ResponseWriter, r *http.Request) { a.user(w, r, telegramID) })
 	case len(segments) == 1 && segments[0] == "audit":
 		a.get(w, r, a.audit)
+	case len(segments) == 1 && segments[0] == "journal":
+		// Read-only: the journal is append-only and written by the backend.
+		a.get(w, r, a.journalList)
+	case len(segments) == 2 && segments[0] == "journal":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		a.get(w, r, func(w http.ResponseWriter, r *http.Request) { a.journalEvent(w, r, id) })
 	case segments[0] == "tariffs":
 		a.routeTariffs(w, r, segments)
 	case len(segments) == 1 && segments[0] == "plans":

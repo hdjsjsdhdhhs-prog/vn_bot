@@ -761,6 +761,38 @@ input[type='datetime-local'].input { min-width: 0; }
   .nodes-table td:first-child { grid-column: 1 / -1; font-weight: 600; }
 }
 
+/* Journal ---------------------------------------------------------------- */
+
+.journal-toolbar .search { flex-basis: 280px; }
+.journal-toolbar .select { flex-basis: 220px; }
+.period { display: inline-flex; align-items: center; gap: var(--sp-2); }
+.period-label { font-size: 13px; color: var(--muted); }
+.date-input { width: 152px; }
+.tone-failed { background: var(--danger); }
+.journal-table td { height: auto; padding-top: var(--sp-3); padding-bottom: var(--sp-3); vertical-align: top; }
+.journal-table td.cell-wrap { min-width: 260px; }
+.journal-table .col-date { font-variant-numeric: tabular-nums; }
+.cell-note { display: block; margin-top: 2px; font-size: 12px; font-weight: 400; color: var(--muted); white-space: normal; }
+.journal-open {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
+}
+.journal-open:focus-visible { outline-offset: 2px; border-radius: 2px; }
+@media (hover: hover) and (pointer: fine) {
+  .journal-open:hover { text-decoration: underline; text-underline-offset: 3px; }
+}
+@media (max-width: 767px) {
+  .period { flex: 1 1 100%; }
+  .date-input { flex: 1 1 0; width: auto; }
+  .journal-table td.cell-wrap { min-width: 0; }
+}
+
 /* Toasts ----------------------------------------------------------------- */
 
 .toast-region {

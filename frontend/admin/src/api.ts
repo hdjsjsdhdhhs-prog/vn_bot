@@ -425,6 +425,24 @@ export class AdminApi {
     return page;
   }
 
+  /**
+   * GET /admin/api/journal: one page of journal events, newest first. The
+   * journal is read-only here: events are written by the backend itself.
+   */
+  async journal(query: JournalQuery): Promise<JournalPage> {
+    const params = new URLSearchParams();
+    if (query.q) params.set('q', query.q);
+    if (query.type) params.set('type', query.type);
+    if (query.planKind) params.set('plan_kind', query.planKind);
+    if (query.from) params.set('from', query.from);
+    if (query.to) params.set('to', query.to);
+    if (query.offset > 0) params.set('offset', String(query.offset));
+    const search = params.toString();
+    const page = parseJournalPage(await this.#send('GET', search ? `/admin/api/journal?${search}` : '/admin/api/journal'));
+    if (!page) throw new ApiError('invalid_response');
+    return page;
+  }
+
   /** GET /admin/api/users/{telegram_id}. 404 means no linked customer has this ID. */
   async user(telegramId: number): Promise<UserDetail> {
     // The route only accepts canonical positive IDs and answers 404 otherwise.
@@ -1082,4 +1100,125 @@ function parseTariffPlan(value: unknown): TariffPlan | undefined {
     !isCount(traffic_limit) || !isNullable(subscription_builder_id, isPositive) || !isText(builder_name) ||
     !isCount(tariffs) || !isCount(subscriptions) || typeof selectable !== 'boolean') return undefined;
   return { id, name, is_active, devices_limit, traffic_limit, subscription_builder_id, builder_name, tariffs, subscriptions, selectable };
+}
+
+// =============================================================================
+// Journal (web.adminAPI.journalList → service.JournalPage, migration 047)
+// =============================================================================
+
+/** database.JournalEventTypes, in the order the filter offers them. */
+export const JOURNAL_EVENT_TYPES = [
+  'user_registered', 'trial_started', 'trial_bound', 'trial_expired',
+  'subscription_reconnected', 'free_activated', 'paid_activated', 'plan_changed',
+  'subscription_renewed', 'expiry_changed', 'subscription_expired',
+  'subscription_disabled', 'subscription_enabled', 'subscription_revoked',
+  'payment_succeeded', 'payment_failed', 'payment_refunded',
+] as const;
+export type JournalEventType = (typeof JOURNAL_EVENT_TYPES)[number];
+
+/** database.PlanKind* — the subscription type filter. */
+export const PLAN_KINDS = ['free', 'trial', 'paid'] as const;
+export type PlanKind = (typeof PLAN_KINDS)[number];
+
+/** database.JournalState: lifecycle snapshot in details.before / details.after. */
+export interface JournalState {
+  readonly status: string;
+  readonly expires_at: string | null;
+  readonly plan_id: number;
+  readonly plan_name: string;
+}
+
+/** service.JournalEventView. Unknown types and actors are kept verbatim. */
+export interface JournalEvent {
+  readonly id: number;
+  readonly created_at: string;
+  readonly event_type: string;
+  /** success | failed | rejected */
+  readonly outcome: string;
+  /** user | admin | system */
+  readonly actor: string;
+  /** Admin login or payment provider; '' when not applicable. */
+  readonly actor_name: string;
+  /** > 0 linked customer, < 0 anonymous trial, 0 unknown. */
+  readonly telegram_id: number;
+  readonly username: string;
+  /** May reference a subscription deleted since (admin /del, trial cleanup). */
+  readonly subscription_id: number | null;
+  readonly plan_id: number | null;
+  readonly plan_name: string;
+  /** free | trial | paid | '' */
+  readonly plan_kind: string;
+  readonly order_id: number | null;
+  /** Minor units; for XTR whole Stars. */
+  readonly amount_cents: number | null;
+  readonly currency: string | null;
+  readonly description: string;
+  readonly before: JournalState | null;
+  readonly after: JournalState | null;
+  /** Remaining details (days, provider, error_code, backfill, …). */
+  readonly details: Readonly<Record<string, unknown>>;
+}
+
+export interface JournalPage {
+  readonly events: readonly JournalEvent[];
+  readonly total: number;
+  readonly limit: number;
+  readonly offset: number;
+}
+
+/**
+ * Query of GET /admin/api/journal. from/to are RFC 3339 instants (from
+ * inclusive, to exclusive) or ''. q matches a Telegram or subscription ID
+ * exactly, otherwise a username substring.
+ */
+export interface JournalQuery {
+  readonly q: string;
+  readonly type: JournalEventType | '';
+  readonly planKind: PlanKind | '';
+  readonly from: string;
+  readonly to: string;
+  readonly offset: number;
+}
+
+function parseJournalState(value: unknown): JournalState | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const { status, expires_at = null, plan_id = 0, plan_name = '' } = value;
+  if (!isText(status) || !isNullable(expires_at, isTime) || !isCount(plan_id) || !isText(plan_name)) return undefined;
+  return { status, expires_at, plan_id, plan_name };
+}
+
+function parseJournalEvent(value: unknown): JournalEvent | null {
+  if (!isRecord(value) || !isRecord(value.details)) return null;
+  const {
+    id, created_at, event_type, outcome, actor, actor_name, telegram_id, username, subscription_id, plan_id,
+    plan_name, plan_kind, order_id, amount_cents, currency, description,
+  } = value;
+  if (!isPositive(id) || !isTime(created_at) || !isText(event_type) || event_type === '' || !isText(outcome) ||
+    !isText(actor) || !isText(actor_name) || !isInteger(telegram_id) || !isText(username) ||
+    !isNullable(subscription_id, isPositive) || !isNullable(plan_id, isPositive) || !isText(plan_name) ||
+    !isText(plan_kind) || !isNullable(order_id, isPositive) || !isNullable(amount_cents, isInteger) ||
+    !isNullable(currency, isCurrency) || !isText(description)) return null;
+  const { before: rawBefore, after: rawAfter, ...details } = value.details;
+  const before = parseJournalState(rawBefore);
+  const after = parseJournalState(rawAfter);
+  if (before === undefined || after === undefined) return null;
+  return {
+    id, created_at, event_type, outcome, actor, actor_name, telegram_id, username, subscription_id, plan_id,
+    plan_name, plan_kind, order_id, amount_cents, currency, description, before, after, details,
+  };
+}
+
+function parseJournalPage(value: unknown): JournalPage | null {
+  if (!isRecord(value)) return null;
+  const { events: list, total, limit, offset } = value;
+  if (!Array.isArray(list) || !isCount(total) || !isPositive(limit) || !isCount(offset) ||
+    list.length > limit || list.length > total) return null;
+  const events: JournalEvent[] = [];
+  for (const item of list) {
+    const event = parseJournalEvent(item);
+    if (!event) return null;
+    events.push(event);
+  }
+  return { events, total, limit, offset };
 }

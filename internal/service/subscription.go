@@ -218,6 +218,7 @@ func (s *SubscriptionService) reanimateRevokedSubscription(ctx context.Context, 
 	// Keep the row revoked until stale node bindings have been cleared
 	// successfully; otherwise an active subscription could be returned without
 	// a working VPN binding.
+	before := database.JournalStateOf(sub)
 	sub.PlanID = freePlan.ID
 	sub.Status = string(database.SubscriptionStatusActive)
 	sub.ExpiresAt = nil
@@ -235,7 +236,11 @@ func (s *SubscriptionService) reanimateRevokedSubscription(ctx context.Context, 
 		return nil, fmt.Errorf("clear subscription nodes during reanimation: %w", err)
 	}
 
-	err = s.db.UpdateSubscription(ctx, sub)
+	err = s.updateSubscriptionJournaled(ctx, sub, database.JournalRecord{
+		Type: database.JournalSubscriptionReconnected, Actor: database.JournalActorUser,
+		Description: "Подписка подключена повторно на бесплатном тарифе",
+		Before:      before, After: database.JournalStateOf(sub),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("reanimate subscription: %w", err)
 	}
@@ -250,6 +255,22 @@ func (s *SubscriptionService) reanimateRevokedSubscription(ctx context.Context, 
 	s.RefreshActiveSubscriptionsMetric(ctx)
 
 	return sub, nil
+}
+
+// journalUpdater is implemented by *database.Service: the subscription update
+// and its journal event commit in one transaction.
+type journalUpdater interface {
+	UpdateSubscriptionWithJournal(ctx context.Context, sub *database.Subscription, rec database.JournalRecord) error
+}
+
+// updateSubscriptionJournaled persists a lifecycle change together with its
+// journal event. Repositories without journal support (test doubles) fall back
+// to the plain update, so the lifecycle behaviour is identical either way.
+func (s *SubscriptionService) updateSubscriptionJournaled(ctx context.Context, sub *database.Subscription, rec database.JournalRecord) error {
+	if repo, ok := s.db.(journalUpdater); ok {
+		return repo.UpdateSubscriptionWithJournal(ctx, sub, rec)
+	}
+	return s.db.UpdateSubscription(ctx, sub)
 }
 
 // DowngradeToFreePlan resets a subscription to the free plan and deprovisions
@@ -275,6 +296,7 @@ func (s *SubscriptionService) DowngradeToFreePlan(ctx context.Context, sub *data
 	}
 
 	// Reset subscription to free-plan defaults.
+	before := database.JournalStateOf(sub)
 	sub.PlanID = freePlan.ID
 	sub.Status = string(database.SubscriptionStatusActive)
 	sub.ExpiresAt = nil
@@ -283,7 +305,11 @@ func (s *SubscriptionService) DowngradeToFreePlan(ctx context.Context, sub *data
 	sub.PricePaidCents = 0
 	sub.Currency = nil
 
-	err = s.db.UpdateSubscription(ctx, sub)
+	err = s.updateSubscriptionJournaled(ctx, sub, database.JournalRecord{
+		Type: database.JournalFreeActivated, Actor: database.JournalActorSystem,
+		Description: "Подписка переведена на бесплатный тариф",
+		Before:      before, After: database.JournalStateOf(sub),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("downgrade: update subscription: %w", err)
 	}
@@ -341,9 +367,15 @@ func (s *SubscriptionService) DowngradeToFreePlan(ctx context.Context, sub *data
 // lives in exactly one place. Returns the deleted subscription (nil on error).
 func (s *SubscriptionService) revokeAndDeprovisionThenDelete(ctx context.Context, sub *database.Subscription) (*database.Subscription, error) {
 	// Phase 1: mark revoked before any external effect.
+	before := database.JournalStateOf(sub)
 	sub.Status = string(database.SubscriptionStatusRevoked)
 
-	err := s.db.UpdateSubscription(ctx, sub)
+	// The journal row outlives the physical delete below.
+	err := s.updateSubscriptionJournaled(ctx, sub, database.JournalRecord{
+		Type: database.JournalRevoked, Actor: database.JournalActorAdmin, ActorName: "bot",
+		Description: "Подписка отозвана и удалена администратором",
+		Before:      before, After: database.JournalStateOf(sub),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("mark revoked: %w", err)
 	}
@@ -449,6 +481,7 @@ func (s *SubscriptionService) AdminSetPlan(ctx context.Context, subscriptionID, 
 		return nil, errors.New("provider subscriptions require a finite expiry; legacy free downgrade is unsupported")
 	}
 	now := time.Now().UTC()
+	before := database.JournalStateOf(sub)
 	if plan.Name == database.FreePlanName {
 		// Free plan: clear expiry and paid state, mirroring DowngradeToFreePlan.
 		// Leaving ProductID/PricePaidCents behind would keep the subscription
@@ -482,7 +515,16 @@ func (s *SubscriptionService) AdminSetPlan(ctx context.Context, subscriptionID, 
 	// new expiry (mirrors ConfirmOrderPaidCAS).
 	sub.RemindersSent = 0
 
-	err = s.db.UpdateSubscription(ctx, sub)
+	journal := database.JournalRecord{
+		Type: database.JournalPlanChanged, Actor: database.JournalActorAdmin, ActorName: "bot",
+		Description: fmt.Sprintf("Администратор назначил тариф «%s»", plan.Name),
+		Before:      before, After: database.JournalStateOf(sub), Extra: map[string]any{"days": days},
+	}
+	if plan.Name == database.FreePlanName {
+		journal.Type = database.JournalFreeActivated
+		journal.Description = "Администратор перевёл подписку на бесплатный тариф"
+	}
+	err = s.updateSubscriptionJournaled(ctx, sub, journal)
 	if err != nil {
 		return nil, fmt.Errorf("admin set plan: update subscription: %w", err)
 	}
@@ -945,9 +987,14 @@ func (s *SubscriptionService) ReconcileOrphanedClients(ctx context.Context) (int
 		// Every node binding is pending_remove (or an unexpected state):
 		// the subscription is fully deprovisioned but the DB row remains.
 		// Policy: never delete — revoke instead (subserver then serves 404).
+		before := database.JournalStateOf(&sub)
 		sub.Status = string(database.SubscriptionStatusRevoked)
 
-		updateErr := s.db.UpdateSubscription(ctx, &sub)
+		updateErr := s.updateSubscriptionJournaled(ctx, &sub, database.JournalRecord{
+			Type: database.JournalRevoked, Actor: database.JournalActorSystem,
+			Description: "Подписка отозвана: VPN-доступ не найден ни на одном узле",
+			Before:      before, After: database.JournalStateOf(&sub),
+		})
 		if updateErr != nil {
 			logger.Warn("failed to revoke orphaned subscription",
 				zap.Error(updateErr),

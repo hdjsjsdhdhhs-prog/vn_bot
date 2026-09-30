@@ -199,6 +199,8 @@ func (s *Service) CreateSubscription(ctx context.Context, sub *Subscription, inv
 			return fmt.Errorf("failed to create new subscription: %w", err)
 		}
 
+		recordJournal(ctx, tx, subscriptionCreatedJournal(sub))
+
 		return nil
 	})
 	if err != nil {
@@ -206,6 +208,21 @@ func (s *Service) CreateSubscription(ctx context.Context, sub *Subscription, inv
 	}
 	*sub = created
 	return nil
+}
+
+// subscriptionCreatedJournal is the journal event of a newly inserted row: a
+// Telegram customer registers; a row with a negative ID is an anonymous trial.
+func subscriptionCreatedJournal(sub *Subscription) JournalRecord {
+	rec := JournalRecord{
+		Type: JournalUserRegistered, Actor: JournalActorUser, Subscription: sub,
+		Description: "Пользователь зарегистрирован, подписка подключена",
+		After:       JournalStateOf(sub), DedupKey: journalKey("subscription_created", sub.ID),
+	}
+	if sub.TelegramID <= 0 {
+		rec.Type = JournalTrialStarted
+		rec.Description = "Активирована пробная подписка"
+	}
+	return rec
 }
 
 func createSubscriptionWithToken(db *gorm.DB, sub *Subscription) error {
@@ -530,6 +547,13 @@ type ExpireSubscriptionPlanInTxFn func(ctx context.Context, tx *gorm.DB, subscri
 // creates the pending node-sync state needed to deprovision its previous plan.
 func (s *Service) ExpireSubscriptionWithPlanCAS(ctx context.Context, id uint, freePlanID uint, applyPlan ExpireSubscriptionPlanInTxFn) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Snapshot for the journal; the CAS below stays the authority. Take the
+		// SQLite writer reservation first (as renewSubscription does) so the
+		// read cannot be followed by a failing lock upgrade.
+		prior, err := claimSubscriptionSnapshot(tx, id)
+		if err != nil {
+			return err
+		}
 		result := tx.Model(&Subscription{}).Where("id = ? AND status = ? AND expires_at IS NOT NULL AND expires_at <= ?", id, string(SubscriptionStatusActive), time.Now().UTC()).
 			Updates(map[string]any{
 				"status":           string(SubscriptionStatusActive),
@@ -573,31 +597,73 @@ func (s *Service) ExpireSubscriptionWithPlanCAS(ctx context.Context, id uint, fr
 			}
 		}
 
+		recordJournal(ctx, tx, expiredToFreeJournal(prior, freePlanID))
+
 		return nil
 	})
 }
 
+// claimSubscriptionSnapshot takes SQLite's writer reservation on the row
+// (no-op UPDATE, like renewSubscription) and then reads it, so the snapshot
+// cannot be invalidated by a concurrent writer before this transaction's own
+// write. Returns ErrSubscriptionNotFound for a missing row.
+func claimSubscriptionSnapshot(tx *gorm.DB, id uint) (*Subscription, error) {
+	claim := tx.Model(&Subscription{}).Where("id = ?", id).UpdateColumn("id", gorm.Expr("id"))
+	if claim.Error != nil {
+		return nil, fmt.Errorf("lock subscription: %w", claim.Error)
+	}
+	if claim.RowsAffected == 0 {
+		return nil, ErrSubscriptionNotFound
+	}
+	var sub Subscription
+	if err := tx.First(&sub, id).Error; err != nil {
+		return nil, fmt.Errorf("load subscription: %w", err)
+	}
+	return &sub, nil
+}
+
+// expiredToFreeJournal describes a finite term ending with a downgrade to the
+// free plan. The event carries the plan that expired, not the free plan.
+func expiredToFreeJournal(prior *Subscription, freePlanID uint) JournalRecord {
+	after := JournalStateOf(prior)
+	after.Status, after.ExpiresAt, after.PlanID = string(SubscriptionStatusActive), nil, freePlanID
+	return JournalRecord{
+		Type: JournalExpired, Actor: JournalActorSystem, Subscription: prior,
+		Description: "Срок подписки истёк, подписка переведена на бесплатный тариф",
+		Before:      JournalStateOf(prior), After: after,
+		DedupKey: journalExpiryKey("subscription_expired", prior.ID, prior.ExpiresAt),
+	}
+}
+
 // ExpireSubscription downgrades the subscription to the free plan and clears expires_at.
 func (s *Service) ExpireSubscription(ctx context.Context, id uint, freePlanID uint) error {
-	result := s.db.WithContext(ctx).Model(&Subscription{}).Where("id = ?", id).
-		Updates(map[string]any{
-			"status":           string(SubscriptionStatusActive),
-			"expires_at":       nil,
-			"plan_id":          freePlanID,
-			"product_id":       nil,
-			"started_at":       nil,
-			"price_paid_cents": 0,
-			"currency":         nil,
-		})
-	if result.Error != nil {
-		return fmt.Errorf("failed to expire subscription: %w", result.Error)
-	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		prior, err := claimSubscriptionSnapshot(tx, id)
+		if err != nil {
+			return err
+		}
+		result := tx.Model(&Subscription{}).Where("id = ?", id).
+			Updates(map[string]any{
+				"status":           string(SubscriptionStatusActive),
+				"expires_at":       nil,
+				"plan_id":          freePlanID,
+				"product_id":       nil,
+				"started_at":       nil,
+				"price_paid_cents": 0,
+				"currency":         nil,
+			})
+		if result.Error != nil {
+			return fmt.Errorf("failed to expire subscription: %w", result.Error)
+		}
 
-	if result.RowsAffected == 0 {
-		return ErrSubscriptionNotFound
-	}
+		if result.RowsAffected == 0 {
+			return ErrSubscriptionNotFound
+		}
 
-	return nil
+		recordJournal(ctx, tx, expiredToFreeJournal(prior, freePlanID))
+
+		return nil
+	})
 }
 
 // GetExpiredPaidSubscriptions returns active subscriptions that have expired and are not on free or trial plans.

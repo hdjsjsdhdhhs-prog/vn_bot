@@ -2,6 +2,12 @@
 
 **Branch:** `dev`
 
+## Admin Journal (2026-09-29, migration 047)
+- Table `journal_events`: append-only (UPDATE/DELETE triggers), no FKs (history survives `/del` and trial cleanup), UNIQUE `dedup_key` (NULLs allowed). Backfill of registrations, paid orders and admin audit in 047 with the live dedup keys (`details.backfill=true`).
+- Written by `database.recordJournal` inside the transaction of the state change; best-effort in a SAVEPOINT (failure → `Warn`, business tx continues). Producers: CreateSubscription, CreateTrialSubscription, BindTrialSubscription, ClaimExpiredTrials, renewSubscription (actor user for Mini App, system by ID), ConfirmOrderPaidCAS (payment_succeeded + paid_activated/subscription_renewed), CancelOrderCAS, CancelPaidOrderAndDowngradeCAS, ExpireSubscriptionWithPlanCAS/ExpireSubscription/ExpireProviderSubscription, AdminMutateSubscription (incl. rejected). Service-layer changes (reanimate, /setplan, /del revoke, orphan revoke, DowngradeToFreePlan) go through `UpdateSubscriptionWithJournal` via optional `journalUpdater` type assertion (mocks fall back to plain UpdateSubscription).
+- Expiry paths claim the row first (`claimSubscriptionSnapshot`, no-op UPDATE) before reading the snapshot — same SQLite writer-reservation pattern as renewSubscription.
+- Read: `AdminService.ListJournal/GetJournalEvent` (type assertion `JournalRepository`), `GET /admin/api/journal[/{id}]` (GET/HEAD only). Frontend: section `audit` (`#/audit`) in `frontend/admin/src/main.ts`, spec `frontend/admin/browser/journal.spec.ts`. Doc: `doc/journal.md`.
+
 ## 3x-ui v3.7.0 auto-renew (2026-08-29)
 - Free clients are provisioned/updated with `reset=30`, `resetDay=0`, `resetMax=0`, `trafficReset=monthly`, `trafficResetDay=1`, matching the panel payload supplied by the operator.
 - `resetDay=0` intentionally preserves rolling 30-day renewal; calendar renewal is not enabled. `resetMax=0` is unlimited. Trials use `reset=0`.

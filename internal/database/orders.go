@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/kereal/rs8kvn_bot/internal/logger"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -343,6 +345,8 @@ func (s *Service) ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt,
 			}
 		}
 
+		recordPaymentJournal(ctx, tx, orderID, &currentSub, product, newExpiry, activatedAt)
+
 		activated = true
 
 		return nil
@@ -352,6 +356,46 @@ func (s *Service) ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt,
 	}
 
 	return activated, nil
+}
+
+// recordPaymentJournal journals a confirmed payment and the entitlement it
+// granted: a renewal when the subscription already held a paid term of the
+// same plan (the same rule as the admin payment alert), otherwise a paid
+// activation. Both rows are keyed by the order, so they exist at most once.
+func recordPaymentJournal(ctx context.Context, tx *gorm.DB, orderID uint, prior *Subscription, product *Product, newExpiry, activatedAt time.Time) {
+	var order Order
+	if err := tx.First(&order, orderID).Error; err != nil {
+		logger.Warn("failed to load order for journal", zap.Uint("order_id", orderID), zap.Error(err))
+		return
+	}
+	after := *prior
+	after.PlanID, after.Status = product.PlanID, string(SubscriptionStatusActive)
+	expiry := newExpiry
+	after.ExpiresAt = &expiry
+	amount := order.AmountCents
+	payment := map[string]any{"provider": order.PaymentProvider, "product_id": product.ID, "product_name": product.Name, "duration_days": product.DurationDays}
+	if order.CallbackAmountCents != nil {
+		payment["charged_cents"] = *order.CallbackAmountCents
+	}
+	recordJournal(ctx, tx, JournalRecord{
+		Type: JournalPaymentSucceeded, Actor: JournalActorUser, ActorName: order.PaymentProvider, Subscription: &after,
+		Description: fmt.Sprintf("Оплата заказа #%d прошла успешно", order.ID),
+		OrderID:     order.ID, AmountCents: &amount, Currency: order.Currency, Extra: payment,
+		DedupKey: journalKey("order_paid", order.ID), At: activatedAt,
+	})
+	renewal := prior.PlanID == product.PlanID && (prior.ProductID != nil || prior.PricePaidCents > 0)
+	entitlement := JournalRecord{
+		Type: JournalPaidActivated, Actor: JournalActorUser, ActorName: order.PaymentProvider, Subscription: &after,
+		Description: fmt.Sprintf("Активирована платная подписка «%s» на %s", product.Name, journalDays(product.DurationDays)),
+		OrderID:     order.ID, AmountCents: &amount, Currency: order.Currency,
+		Before: JournalStateOf(prior), After: JournalStateOf(&after), Extra: payment,
+		DedupKey: journalKey("order_activated", order.ID), At: activatedAt,
+	}
+	if renewal {
+		entitlement.Type = JournalRenewed
+		entitlement.Description = fmt.Sprintf("Подписка продлена оплатой «%s» на %s", product.Name, journalDays(product.DurationDays))
+	}
+	recordJournal(ctx, tx, entitlement)
 }
 
 // CalculatePaymentExpiry is the single source of truth for payment expiry
@@ -444,6 +488,7 @@ func (s *Service) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider s
 		order.Status = OrderStatusCanceled
 		if !result.WasPaid {
 			result.Order = &order
+			recordOrderCanceledJournal(ctx, tx, &order, &currentSub)
 			return nil
 		}
 		// A chargeback must never resurrect a subscription that was already
@@ -452,6 +497,7 @@ func (s *Service) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider s
 		// the active free plan below.
 		if currentSub.Status != string(SubscriptionStatusActive) {
 			result.Order = &order
+			recordChargebackJournal(ctx, tx, &order, &currentSub, 0)
 			return nil
 		}
 
@@ -473,6 +519,7 @@ func (s *Service) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider s
 
 		if activePaid > 0 {
 			result.Order = &order
+			recordChargebackJournal(ctx, tx, &order, &currentSub, 0)
 			return nil
 		}
 
@@ -502,6 +549,7 @@ func (s *Service) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider s
 
 		result.Downgraded = true
 		result.Order = &order
+		recordChargebackJournal(ctx, tx, &order, &currentSub, freePlanID)
 
 		return nil
 	})
@@ -519,12 +567,78 @@ func (s *Service) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider s
 // CancelOrderCAS cancels an order only from one of the supplied states. It
 // returns false without error when the callback is an idempotent no-op.
 func (s *Service) CancelOrderCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, fromStatuses []OrderStatus) (bool, error) {
-	result := s.db.WithContext(ctx).Model(&Order{}).Where("payment_provider = ? AND provider_payment_id = ? AND status IN ?", provider, providerPaymentID.String(), fromStatuses).Update("status", OrderStatusCanceled)
-	if result.Error != nil {
-		return false, fmt.Errorf("cancel order: %w", result.Error)
+	changed := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&Order{}).Where("payment_provider = ? AND provider_payment_id = ? AND status IN ?", provider, providerPaymentID.String(), fromStatuses).Update("status", OrderStatusCanceled)
+		if result.Error != nil {
+			return result.Error
+		}
+		changed = result.RowsAffected > 0
+		if !changed {
+			return nil
+		}
+		var order Order
+		if err := tx.Where("payment_provider = ? AND provider_payment_id = ?", provider, providerPaymentID.String()).First(&order).Error; err != nil {
+			logger.Warn("failed to load canceled order for journal", zap.String("provider", provider), zap.Error(err))
+			return nil
+		}
+		var sub Subscription
+		if err := tx.First(&sub, order.SubscriptionID).Error; err != nil {
+			logger.Warn("failed to load subscription of canceled order for journal", zap.Uint("order_id", order.ID), zap.Error(err))
+			return nil
+		}
+		recordOrderCanceledJournal(ctx, tx, &order, &sub)
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("cancel order: %w", err)
 	}
 
-	return result.RowsAffected > 0, nil
+	return changed, nil
+}
+
+// recordOrderCanceledJournal journals a payment that did not go through: the
+// provider canceled an order before any money was collected.
+func recordOrderCanceledJournal(ctx context.Context, tx *gorm.DB, order *Order, sub *Subscription) {
+	amount := order.AmountCents
+	recordJournal(ctx, tx, JournalRecord{
+		Type: JournalPaymentFailed, Outcome: JournalOutcomeFailed, Actor: JournalActorSystem, ActorName: order.PaymentProvider,
+		Subscription: sub, PlanID: orderPlanID(tx, order),
+		Description: fmt.Sprintf("Оплата заказа #%d не прошла: платёж отменён провайдером", order.ID),
+		OrderID:     order.ID, AmountCents: &amount, Currency: order.Currency,
+		Extra:    map[string]any{"provider": order.PaymentProvider, "product_id": order.ProductID},
+		DedupKey: journalKey("order_canceled", order.ID),
+	})
+}
+
+// recordChargebackJournal journals a refund of a collected payment.
+// freePlanID is non-zero when access was downgraded to the free plan.
+func recordChargebackJournal(ctx context.Context, tx *gorm.DB, order *Order, prior *Subscription, freePlanID uint) {
+	amount := order.AmountCents
+	rec := JournalRecord{
+		Type: JournalPaymentRefunded, Actor: JournalActorSystem, ActorName: order.PaymentProvider,
+		Subscription: prior, PlanID: orderPlanID(tx, order),
+		Description: fmt.Sprintf("Возврат платежа по заказу #%d, доступ сохранён", order.ID),
+		OrderID:     order.ID, AmountCents: &amount, Currency: order.Currency,
+		Extra:    map[string]any{"provider": order.PaymentProvider, "product_id": order.ProductID, "downgraded": freePlanID != 0},
+		DedupKey: journalKey("order_canceled", order.ID),
+	}
+	if freePlanID != 0 {
+		after := JournalStateOf(prior)
+		after.Status, after.ExpiresAt, after.PlanID = string(SubscriptionStatusActive), nil, freePlanID
+		rec.Before, rec.After = JournalStateOf(prior), after
+		rec.Description = fmt.Sprintf("Возврат платежа по заказу #%d, подписка переведена на бесплатный тариф", order.ID)
+	}
+	recordJournal(ctx, tx, rec)
+}
+
+// orderPlanID is the plan of the order's product (0 when unavailable).
+func orderPlanID(tx *gorm.DB, order *Order) uint {
+	var product Product
+	if err := tx.Select("id", "plan_id").First(&product, order.ProductID).Error; err != nil {
+		return 0
+	}
+	return product.PlanID
 }
 
 // GetOrdersBySubscriptionID returns orders for the given subscription.
