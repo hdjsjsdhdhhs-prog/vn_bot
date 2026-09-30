@@ -2425,7 +2425,7 @@ class AdminApp {
     const now = Date.now();
     const grid = el('div', 'detail-grid');
     grid.append(subscriptionPanel(user, data.plan, now), planPanel(user, data.plan));
-    view.body.replaceChildren(grid, this.managePanel(data, now), this.builderPanel(data, view), nodesPanel(user, data.nodes));
+    view.body.replaceChildren(grid, this.managePanel(data, now), this.builderPanel(data), nodesPanel(user, data.nodes));
     if (focusKey) this.focusManage(focusKey);
   }
 
@@ -2949,7 +2949,7 @@ class AdminApp {
   // ===========================================================================
 
   /** Renders the "Построитель" panel on the subscription detail page. */
-  private builderPanel(data: UserDetail, _view: DetailView): HTMLElement {
+  private builderPanel(data: UserDetail): HTMLElement {
     const sub = data.subscription;
     const plan = data.plan;
     const panel = el('section', 'panel');
@@ -4069,7 +4069,9 @@ class AdminApp {
     dialog.append(bodyEl);
 
     // ---- Dialog lifecycle ----
-    let handle: { dismiss: () => void };
+    const handle = {
+      dismiss: () => { if (dialog.open) dialog.close(); dialog.remove(); },
+    };
     const isOpen = () => this.dialog === handle;
     const close = (force = false) => {
       if (!isOpen()) return;
@@ -4078,9 +4080,6 @@ class AdminApp {
       }
       this.dialog = null;
       handle.dismiss();
-    };
-    handle = {
-      dismiss: () => { if (dialog.open) dialog.close(); dialog.remove(); },
     };
 
     cancelBtn.addEventListener('click', () => close());
