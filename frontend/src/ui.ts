@@ -133,7 +133,7 @@ export function mount(root: HTMLElement, store: Store, telegram?: WebApp) {
     const route = location.hash.slice(1) || 'home';
     const view = el('div', 'app-shell');
     const header = el('header', 'header');
-    const brand = el('a', 'brand', 'RS8'); brand.href = '#home'; brand.setAttribute('aria-label', 'На главную');
+    const brand = el('a', 'brand', 'DictatorVPN'); brand.href = '#home'; brand.setAttribute('aria-label', 'На главную');
     header.append(brand, el('span', 'brand-caption', 'ЛИЧНЫЙ КАБИНЕТ'));
     view.append(header);
     const main = el('main', 'content'); main.id = 'main';

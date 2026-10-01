@@ -24,7 +24,7 @@ func TestAdminUI_EmbeddedProductionAssets(t *testing.T) {
 
 	rr := request("GET", "/admin-ui/")
 	require.Equal(t, 200, rr.Code, "run npm --prefix frontend run build:admin before testing embedded admin UI")
-	assert.Contains(t, rr.Body.String(), "<title>RS8 Admin</title>")
+	assert.Contains(t, rr.Body.String(), "<title>DictatorVPN Admin</title>")
 	assert.Equal(t, "text/html; charset=utf-8", rr.Header().Get("Content-Type"))
 	assert.Equal(t, "no-store", rr.Header().Get("Cache-Control"))
 	assert.Equal(t, "DENY", rr.Header().Get("X-Frame-Options"))
@@ -67,7 +67,7 @@ func TestAdminUI_ProductionRouterKeepsAdminGuard(t *testing.T) {
 	}
 	ui := serve("/admin-ui/")
 	require.Equal(t, http.StatusOK, ui.Code)
-	assert.Contains(t, ui.Body.String(), "<title>RS8 Admin</title>")
+	assert.Contains(t, ui.Body.String(), "<title>DictatorVPN Admin</title>")
 	redirect := serve("/admin-ui")
 	assert.Equal(t, http.StatusMovedPermanently, redirect.Code)
 	assert.Equal(t, "/admin-ui/", redirect.Header().Get("Location"))

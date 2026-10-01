@@ -1,6 +1,6 @@
 package bot
 
-const legalFooter = "\n\nБот «RS8 KVN», 28.07.2026"
+const legalFooter = "\n\nБот «DictatorVPN», 28.07.2026"
 
 const privacyText = `🔒 *Политика конфиденциальности*
 

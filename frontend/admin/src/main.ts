@@ -147,7 +147,7 @@ function setLabel(node: HTMLButtonElement, label: string) {
 
 function brand(): HTMLElement {
   const node = el('div', 'brand');
-  node.append(el('span', 'brand-mark', 'RS8'), el('span', 'brand-tag', 'Admin'));
+  node.append(el('span', 'brand-mark', 'DictatorVPN'), el('span', 'brand-tag', 'Admin'));
   return node;
 }
 
@@ -1738,7 +1738,7 @@ class AdminApp {
       if (id === section.id) link.setAttribute('aria-current', 'page');
       else link.removeAttribute('aria-current');
     }
-    document.title = `${section.label} · RS8 Admin`;
+    document.title = `${section.label} · DictatorVPN Admin`;
 
     // Leaving a screen invalidates every request still in flight for it. A
     // mutation already sent still completes on the server; its dialog closes.
@@ -2654,7 +2654,7 @@ class AdminApp {
     const name = displayName(user);
     view.title.textContent = name;
     view.desc.textContent = `Telegram ID ${user.telegram_id} · Подписка #${user.id}`;
-    document.title = `${name} · RS8 Admin`;
+    document.title = `${name} · DictatorVPN Admin`;
     view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
     // Repainting replaces every node; keep keyboard focus on the same control.
     const active = document.activeElement;
@@ -3501,7 +3501,7 @@ class AdminApp {
     const b = data.builder;
     const name = b.name || `Построитель #${b.id}`;
     view.title.textContent = name;
-    document.title = `${name} · Мониторинг · RS8 Admin`;
+    document.title = `${name} · Мониторинг · DictatorVPN Admin`;
     view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
 
     const panel = el('section', 'panel');
@@ -4483,7 +4483,7 @@ class AdminApp {
     setLoading(view.body, null);
     view.title.textContent = src.name;
     view.desc.textContent = `${formatLabel(src.type)} · ${src.enabled ? 'включён' : 'отключён'}${src.description ? ` · ${src.description}` : ''}`;
-    document.title = `${src.name} · Источники · RS8 Admin`;
+    document.title = `${src.name} · Источники · DictatorVPN Admin`;
     const last = this.syncNotices.get(src.id);
     view.status.replaceChildren(...(last && !view.syncing ? [notice(last)] : []));
 
@@ -5955,7 +5955,7 @@ class AdminApp {
     const paintHeading = () => {
       const name = base?.name ?? 'Новый тариф';
       view.title.textContent = name;
-      document.title = `${name} · RS8 Admin`;
+      document.title = `${name} · DictatorVPN Admin`;
       view.desc.textContent = base
         ? [`Тариф #${base.id}`, base.previous_id ? `новая версия тарифа #${base.previous_id}` : '', `изменён ${formatDateTime(base.updated_at)}`]
           .filter(Boolean).join(' · ')

@@ -1070,7 +1070,7 @@ func TestHandleCallback_MenuPrivacy(t *testing.T) {
 	}
 
 	assert.Contains(t, combined.String(), "Политика конфиденциальности", "message should contain privacy title")
-	assert.Contains(t, combined.String(), "Бот «RS8 KVN», 28.07.2026", "message should contain legal footer")
+	assert.Contains(t, combined.String(), "Бот «DictatorVPN», 28.07.2026", "message should contain legal footer")
 }
 
 func TestHandleCallback_MenuTerms(t *testing.T) {
@@ -1107,7 +1107,7 @@ func TestHandleCallback_MenuTerms(t *testing.T) {
 	}
 
 	assert.Contains(t, combined.String(), "Пользовательское соглашение", "message should contain terms title")
-	assert.Contains(t, combined.String(), "Бот «RS8 KVN», 28.07.2026", "message should contain legal footer")
+	assert.Contains(t, combined.String(), "Бот «DictatorVPN», 28.07.2026", "message should contain legal footer")
 }
 
 func TestHandleCallback_MenuSupport(t *testing.T) {

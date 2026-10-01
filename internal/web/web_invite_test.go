@@ -157,7 +157,7 @@ func TestHandleInvite_InvalidCode(t *testing.T) {
 	body := rec.Body.String()
 
 	expectedElements := []string{
-		"RS8 KVN",
+		"DictatorVPN",
 		"Добавить в Happ",
 		"Активировать",
 		"t.me/testbot",

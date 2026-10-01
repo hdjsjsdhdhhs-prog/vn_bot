@@ -41,7 +41,7 @@ func TestRenderTrialPage(t *testing.T) {
 			trialHours:   3,
 			check: func(t *testing.T, html string) {
 				for _, expected := range []string{
-					"<!DOCTYPE html>", "RS8 KVN", "Добавить в Happ",
+					"<!DOCTYPE html>", "DictatorVPN", "Добавить в Happ",
 					"happ://add/", "Активировать",
 					"https://t.me/testbot?start=trial_sub123",
 					"3 часа", "Срок действия", "copyToClipboard",
@@ -111,7 +111,7 @@ func TestRenderTrialPage(t *testing.T) {
 			trialHours:   24,
 			check: func(t *testing.T, html string) {
 				assert.Contains(t, html, "<!DOCTYPE html>")
-				assert.Contains(t, html, "RS8 KVN")
+				assert.Contains(t, html, "DictatorVPN")
 				assert.Contains(t, html, "Добавить в Happ")
 				assert.Contains(t, html, "Активировать")
 				assert.Contains(t, html, "24 часа")
@@ -126,7 +126,7 @@ func TestRenderTrialPage(t *testing.T) {
 			trialHours:   24,
 			check: func(t *testing.T, html string) {
 				assert.Contains(t, html, "<!DOCTYPE html>")
-				assert.Contains(t, html, "RS8 KVN")
+				assert.Contains(t, html, "DictatorVPN")
 				assert.Contains(t, html, "Добавить в Happ")
 				assert.Contains(t, html, "Активировать")
 				assert.Contains(t, html, "24 часа")
