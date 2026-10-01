@@ -13,6 +13,7 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/logger"
 	"github.com/kereal/rs8kvn_bot/internal/metrics"
+	"github.com/kereal/rs8kvn_bot/internal/netmon"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/service/payment/platega"
 	"github.com/kereal/rs8kvn_bot/internal/subserver"
@@ -120,6 +121,26 @@ type appServices struct {
 	syncService    *service.SyncService
 	adminService   *service.AdminService
 	builderService *service.BuilderService
+	netMonitor     *netmon.Service
+}
+
+// newNetworkMonitor wires the network monitor with the /sub builder pipeline
+// (subserver.ResolveMonitorBuilders) and the handshake prober. It is created
+// even when NETMON_ENABLED=false so the admin page still shows history; only
+// the background worker is gated by the flag.
+func newNetworkMonitor(cfg *config.Config, dbService *database.Service) *netmon.Service {
+	resolve := func(ctx context.Context, builders []database.SubscriptionBuilder) ([]subserver.MonitorBuilder, error) {
+		return subserver.ResolveMonitorBuilders(ctx, dbService, builders)
+	}
+	timeout := time.Duration(cfg.NetMonTimeout) * time.Second
+	return netmon.New(dbService, resolve, netmon.NetProber{Timeout: timeout}, netmon.Config{
+		Enabled:     cfg.NetMonEnabled,
+		Interval:    time.Duration(cfg.NetMonInterval) * time.Second,
+		Timeout:     timeout,
+		Refresh:     time.Duration(cfg.NetMonRefresh) * time.Second,
+		Concurrency: cfg.NetMonConcurrency,
+		DownAfter:   cfg.NetMonDownAfter,
+	})
 }
 
 // initServices wires the subscription service, subserver, bot handler,
@@ -157,7 +178,10 @@ func initServices(cfg *config.Config, dbService *database.Service, deps *runtime
 		return &service.FetchedCatalogue{Format: c.Format, Entries: c.Entries, Skipped: c.Skipped, Duplicates: c.Duplicates}, nil
 	})
 
-	return &appServices{subService: subService, subServer: subServer, handler: handler, orderService: orderService, syncService: syncSvc, adminService: adminService, builderService: builderService}
+	return &appServices{
+		subService: subService, subServer: subServer, handler: handler, orderService: orderService, syncService: syncSvc,
+		adminService: adminService, builderService: builderService, netMonitor: newNetworkMonitor(cfg, dbService),
+	}
 }
 
 // runEventLoop processes Telegram updates with bounded concurrency until

@@ -30,11 +30,12 @@ type adminAPI struct {
 	svc        *service.AdminService
 	builderSvc *service.BuilderService
 	tariffSvc  *service.TariffService
+	monitor    NetworkMonitor
 	actor      string
 }
 
-func newAdminAPI(svc *service.AdminService, builderSvc *service.BuilderService, tariffSvc *service.TariffService, actor string) http.Handler {
-	return &adminAPI{svc: svc, builderSvc: builderSvc, tariffSvc: tariffSvc, actor: actor}
+func newAdminAPI(svc *service.AdminService, builderSvc *service.BuilderService, tariffSvc *service.TariffService, monitor NetworkMonitor, actor string) http.Handler {
+	return &adminAPI{svc: svc, builderSvc: builderSvc, tariffSvc: tariffSvc, monitor: monitor, actor: actor}
 }
 
 func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -72,6 +73,9 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.get(w, r, func(w http.ResponseWriter, r *http.Request) { a.journalEvent(w, r, id) })
+	case segments[0] == "monitoring":
+		// Read-only: checks run only in the background network monitor.
+		a.routeMonitoring(w, r, segments)
 	case segments[0] == "tariffs":
 		a.routeTariffs(w, r, segments)
 	case len(segments) == 1 && segments[0] == "plans":

@@ -9,7 +9,15 @@ import {
   TARIFF_LIMITS, type AdminTariff, type TariffPlan, type TariffOutcome,
   JOURNAL_EVENT_TYPES, PLAN_KINDS, type JournalEvent, type JournalEventType, type JournalPage, type JournalQuery,
   type JournalState, type PlanKind,
+  MONITOR_PERIODS, type MonitorBuilderDetail, type MonitorBuilderSummary, type MonitorCountry, type MonitorHistory,
+  type MonitorHistoryQuery, type MonitorNode, type MonitorOverview, type MonitorPeriod, type MonitorStatus,
 } from './api';
+import {
+  EMPTY_MONITOR_FILTER, FILTER_STATUSES, STATUS_BADGES, STATUS_LABELS, endReasonLabel, errorLabel, filterCountries,
+  formatAgo, formatAvailability, formatDuration, formatLatency, isFiltered, latencyChart, monitorCountryLabel,
+  outageKindLabel, probeLabel, protocolLabel, protocolsOf as monitorProtocolsOf, transitionText, transportLabel,
+  type MonitorFilter,
+} from './monitoring';
 import {
   BADGE_PRESETS, DURATION_PRESETS, SERVER_FIELDS, TARIFF_CURRENCIES, botButtonLabel, catalogueOrder, durationLabel,
   featuresFromText, formFromTariff, formatTariffPrice, isRetired, moveItem, parsePriceInput, pluralRu, reorderIds, sameForm,
@@ -26,7 +34,7 @@ import {
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
 // handful of glyphs does not add a runtime dependency. One family, one stroke.
 
-type IconName = 'overview' | 'users' | 'tariffs' | 'up' | 'audit' | 'sources' | 'builders' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
+type IconName = 'overview' | 'users' | 'tariffs' | 'up' | 'audit' | 'sources' | 'builders' | 'monitoring' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
   | 'search' | 'back' | 'prev' | 'next' | 'chevron' | 'check' | 'plus' | 'trash' | 'drag' | 'edit';
 type Shape = readonly ['path' | 'circle' | 'rect', Readonly<Record<string, string>>];
 
@@ -85,6 +93,7 @@ const ICONS: Record<IconName, readonly Shape[]> = {
     ['path', { d: 'M9 3v18' }],
     ['path', { d: 'M15 3v18' }],
   ],
+  monitoring: [['path', { d: 'M22 12h-4l-3 9L9 3l-3 9H2' }]],
   plus: [['path', { d: 'M12 5v14' }], ['path', { d: 'M5 12h14' }]],
   trash: [
     ['path', { d: 'M3 6h18' }],
@@ -158,7 +167,7 @@ const clock = (date: Date) => date.toLocaleTimeString('ru-RU', { hour: '2-digit'
 // Sections. Overview reads /admin/api/dashboard, Users reads /admin/api/users,
 // the Journal (route #/audit) reads /admin/api/journal.
 
-type SectionId = 'overview' | 'users' | 'tariffs' | 'audit' | 'sources' | 'builders';
+type SectionId = 'overview' | 'users' | 'tariffs' | 'audit' | 'sources' | 'builders' | 'monitoring';
 interface Section {
   id: SectionId;
   label: string;
@@ -188,6 +197,10 @@ const SECTIONS: readonly Section[] = [
     description: 'Конфигурации подписок: правила фильтрации, порядок серверов, назначение планам.',
   },
   {
+    id: 'monitoring', label: 'Мониторинг',
+    description: 'Доступность серверов, которые построители сейчас выдают клиентам: построитель, страна, сервер. Проверки идут в фоне на уровне handshake протокола.',
+  },
+  {
     id: 'audit', label: 'Журнал',
     description: 'История действий пользователей, администраторов и системы: регистрации, подписки и платежи. Записи создаются автоматически и не редактируются.',
   },
@@ -197,32 +210,43 @@ const SECTIONS: readonly Section[] = [
 // positive Telegram IDs open a user, matching the API route.
 // Tariffs: #/tariffs, #/tariffs/new, #/tariffs/{product_id}.
 // Sources: #/sources, #/sources/{source_id} (catalogue of one source).
-interface Route { section: Section; userId: number | null; tariffId: number | 'new' | null; sourceId: number | null }
+// Monitoring: #/monitoring, #/monitoring/{builder_id} (countries and servers).
+interface Route {
+  section: Section; userId: number | null; tariffId: number | 'new' | null; sourceId: number | null; monitorId: number | null;
+}
 const USER_ROUTE = /^users\/([1-9][0-9]{0,15})$/;
 const TARIFF_ROUTE = /^tariffs\/(new|[1-9][0-9]{0,15})$/;
 const SOURCE_ROUTE = /^sources\/([1-9][0-9]{0,15})$/;
+const MONITOR_ROUTE = /^monitoring\/([1-9][0-9]{0,15})$/;
 
 function currentRoute(): Route {
   const path = location.hash.replace(/^#\/?/, '');
+  const none = { userId: null, tariffId: null, sourceId: null, monitorId: null };
   const match = USER_ROUTE.exec(path);
   const users = SECTIONS.find(section => section.id === 'users');
   if (match && users) {
     const id = Number(match[1]);
-    if (Number.isSafeInteger(id)) return { section: users, userId: id, tariffId: null, sourceId: null };
+    if (Number.isSafeInteger(id)) return { ...none, section: users, userId: id };
   }
   const tariff = TARIFF_ROUTE.exec(path);
   const tariffs = SECTIONS.find(section => section.id === 'tariffs');
   if (tariff && tariffs) {
     const id = tariff[1] === 'new' ? 'new' : Number(tariff[1]);
-    if (id === 'new' || Number.isSafeInteger(id)) return { section: tariffs, userId: null, tariffId: id, sourceId: null };
+    if (id === 'new' || Number.isSafeInteger(id)) return { ...none, section: tariffs, tariffId: id };
   }
   const source = SOURCE_ROUTE.exec(path);
   const sources = SECTIONS.find(section => section.id === 'sources');
   if (source && sources) {
     const id = Number(source[1]);
-    if (Number.isSafeInteger(id)) return { section: sources, userId: null, tariffId: null, sourceId: id };
+    if (Number.isSafeInteger(id)) return { ...none, section: sources, sourceId: id };
   }
-  return { section: SECTIONS.find(section => section.id === path) ?? SECTIONS[0], userId: null, tariffId: null, sourceId: null };
+  const monitor = MONITOR_ROUTE.exec(path);
+  const monitoring = SECTIONS.find(section => section.id === 'monitoring');
+  if (monitor && monitoring) {
+    const id = Number(monitor[1]);
+    if (Number.isSafeInteger(id)) return { ...none, section: monitoring, monitorId: id };
+  }
+  return { ...none, section: SECTIONS.find(section => section.id === path) ?? SECTIONS[0] };
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +919,193 @@ function changeNode(before: string | null, after: string | null): HTMLElement {
 }
 
 // ---------------------------------------------------------------------------
+// Network monitor. GET /admin/api/monitoring* only: checks run in the backend
+// worker, the page polls every MONITOR_POLL_MS while it is open and visible
+// and re-renders "N s ago" labels every second locally.
+
+const MONITOR_POLL_MS = 15_000;
+
+interface MonitorHistorySubject {
+  kind: 'builder' | 'country' | 'target';
+  country: string | null;
+  targetId: number | null;
+  label: string;
+}
+
+interface MonitorState {
+  overview: { data: MonitorOverview; at: Date } | null;
+  overviewStatus: MonitorStatus | '';
+  detail: { id: number; data: MonitorBuilderDetail; at: Date } | null;
+  /** Builder the filters, expanded countries and history subject belong to. */
+  builderId: number | null;
+  filter: MonitorFilter;
+  expanded: Set<string>;
+  subject: MonitorHistorySubject | null;
+  period: MonitorPeriod;
+  history: { key: string; data: MonitorHistory } | null;
+}
+
+function initialMonitorState(): MonitorState {
+  return {
+    overview: null, overviewStatus: '', detail: null, builderId: null, filter: EMPTY_MONITOR_FILTER,
+    expanded: new Set(), subject: null, period: '24h', history: null,
+  };
+}
+
+interface MonitorOverviewView {
+  results: HTMLElement;
+  refresh: HTMLButtonElement;
+  updated: HTMLElement;
+  meta: HTMLElement;
+  status: HTMLSelectElement;
+}
+
+interface MonitorDetailView {
+  id: number;
+  refresh: HTMLButtonElement;
+  updated: HTMLElement;
+  title: HTMLElement;
+  desc: HTMLElement;
+  summary: HTMLElement;
+  notices: HTMLElement;
+  country: HTMLSelectElement;
+  status: HTMLSelectElement;
+  protocol: HTMLSelectElement;
+  meta: HTMLElement;
+  countries: HTMLElement;
+  history: HTMLElement;
+}
+
+const MONITOR_BUILDER_COLUMNS = [
+  ['Построитель', ''], ['Статус', 'col-status'], ['Страны', 'col-md'], ['Серверы', 'col-md'],
+  ['Задержка', 'col-md'], ['Проверено', 'col-md'], ['Последний переход', ''],
+] as const;
+
+const MONITOR_COUNTRY_COLUMNS = [
+  ['Страна', ''], ['Статус', 'col-status'], ['Задержка', 'col-md'], ['Серверы', 'col-md'],
+  ['Проверено', 'col-md'], ['Последний UP', 'col-md'], ['Последнее падение', 'col-md'], ['', 'col-actions'],
+] as const;
+
+const MONITOR_NODE_COLUMNS = [
+  ['Сервер', ''], ['Протокол', 'col-md'], ['Адрес', ''], ['Статус', 'col-status'], ['Задержка', 'col-md'],
+  ['Проверено', 'col-md'], ['Последний ответ', 'col-md'], ['Последнее падение', 'col-md'], ['', 'col-actions'],
+] as const;
+
+const MONITOR_OUTAGE_COLUMNS = [
+  ['Начало', 'col-date'], ['Конец', 'col-date'], ['Длительность', 'col-md'], ['Тип', 'col-md'],
+  ['Причина', ''], ['Где', ''], ['Итог', 'col-md'],
+] as const;
+
+const MONITOR_PERIOD_LABELS: Readonly<Record<MonitorPeriod, string>> = { '24h': '24 часа', '7d': '7 дней', '30d': '30 дней' };
+
+function monitorBadge(status: MonitorStatus): HTMLElement {
+  return el('span', STATUS_BADGES[status], STATUS_LABELS[status]);
+}
+
+/** "N s ago" that the page ticker keeps current; the title carries the exact time. */
+function agoNode(iso: string | null, never = 'Не проверялся'): HTMLElement {
+  const node = el('span', 'ago', formatAgo(iso, Date.now(), never));
+  node.dataset.ago = iso ?? '';
+  node.dataset.never = never;
+  if (iso) node.title = formatDateTime(iso);
+  return node;
+}
+
+function nodeAddress(node: MonitorNode): string {
+  return node.host.includes(':') ? `[${node.host}]:${node.port}` : `${node.host}:${node.port}`;
+}
+
+function monitorHistoryKey(builderId: number, subject: MonitorHistorySubject, period: MonitorPeriod): string {
+  return `${builderId}|${subject.kind}|${subject.country ?? ''}|${subject.targetId ?? ''}|${period}`;
+}
+
+const BUILDER_HISTORY: MonitorHistorySubject = { kind: 'builder', country: null, targetId: null, label: 'Весь построитель' };
+
+const parseMonitorStatus = (value: string): MonitorStatus | '' =>
+  (Object.prototype.hasOwnProperty.call(STATUS_LABELS, value) ? value as MonitorStatus : '');
+
+/** Filter value of a country: '' (no country) is '-' so that '' can mean "all". */
+const countryKey = (code: string) => code || '-';
+
+/** History query of a subject: a server by its own ID, a country or the whole builder. */
+function monitorHistoryQuery(builderId: number, subject: MonitorHistorySubject, period: MonitorPeriod): MonitorHistoryQuery {
+  if (subject.kind === 'target') return { builderId: null, country: null, targetId: subject.targetId, period };
+  return { builderId, country: subject.kind === 'country' ? subject.country ?? '' : null, targetId: null, period };
+}
+
+/** "Проверка каждые 1 мин · последний раунд: 12 с назад" in a panel head. */
+function monitorRoundMeta(intervalSeconds: number, lastRoundAt: string | null): HTMLElement {
+  const meta = el('p', 'panel-meta');
+  meta.append(`Проверка каждые ${formatDuration(intervalSeconds)} · последний раунд: `, agoNode(lastRoundAt, 'ещё не было'));
+  return meta;
+}
+
+/** "3 из 5" with the non-zero breakdown as a note. */
+function countsCell(label: string, up: number, total: number, notes: readonly (readonly [string, number])[]): HTMLTableCellElement {
+  const td = cell(label, `${formatCount(up)} из ${formatCount(total)}`, 'col-md');
+  const parts = notes.filter(([, count]) => count > 0).map(([text, count]) => `${text}: ${formatCount(count)}`);
+  if (parts.length) td.append(el('span', 'cell-note', parts.join(' · ')));
+  return td;
+}
+
+/** A cell with a ticking "N s ago" label. */
+function agoCell(label: string, iso: string | null, never?: string): HTMLTableCellElement {
+  return cell(label, agoNode(iso, never), 'col-md');
+}
+
+function monitorStatusNode(status: MonitorStatus, since: string | null): HTMLElement {
+  const badge = monitorBadge(status);
+  if (since) badge.title = `С ${formatDateTime(since)}`;
+  return badge;
+}
+
+function focusKeyWithin(container: HTMLElement): string | undefined {
+  const active = document.activeElement;
+  return active instanceof HTMLElement && container.contains(active) ? active.dataset.focusKey : undefined;
+}
+
+function restoreFocusKey(container: HTMLElement, key: string | undefined) {
+  if (!key) return;
+  const target = [...container.querySelectorAll<HTMLElement>('[data-focus-key]')].find(node => node.dataset.focusKey === key);
+  target?.focus({ preventScroll: true });
+}
+
+const CHART_WIDTH = 600;
+const CHART_HEIGHT = 120;
+
+/** Average latency per step as a polyline; steps with failed checks are marked. */
+function latencyChartNode(history: MonitorHistory): HTMLElement {
+  const figure = el('figure', 'monitor-chart');
+  const geometry = latencyChart(history.latency, history.from, history.to, CHART_WIDTH, CHART_HEIGHT);
+  if (!geometry.line && geometry.failures.length === 0) {
+    figure.append(el('p', 'panel-note', 'За период нет замеров задержки.'));
+    return figure;
+  }
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', `Средняя задержка за ${MONITOR_PERIOD_LABELS[history.period]}, максимум ${formatLatency(geometry.maxMs)}`);
+  for (const x of geometry.failures) {
+    const mark = document.createElementNS(SVG_NS, 'line');
+    for (const [name, value] of [['x1', x], ['x2', x], ['y1', 0], ['y2', CHART_HEIGHT]] as const) mark.setAttribute(name, String(value));
+    mark.setAttribute('class', 'chart-failure');
+    svg.append(mark);
+  }
+  if (geometry.line) {
+    const line = document.createElementNS(SVG_NS, 'polyline');
+    line.setAttribute('points', geometry.line);
+    line.setAttribute('class', 'chart-line');
+    svg.append(line);
+  }
+  figure.append(svg, el('figcaption', 'chart-caption',
+    `Средняя задержка, максимум ${formatLatency(geometry.maxMs)}, шаг ${formatDuration(history.step_seconds)}. Красные отметки — шаги с неудачными проверками.`));
+  return figure;
+}
+
+type MonitorHistoryContent = { kind: 'loading' } | { kind: 'error'; error: unknown } | { kind: 'data'; data: MonitorHistory };
+
+// ---------------------------------------------------------------------------
 // Subscription management. Availability mirrors database.applyAdminAction so
 // only meaningful actions are offered; the backend stays the authority and
 // its rejections are reported, never second-guessed. disable is a pause:
@@ -1167,6 +1378,17 @@ class AdminApp {
   private journalState: JournalListState = initialJournalState();
   private journalView: JournalView | null = null;
   private journalRequest = 0;
+  // Network monitor: last snapshots, filters, expanded countries and the
+  // history subject survive navigation within the session (never the URL).
+  // The page polls while it is open and the tab is visible.
+  private monitorState: MonitorState = initialMonitorState();
+  private monitorView: MonitorOverviewView | null = null;
+  private monitorDetailView: MonitorDetailView | null = null;
+  private monitorRequest = 0;
+  private monitorHistoryRequest = 0;
+  private monitorTimer = 0;
+  private monitorTicker = 0;
+  private monitorLoadedAt = 0;
   // The open confirmation dialog, if any, and the outcome of the last
   // management action shown on the subscription page it belongs to.
   private dialog: { dismiss: () => void } | null = null;
@@ -1214,7 +1436,10 @@ class AdminApp {
       if (this.unsavedChanges?.()) event.preventDefault();
     });
     window.addEventListener('hashchange', event => this.onRoute(event));
-    document.addEventListener('visibilitychange', () => void this.checkSession());
+    document.addEventListener('visibilitychange', () => {
+      void this.checkSession();
+      this.resumeMonitoring();
+    });
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && this.shell?.sidebar.dataset.open === 'true') {
         this.setMenu(false);
@@ -1244,6 +1469,7 @@ class AdminApp {
     this.usersView = null;
     this.detailView = null;
     this.journalView = null;
+    this.stopMonitoring();
     window.clearTimeout(this.searchTimer);
     window.clearInterval(this.countdownTimer);
     window.clearTimeout(this.toastTimer);
@@ -1300,6 +1526,7 @@ class AdminApp {
     this.dashboard = null;
     this.usersState = initialUsersState();
     this.journalState = initialJournalState();
+    this.monitorState = initialMonitorState();
     this.detailCache = null;
     this.manageNotice = null;
     this.tariffsCache = null;
@@ -1503,9 +1730,9 @@ class AdminApp {
 
   private renderSection(focus: boolean) {
     if (!this.shell) return;
-    const { section, userId, tariffId, sourceId } = currentRoute();
+    const { section, userId, tariffId, sourceId, monitorId } = currentRoute();
     const canonical = userId !== null ? `#/users/${userId}` : tariffId !== null ? `#/tariffs/${tariffId}`
-      : sourceId !== null ? `#/sources/${sourceId}` : `#/${section.id}`;
+      : sourceId !== null ? `#/sources/${sourceId}` : monitorId !== null ? `#/monitoring/${monitorId}` : `#/${section.id}`;
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
     for (const [id, link] of this.shell.links) {
       if (id === section.id) link.setAttribute('aria-current', 'page');
@@ -1538,6 +1765,7 @@ class AdminApp {
     this.sourcesRequest++;
     this.buildersRequest++;
     this.builderEditorRequest++;
+    this.stopMonitoring();
     window.clearTimeout(this.searchTimer);
 
     const header = el('header', 'page-header');
@@ -1583,6 +1811,15 @@ class AdminApp {
     } else if (section.id === 'builders') {
       page.append(header, this.buildBuildersSection(header));
       load = () => this.loadBuilders();
+    } else if (monitorId !== null) {
+      const back = el('a', 'back-link');
+      back.href = '#/monitoring';
+      back.append(icon('back'), el('span', '', 'Назад к мониторингу'));
+      page.append(back, header, this.buildMonitorBuilder(monitorId, header, title, desc));
+      load = () => this.loadMonitorBuilder(false);
+    } else if (section.id === 'monitoring') {
+      page.append(header, this.buildMonitoring(header));
+      load = () => this.loadMonitoring(false);
     } else if (section.id === 'audit') {
       page.append(header, this.buildJournal(header));
       load = () => this.loadJournal();
@@ -2942,6 +3179,682 @@ class AdminApp {
     this.toasts.replaceChildren(node);
     window.clearTimeout(this.toastTimer);
     this.toastTimer = window.setTimeout(() => node.remove(), TOAST_MS);
+  }
+
+  // ===========================================================================
+  // Network monitor (#/monitoring, #/monitoring/{builder_id}). Read-only: the
+  // page only GETs snapshots; checks run in the backend worker.
+  // ===========================================================================
+
+  /** Stops polling and the "N s ago" ticker and drops every monitor request in flight. */
+  private stopMonitoring() {
+    window.clearTimeout(this.monitorTimer);
+    window.clearInterval(this.monitorTicker);
+    this.monitorTimer = 0;
+    this.monitorTicker = 0;
+    this.monitorView = null;
+    this.monitorDetailView = null;
+    this.monitorRequest++;
+    this.monitorHistoryRequest++;
+  }
+
+  private startMonitorTicker() {
+    window.clearInterval(this.monitorTicker);
+    this.monitorTicker = window.setInterval(() => {
+      if (document.visibilityState !== 'visible' || !this.shell) return;
+      const now = Date.now();
+      for (const node of this.shell.content.querySelectorAll<HTMLElement>('.ago')) {
+        node.textContent = formatAgo(node.dataset.ago || null, now, node.dataset.never);
+      }
+    }, 1000);
+  }
+
+  private scheduleMonitorPoll() {
+    window.clearTimeout(this.monitorTimer);
+    if (!this.monitorView && !this.monitorDetailView) return;
+    const wait = Math.max(1000, MONITOR_POLL_MS - (Date.now() - this.monitorLoadedAt));
+    this.monitorTimer = window.setTimeout(() => this.pollMonitoring(), wait);
+  }
+
+  /** A hidden tab does not poll; resumeMonitoring catches up when it is shown again. */
+  private pollMonitoring() {
+    if (document.visibilityState !== 'visible') return;
+    if (this.monitorDetailView) void this.loadMonitorBuilder(true);
+    else if (this.monitorView) void this.loadMonitoring(true);
+  }
+
+  private resumeMonitoring() {
+    if (this.view !== 'app' || document.visibilityState !== 'visible') return;
+    if (!this.monitorView && !this.monitorDetailView) return;
+    if (Date.now() - this.monitorLoadedAt >= MONITOR_POLL_MS) this.pollMonitoring();
+    else this.scheduleMonitorPoll();
+  }
+
+  /** Error of a monitor request; 503 means the backend runs without the monitor. */
+  private monitorErrorPanel(title: string, error: unknown, onRetry: () => void): HTMLElement {
+    const text = error instanceof ApiError && error.status === 503
+      ? 'Мониторинг сети не запущен на сервере. Проверьте настройки развёртывания.'
+      : errorText(error);
+    return messagePanel('alert', title, text, 'alert', retryButton(onRetry));
+  }
+
+  // Overview: every builder -------------------------------------------------
+
+  private buildMonitoring(header: HTMLElement): HTMLElement {
+    const { actions, refresh, updated } = refreshActions(() => void this.loadMonitoring(false));
+    header.classList.add('has-actions');
+    header.append(actions);
+    const state = this.monitorState;
+
+    const status = el('select', 'input select-input');
+    status.id = 'monitor-overview-status';
+    status.append(option('', 'Все статусы'), ...[...FILTER_STATUSES, 'disabled' as const].map(s => option(s, STATUS_LABELS[s])));
+    status.value = state.overviewStatus;
+    const caption = el('label', 'sr-only', 'Статус построителя');
+    caption.htmlFor = status.id;
+    const box = el('div', 'select');
+    box.append(status, icon('chevron'));
+    const meta = el('p', 'toolbar-meta');
+    meta.setAttribute('aria-live', 'polite');
+    const toolbar = el('div', 'toolbar');
+    toolbar.append(caption, box, meta);
+
+    const results = el('div', 'results');
+    const view: MonitorOverviewView = { results, refresh, updated, meta, status };
+    this.monitorView = view;
+    status.addEventListener('change', () => {
+      state.overviewStatus = parseMonitorStatus(status.value);
+      if (state.overview) this.paintMonitoring(view, state.overview.data, state.overview.at);
+    });
+    if (state.overview) this.paintMonitoring(view, state.overview.data, state.overview.at);
+    else this.paintMonitoringSkeleton(view);
+    this.startMonitorTicker();
+
+    const wrap = el('div', 'users monitoring');
+    wrap.append(toolbar, results);
+    return wrap;
+  }
+
+  private paintMonitoringSkeleton(view: MonitorOverviewView) {
+    setLoading(view.results, 'Загружаем состояние сети');
+    view.results.replaceChildren(usersSkeleton());
+    view.meta.textContent = '';
+    view.updated.textContent = '';
+  }
+
+  private paintMonitoring(view: MonitorOverviewView, data: MonitorOverview, at: Date) {
+    setLoading(view.results, null);
+    view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
+    const filter = this.monitorState.overviewStatus;
+    const list = filter ? data.builders.filter(b => b.status === filter) : data.builders;
+    view.meta.textContent = data.builders.length === 0 ? ''
+      : filter ? `Найдено: ${formatCount(list.length)} из ${formatCount(data.builders.length)}` : `Всего: ${formatCount(data.builders.length)}`;
+
+    const nodes: HTMLElement[] = [];
+    if (!data.enabled) {
+      nodes.push(notice({ tone: 'info', text: 'Фоновые проверки отключены в конфигурации. Показано последнее сохранённое состояние.' }));
+    }
+    if (data.builders.length === 0) {
+      nodes.push(messagePanel('monitoring', 'Проверять пока нечего',
+        'Мониторинг проверяет серверы, которые построители выдают клиентам. Создайте построитель — он появится здесь.', 'status'));
+      view.results.replaceChildren(...nodes);
+      return;
+    }
+    if (list.length === 0) {
+      const reset = button('Показать все', 'btn btn-secondary btn-sm');
+      reset.addEventListener('click', () => {
+        view.status.value = '';
+        view.status.dispatchEvent(new Event('change'));
+        view.status.focus();
+      });
+      nodes.push(messagePanel('search', 'Построители не найдены', 'Нет построителей с выбранным статусом.', 'status', reset));
+      view.results.replaceChildren(...nodes);
+      return;
+    }
+    const focusKey = focusKeyWithin(view.results);
+    const panel = el('section', 'panel users-panel');
+    panel.setAttribute('aria-labelledby', 'monitor-builders-title');
+    const head = el('div', 'panel-head');
+    const title = el('h2', 'panel-title', 'Построители');
+    title.id = 'monitor-builders-title';
+    head.append(title, monitorRoundMeta(data.interval_seconds, data.last_round_at));
+    const table = el('table', 'table table-cards users-table monitor-table');
+    table.append(el('caption', 'sr-only', 'Состояние сети по построителям'), headRow(MONITOR_BUILDER_COLUMNS));
+    const body = el('tbody');
+    for (const b of list) body.append(this.monitorBuilderRow(b));
+    table.append(body);
+    const wrap = el('div', 'table-wrap');
+    wrap.append(table);
+    panel.append(head, wrap,
+      el('p', 'panel-note', `Сервер становится недоступным после ${formatCount(data.down_after)} неудачных проверок подряд.`));
+    nodes.push(panel);
+    view.results.replaceChildren(...nodes);
+    restoreFocusKey(view.results, focusKey);
+  }
+
+  private monitorBuilderRow(b: MonitorBuilderSummary): HTMLTableRowElement {
+    const link = el('a', 'inline-link', b.name || `Построитель #${b.id}`);
+    link.href = `#/monitoring/${b.id}`;
+    link.dataset.focusKey = `builder:${b.id}`;
+    const name = cell('Построитель', link, 'col-user');
+    if (!b.enabled) name.append(el('span', 'cell-note', 'Отключён, серверы не выдаются'));
+    else if (b.source_errors > 0) name.append(el('span', 'cell-note is-danger', `Источников с ошибкой: ${formatCount(b.source_errors)}`));
+
+    const transition = cell('Последний переход', transitionText(b.last_transition), 'cell-wrap');
+    if (b.last_transition) {
+      const note = el('span', 'cell-note');
+      note.append(agoNode(b.last_transition.at));
+      transition.append(note);
+    }
+    const row = el('tr', 'row-link');
+    row.append(
+      name,
+      cell('Статус', monitorBadge(b.status), 'col-status'),
+      countsCell('Страны', b.countries_up, b.countries_total, [['частично', b.countries_degraded], ['недоступны', b.countries_down]]),
+      countsCell('Серверы', b.nodes_up, b.nodes_total, [['недоступны', b.nodes_down], ['нет данных', b.nodes_unknown]]),
+      cell('Задержка', formatLatency(b.avg_latency_ms), 'col-md'),
+      agoCell('Проверено', b.last_checked_at),
+      transition,
+    );
+    row.addEventListener('click', event => {
+      if (event.target instanceof Element && event.target.closest('button, a')) return;
+      if (document.getSelection()?.type === 'Range') return;
+      link.click();
+    });
+    return row;
+  }
+
+  /**
+   * Loads the overview. silent marks a background poll: it does not show the
+   * busy button, and a failure with data on screen only notes the time instead
+   * of raising a toast every poll. Stale responses are dropped.
+   */
+  private async loadMonitoring(silent: boolean) {
+    const view = this.monitorView;
+    if (!view) return;
+    const state = this.monitorState;
+    const request = ++this.monitorRequest;
+    const current = () => this.monitorView === view && request === this.monitorRequest;
+    window.clearTimeout(this.monitorTimer);
+    if (!silent) setRefreshBusy(view.refresh, true);
+    if (!state.overview) this.paintMonitoringSkeleton(view);
+    else if (!silent) view.results.setAttribute('aria-busy', 'true');
+    try {
+      const data = await this.api.monitoring();
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      state.overview = { data, at: new Date() };
+      this.paintMonitoring(view, data, state.overview.at);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      if (state.overview) {
+        view.results.removeAttribute('aria-busy');
+        if (silent) view.updated.textContent = `Не удалось обновить в ${clockSeconds(new Date())}`;
+        else this.toast(`Не удалось обновить мониторинг. ${errorText(error)}`);
+      } else {
+        setLoading(view.results, null);
+        view.results.replaceChildren(this.monitorErrorPanel('Не удалось загрузить мониторинг', error,
+          () => void this.loadMonitoring(false)));
+      }
+    } finally {
+      if (current()) {
+        setRefreshBusy(view.refresh, false);
+        this.monitorLoadedAt = Date.now();
+        this.scheduleMonitorPoll();
+      }
+    }
+  }
+
+  // Builder: countries, servers and history ---------------------------------
+
+  private buildMonitorBuilder(id: number, header: HTMLElement, title: HTMLElement, desc: HTMLElement): HTMLElement {
+    const { actions, refresh, updated } = refreshActions(() => void this.loadMonitorBuilder(false));
+    header.classList.add('has-actions');
+    header.append(actions);
+    const state = this.monitorState;
+    if (state.builderId !== id) {
+      // Filters, expanded countries and the history subject belong to one builder.
+      state.builderId = id;
+      state.filter = EMPTY_MONITOR_FILTER;
+      state.expanded = new Set();
+      state.subject = null;
+    }
+    const cached = state.detail && state.detail.id === id ? state.detail : null;
+    const known = cached?.data.builder ?? state.overview?.data.builders.find(b => b.id === id);
+    title.textContent = known ? known.name || `Построитель #${id}` : 'Построитель';
+    desc.textContent = 'Страны и серверы, которые построитель сейчас выдаёт клиентам. Раскройте страну, чтобы увидеть серверы.';
+
+    const toolbar = el('div', 'toolbar');
+    toolbar.setAttribute('role', 'search');
+    const select = (selectId: string, label: string) => {
+      const node = el('select', 'input select-input');
+      node.id = selectId;
+      const caption = el('label', 'sr-only', label);
+      caption.htmlFor = selectId;
+      const box = el('div', 'select');
+      box.append(node, icon('chevron'));
+      toolbar.append(caption, box);
+      return node;
+    };
+    const country = select('monitor-country', 'Страна');
+    const status = select('monitor-status', 'Статус страны');
+    status.append(option('', 'Все статусы'), ...FILTER_STATUSES.map(s => option(s, STATUS_LABELS[s])));
+    status.value = state.filter.status;
+    const protocol = select('monitor-protocol', 'Протокол');
+    const meta = el('p', 'toolbar-meta');
+    meta.setAttribute('aria-live', 'polite');
+    toolbar.append(meta);
+
+    const view: MonitorDetailView = {
+      id, refresh, updated, title, desc, meta, country, status, protocol,
+      summary: el('div', 'monitor-summary'), notices: el('div', 'monitor-notices'),
+      countries: el('div', 'results'), history: el('div', 'monitor-history'),
+    };
+    this.monitorDetailView = view;
+    const apply = () => {
+      state.filter = { country: country.value, status: parseMonitorStatus(status.value), protocol: protocol.value };
+      this.paintMonitorCountries(view);
+    };
+    for (const control of [country, status, protocol]) control.addEventListener('change', apply);
+
+    if (cached) {
+      this.paintMonitorBuilder(view, cached.data, cached.at);
+      const subject = state.subject ?? BUILDER_HISTORY;
+      const key = monitorHistoryKey(id, subject, state.period);
+      if (state.history?.key === key) this.paintMonitorHistory(view, { kind: 'data', data: state.history.data });
+    } else {
+      this.paintMonitorBuilderSkeleton(view);
+    }
+    this.startMonitorTicker();
+
+    const body = el('div', 'detail monitoring-detail');
+    body.append(view.summary, view.notices, toolbar, view.countries, view.history);
+    return body;
+  }
+
+  private paintMonitorBuilderSkeleton(view: MonitorDetailView) {
+    setLoading(view.countries, 'Загружаем состояние построителя');
+    view.summary.replaceChildren(skeletonPanel(3));
+    view.notices.replaceChildren();
+    view.countries.replaceChildren(usersSkeleton());
+    view.history.replaceChildren();
+    view.meta.textContent = '';
+    view.updated.textContent = '';
+  }
+
+  private paintMonitorBuilderMissing(view: MonitorDetailView) {
+    setLoading(view.countries, null);
+    view.title.textContent = 'Построитель';
+    view.updated.textContent = '';
+    view.meta.textContent = '';
+    view.summary.replaceChildren();
+    view.notices.replaceChildren();
+    view.history.replaceChildren();
+    const back = el('a', 'btn btn-secondary btn-sm', 'К мониторингу');
+    back.href = '#/monitoring';
+    view.countries.replaceChildren(messagePanel('monitoring', 'Построитель не найден',
+      `Построителя #${view.id} нет: возможно, он удалён.`, 'status', back));
+  }
+
+  private paintMonitorBuilder(view: MonitorDetailView, data: MonitorBuilderDetail, at: Date) {
+    const b = data.builder;
+    const name = b.name || `Построитель #${b.id}`;
+    view.title.textContent = name;
+    document.title = `${name} · Мониторинг · RS8 Admin`;
+    view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
+
+    const panel = el('section', 'panel');
+    panel.setAttribute('aria-labelledby', 'monitor-state-title');
+    const head = el('div', 'panel-head');
+    const heading = el('h2', 'panel-title', 'Состояние');
+    heading.id = 'monitor-state-title';
+    head.append(heading, monitorRoundMeta(data.interval_seconds, data.last_round_at));
+    const transition = el('span');
+    transition.append(transitionText(b.last_transition));
+    if (b.last_transition) {
+      const note = el('span', 'fact-note');
+      note.append(agoNode(b.last_transition.at));
+      transition.append(note);
+    }
+    const countryNotes = [['частично', b.countries_degraded], ['недоступны', b.countries_down]] as const;
+    const nodeNotes = [['недоступны', b.nodes_down], ['нет данных', b.nodes_unknown]] as const;
+    const noteOf = (notes: readonly (readonly [string, number])[]) =>
+      notes.filter(([, n]) => n > 0).map(([text, n]) => `${text}: ${formatCount(n)}`).join(' · ') || undefined;
+    const facts = el('dl', 'facts');
+    facts.append(
+      fact('Статус', monitorBadge(b.status)),
+      fact('Страны', `${formatCount(b.countries_up)} из ${formatCount(b.countries_total)} работают`, noteOf(countryNotes)),
+      fact('Серверы', `${formatCount(b.nodes_up)} из ${formatCount(b.nodes_total)} работают`, noteOf(nodeNotes)),
+      fact('Средняя задержка', formatLatency(b.avg_latency_ms)),
+      fact('Проверено', agoNode(b.last_checked_at)),
+      fact('Последний переход', transition),
+    );
+    panel.append(head, facts);
+    view.summary.replaceChildren(panel);
+
+    const notices: HTMLElement[] = [];
+    if (!b.enabled) notices.push(notice({ tone: 'info', text: 'Построитель отключён: его серверы не выдаются клиентам и не проверяются.' }));
+    if (b.source_errors > 0) {
+      notices.push(notice({ tone: 'error', text: `Источников с ошибкой загрузки при последнем разборе: ${formatCount(b.source_errors)}. Их серверы могут отсутствовать в списке.` }));
+    }
+    if (b.unresolved > 0) {
+      notices.push(notice({ tone: 'info', text: `Серверов без проверяемого адреса: ${formatCount(b.unresolved)} (например, конфигурация Xray без основного outbound). Они не проверяются.` }));
+    }
+    view.notices.replaceChildren(...notices);
+    this.paintMonitorCountries(view);
+  }
+
+  /** Rebuilds a filter select, keeping the selected value even if it left the data. */
+  private fillMonitorSelect(node: HTMLSelectElement, all: string, options: readonly (readonly [string, string])[], value: string) {
+    node.replaceChildren(option('', all), ...options.map(([v, label]) => option(v, label)));
+    if (value && !options.some(([v]) => v === value)) node.append(option(value, value === '-' ? 'Без страны' : value));
+    node.value = value;
+  }
+
+  private paintMonitorCountries(view: MonitorDetailView) {
+    const state = this.monitorState;
+    const data = state.detail && state.detail.id === view.id ? state.detail.data : null;
+    if (!data) return;
+    setLoading(view.countries, null);
+    const all = data.countries;
+    this.fillMonitorSelect(view.country, 'Все страны',
+      all.map(c => [countryKey(c.country_code), monitorCountryLabel(c.country_code)] as const), state.filter.country);
+    this.fillMonitorSelect(view.protocol, 'Все протоколы',
+      monitorProtocolsOf(all).map(p => [p, protocolLabel(p)] as const), state.filter.protocol);
+    view.status.value = state.filter.status;
+
+    const filtered = isFiltered(state.filter);
+    const list = filterCountries(all, state.filter);
+    view.meta.textContent = all.length === 0 ? ''
+      : filtered ? `Показано стран: ${formatCount(list.length)} из ${formatCount(all.length)}` : `Стран: ${formatCount(all.length)}`;
+    if (all.length === 0) {
+      view.countries.replaceChildren(messagePanel('monitoring', 'Построитель не выдаёт серверов', data.builder.enabled
+        ? 'После правил построителя не осталось ни одного сервера, или источники ещё не загружены.'
+        : 'Построитель отключён.', 'status'));
+      return;
+    }
+    if (list.length === 0) {
+      const reset = button('Сбросить фильтры', 'btn btn-secondary btn-sm');
+      reset.addEventListener('click', () => {
+        state.filter = EMPTY_MONITOR_FILTER;
+        this.paintMonitorCountries(view);
+        view.country.focus();
+      });
+      view.countries.replaceChildren(messagePanel('search', 'Ничего не найдено', 'Нет стран и серверов по выбранным условиям.', 'status', reset));
+      return;
+    }
+
+    const focusKey = focusKeyWithin(view.countries);
+    const panel = el('section', 'panel users-panel');
+    panel.setAttribute('aria-labelledby', 'monitor-countries-title');
+    panel.append(panelHead('monitor-countries-title', 'Страны', formatCount(list.length)));
+    const table = el('table', 'table table-cards users-table monitor-table');
+    table.append(el('caption', 'sr-only', 'Состояние стран построителя'), headRow(MONITOR_COUNTRY_COLUMNS));
+    const body = el('tbody');
+    for (const c of list) {
+      const open = state.expanded.has(countryKey(c.country_code));
+      body.append(this.monitorCountryRow(view, c, open));
+      if (open) body.append(this.monitorNodesRow(view, c));
+    }
+    table.append(body);
+    const wrap = el('div', 'table-wrap');
+    wrap.append(table);
+    panel.append(wrap);
+    view.countries.replaceChildren(panel);
+    restoreFocusKey(view.countries, focusKey);
+  }
+
+  private monitorCountryRow(view: MonitorDetailView, c: MonitorCountry, open: boolean): HTMLTableRowElement {
+    const key = countryKey(c.country_code);
+    const label = monitorCountryLabel(c.country_code);
+    const toggle = el('button', 'monitor-toggle');
+    toggle.type = 'button';
+    toggle.dataset.focusKey = `country:${key}`;
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-controls', `monitor-nodes-${key}`);
+    toggle.append(icon(open ? 'chevron' : 'next'), el('span', '', label));
+    toggle.addEventListener('click', () => {
+      const expanded = this.monitorState.expanded;
+      if (expanded.has(key)) expanded.delete(key);
+      else expanded.add(key);
+      this.paintMonitorCountries(view);
+    });
+    const history = button('История', 'btn btn-ghost btn-xs');
+    history.dataset.focusKey = `country-history:${key}`;
+    history.setAttribute('aria-label', `История: ${label}`);
+    history.addEventListener('click', () =>
+      this.selectMonitorHistory(view, { kind: 'country', country: c.country_code, targetId: null, label }));
+
+    const row = el('tr');
+    row.append(
+      cell('Страна', toggle),
+      cell('Статус', monitorStatusNode(c.status, c.status_since), 'col-status'),
+      cell('Задержка', formatLatency(c.latency_ms), 'col-md'),
+      countsCell('Серверы', c.nodes_up, c.nodes_total, [['недоступны', c.nodes_down]]),
+      agoCell('Проверено', c.last_checked_at),
+      agoCell('Последний UP', c.last_up_at, 'Не было'),
+      agoCell('Последнее падение', c.last_down_at, 'Не было'),
+      cell('', history, 'col-actions'),
+    );
+    return row;
+  }
+
+  private monitorNodesRow(view: MonitorDetailView, c: MonitorCountry): HTMLTableRowElement {
+    const table = el('table', 'table table-cards monitor-nodes-table');
+    table.append(el('caption', 'sr-only', `Серверы: ${monitorCountryLabel(c.country_code)}`), headRow(MONITOR_NODE_COLUMNS));
+    const body = el('tbody');
+    for (const node of c.nodes) {
+      const label = node.name || `Сервер #${node.target_id}`;
+      const name = cell('Сервер', label, 'cell-wrap');
+      const origin = [node.source_name || `Источник #${node.source_id}`];
+      if (node.shared_with > 0) origin.push(`ещё в построителях: ${formatCount(node.shared_with)}`);
+      name.append(el('span', 'cell-note', origin.join(' · ')));
+      const proto = cell('Протокол', protocolLabel(node.protocol), 'col-md');
+      const transport = transportLabel(node);
+      if (transport) proto.append(el('span', 'cell-note', transport));
+      const address = cell('Адрес', nodeAddress(node));
+      address.append(el('span', 'cell-note', probeLabel(node.probe)));
+      const status = cell('Статус', monitorStatusNode(node.status, node.status_since), 'col-status');
+      if (node.last_error && node.status !== 'up') status.append(el('span', 'cell-note is-danger', errorLabel(node.last_error)));
+      const history = button('История', 'btn btn-ghost btn-xs');
+      history.dataset.focusKey = `target-history:${node.target_id}`;
+      history.setAttribute('aria-label', `История: ${label}`);
+      history.addEventListener('click', () =>
+        this.selectMonitorHistory(view, { kind: 'target', country: null, targetId: node.target_id, label }));
+      const row = el('tr');
+      row.append(
+        name, proto, address, status,
+        cell('Задержка', formatLatency(node.latency_ms), 'col-md'),
+        agoCell('Проверено', node.last_checked_at),
+        agoCell('Последний ответ', node.last_up_at, 'Не было'),
+        agoCell('Последнее падение', node.last_down_at, 'Не было'),
+        cell('', history, 'col-actions'),
+      );
+      body.append(row);
+    }
+    table.append(body);
+    const td = el('td', 'monitor-nodes-cell');
+    td.colSpan = MONITOR_COUNTRY_COLUMNS.length;
+    td.id = `monitor-nodes-${countryKey(c.country_code)}`;
+    td.append(table);
+    const row = el('tr', 'monitor-nodes-row');
+    row.append(td);
+    return row;
+  }
+
+  private selectMonitorHistory(view: MonitorDetailView, subject: MonitorHistorySubject) {
+    this.monitorState.subject = subject.kind === 'builder' ? null : subject;
+    void this.loadMonitorHistory(view, false).then(() => {
+      if (this.monitorDetailView !== view) return;
+      view.history.scrollIntoView({ block: 'start' });
+      view.history.querySelector<HTMLElement>('#monitor-history-title')?.focus({ preventScroll: true });
+    });
+  }
+
+  private paintMonitorHistory(view: MonitorDetailView, content: MonitorHistoryContent) {
+    const state = this.monitorState;
+    const subject = state.subject ?? BUILDER_HISTORY;
+    const focusKey = focusKeyWithin(view.history);
+    const panel = el('section', 'panel');
+    panel.setAttribute('aria-labelledby', 'monitor-history-title');
+    const head = el('div', 'panel-head');
+    const title = el('h2', 'panel-title', `История: ${subject.label}`);
+    title.id = 'monitor-history-title';
+    title.tabIndex = -1;
+    head.append(title);
+    if (subject.kind !== 'builder') {
+      const whole = button('Весь построитель', 'btn btn-ghost btn-xs');
+      whole.dataset.focusKey = 'history-builder';
+      whole.addEventListener('click', () => this.selectMonitorHistory(view, BUILDER_HISTORY));
+      head.append(whole);
+    }
+    const periods = el('div', 'chips monitor-periods');
+    periods.setAttribute('role', 'group');
+    periods.setAttribute('aria-label', 'Период');
+    for (const period of MONITOR_PERIODS) {
+      const chip = el('button', 'chip', MONITOR_PERIOD_LABELS[period]);
+      chip.type = 'button';
+      chip.dataset.focusKey = `period:${period}`;
+      chip.setAttribute('aria-pressed', String(period === state.period));
+      chip.addEventListener('click', () => {
+        if (state.period === period) return;
+        state.period = period;
+        void this.loadMonitorHistory(view, false);
+      });
+      periods.append(chip);
+    }
+    panel.append(head, periods);
+
+    const body = el('div', 'monitor-history-body');
+    if (content.kind === 'loading') {
+      setLoading(body, 'Загружаем историю');
+      const lines = el('div', 'skeleton-rows');
+      for (let i = 0; i < 4; i++) lines.append(el('span', 'skeleton skeleton-row'));
+      body.append(lines);
+    } else if (content.kind === 'error') {
+      body.append(this.monitorErrorPanel('Не удалось загрузить историю', content.error, () => void this.loadMonitorHistory(view, false)));
+    } else {
+      body.append(...this.monitorHistoryContent(content.data));
+    }
+    panel.append(body);
+    view.history.replaceChildren(panel);
+    restoreFocusKey(view.history, focusKey);
+  }
+
+  private monitorHistoryContent(h: MonitorHistory): HTMLElement[] {
+    const s = h.summary;
+    const facts = el('dl', 'facts');
+    facts.append(
+      fact('Сбоев за период', formatCount(s.outages)),
+      fact('Недоступность', formatDuration(s.down_seconds)),
+      fact('Частичные сбои', formatDuration(s.degraded_seconds)),
+      fact('Доступность', formatAvailability(s.availability), s.availability === null ? 'Считается для страны и сервера' : undefined),
+      fact('Проверок', formatCount(s.checks), s.failures > 0 ? `неудачных: ${formatCount(s.failures)}` : undefined),
+    );
+    const out: HTMLElement[] = [facts, latencyChartNode(h)];
+    if (h.outages.length === 0) {
+      out.push(el('p', 'panel-note', `За ${MONITOR_PERIOD_LABELS[h.period]} сбоев не было.`));
+      return out;
+    }
+    // Names of servers on screen; a retired server keeps only its ID.
+    const names = new Map<number, string>();
+    for (const c of this.monitorState.detail?.data.countries ?? []) for (const n of c.nodes) names.set(n.target_id, n.name);
+    const table = el('table', 'table table-cards monitor-outages-table');
+    table.append(el('caption', 'sr-only', 'Сбои за период, от новых к старым'), headRow(MONITOR_OUTAGE_COLUMNS));
+    const body = el('tbody');
+    for (const o of h.outages) {
+      const where = o.scope === 'target' && o.target_id !== null
+        ? names.get(o.target_id) || `Сервер #${o.target_id}`
+        : monitorCountryLabel(o.country_code);
+      const kind = el('span', o.kind === 'degraded' ? 'badge badge-warn' : 'badge badge-danger', outageKindLabel(o.kind));
+      const row = el('tr');
+      row.append(
+        cell('Начало', formatDateTime(o.started_at), 'col-date'),
+        cell('Конец', o.ended_at ? formatDateTime(o.ended_at) : '—', 'col-date'),
+        cell('Длительность', formatDuration(o.duration_seconds), 'col-md'),
+        cell('Тип', kind, 'col-md'),
+        cell('Причина', errorLabel(o.error_code) || '—', 'cell-wrap'),
+        cell('Где', where, 'cell-wrap'),
+        cell('Итог', endReasonLabel(o), 'col-md'),
+      );
+      body.append(row);
+    }
+    table.append(body);
+    const wrap = el('div', 'table-wrap');
+    wrap.append(table);
+    out.push(wrap);
+    return out;
+  }
+
+  private async loadMonitorHistory(view: MonitorDetailView, silent: boolean) {
+    const state = this.monitorState;
+    const subject = state.subject ?? BUILDER_HISTORY;
+    const period = state.period;
+    const key = monitorHistoryKey(view.id, subject, period);
+    const request = ++this.monitorHistoryRequest;
+    const current = () => this.monitorDetailView === view && request === this.monitorHistoryRequest;
+    if (state.history?.key !== key) this.paintMonitorHistory(view, { kind: 'loading' });
+    try {
+      const data = await this.api.monitoringHistory(monitorHistoryQuery(view.id, subject, period));
+      if (!current()) return;
+      state.history = { key, data };
+      this.paintMonitorHistory(view, { kind: 'data', data });
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      if (state.history?.key === key) {
+        if (!silent) this.toast(`Не удалось обновить историю. ${errorText(error)}`);
+      } else {
+        this.paintMonitorHistory(view, { kind: 'error', error });
+      }
+    }
+  }
+
+  /** Same policy as the overview; a successful load also refreshes the history panel. */
+  private async loadMonitorBuilder(silent: boolean) {
+    const view = this.monitorDetailView;
+    if (!view) return;
+    const state = this.monitorState;
+    const request = ++this.monitorRequest;
+    const current = () => this.monitorDetailView === view && request === this.monitorRequest;
+    window.clearTimeout(this.monitorTimer);
+    const shown = state.detail !== null && state.detail.id === view.id;
+    if (!silent) setRefreshBusy(view.refresh, true);
+    if (!shown) this.paintMonitorBuilderSkeleton(view);
+    else if (!silent) view.countries.setAttribute('aria-busy', 'true');
+    let missing = false;
+    try {
+      const data = await this.api.monitoringBuilder(view.id);
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      state.detail = { id: view.id, data, at: new Date() };
+      this.paintMonitorBuilder(view, data, state.detail.at);
+      void this.loadMonitorHistory(view, silent);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      if (error instanceof ApiError && error.status === 404) {
+        missing = true;
+        if (state.detail?.id === view.id) state.detail = null;
+        this.paintMonitorBuilderMissing(view);
+      } else if (shown) {
+        view.countries.removeAttribute('aria-busy');
+        if (silent) view.updated.textContent = `Не удалось обновить в ${clockSeconds(new Date())}`;
+        else this.toast(`Не удалось обновить состояние построителя. ${errorText(error)}`);
+      } else {
+        setLoading(view.countries, null);
+        view.summary.replaceChildren();
+        view.countries.replaceChildren(this.monitorErrorPanel('Не удалось загрузить построитель', error,
+          () => void this.loadMonitorBuilder(false)));
+      }
+    } finally {
+      if (current()) {
+        setRefreshBusy(view.refresh, false);
+        this.monitorLoadedAt = Date.now();
+        if (!missing) this.scheduleMonitorPoll();
+      }
+    }
   }
 
   // ===========================================================================

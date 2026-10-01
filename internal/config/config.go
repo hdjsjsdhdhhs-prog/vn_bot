@@ -61,6 +61,14 @@ type Config struct {
 	PaymentProvider   string
 	PlategaMerchantID string
 	PlategaSecret     string
+
+	// Network monitor ("Мониторинг"): handshake checks of builder servers.
+	NetMonEnabled     bool
+	NetMonInterval    int // seconds between check rounds
+	NetMonTimeout     int // seconds per probe
+	NetMonRefresh     int // seconds between builder re-resolutions
+	NetMonConcurrency int // probes in flight
+	NetMonDownAfter   int // consecutive failures before DOWN
 }
 
 // configFlags holds typed flag values for config fields.
@@ -89,6 +97,12 @@ type configFlags struct {
 	paymentProvider        *flag.StringValue
 	plategaMerchantID      *flag.StringValue
 	plategaSecret          *flag.StringValue
+	netMonEnabled          *flag.BoolValue
+	netMonInterval         *flag.IntValue
+	netMonTimeout          *flag.IntValue
+	netMonRefresh          *flag.IntValue
+	netMonConcurrency      *flag.IntValue
+	netMonDownAfter        *flag.IntValue
 }
 
 // registerFlags creates a new flag.Registry and initializes a configFlags instance with defaults,
@@ -108,6 +122,9 @@ func registerFlags() (*flag.Registry, *configFlags) {
 		donateURL: flag.NewString(DonateURL), donateEnabled: flag.NewBool(DefaultDonateEnabled),
 		globalSubURL: flag.NewString(""), subServerAccessLogPath: flag.NewString(""),
 		paymentEnabled: flag.NewBool(false), paymentProvider: flag.NewString("platega"), plategaMerchantID: flag.NewString(""), plategaSecret: flag.NewString(""),
+		netMonEnabled: flag.NewBool(DefaultNetMonEnabled), netMonInterval: flag.NewInt(DefaultNetMonInterval),
+		netMonTimeout: flag.NewInt(DefaultNetMonTimeout), netMonRefresh: flag.NewInt(DefaultNetMonRefresh),
+		netMonConcurrency: flag.NewInt(DefaultNetMonConcurrency), netMonDownAfter: flag.NewInt(DefaultNetMonDownAfter),
 	}
 	r.Register("ADMIN_USERNAME", f.adminUsername)
 	r.Register("ADMIN_PASSWORD_HASH", f.adminPasswordHash)
@@ -133,6 +150,12 @@ func registerFlags() (*flag.Registry, *configFlags) {
 	r.Register("PAYMENT_PROVIDER", f.paymentProvider)
 	r.Register("PLATEGA_MERCHANT_ID", f.plategaMerchantID)
 	r.Register("PLATEGA_SECRET", f.plategaSecret)
+	r.Register("NETMON_ENABLED", f.netMonEnabled)
+	r.Register("NETMON_INTERVAL", f.netMonInterval)
+	r.Register("NETMON_TIMEOUT", f.netMonTimeout)
+	r.Register("NETMON_REFRESH", f.netMonRefresh)
+	r.Register("NETMON_CONCURRENCY", f.netMonConcurrency)
+	r.Register("NETMON_DOWN_AFTER", f.netMonDownAfter)
 
 	return r, f
 }
@@ -160,6 +183,8 @@ func Load() (*Config, error) {
 		SubServerAccessLogPath: f.subServerAccessLogPath.Get(),
 		PaymentEnabled:         f.paymentEnabled.Get(), PaymentProvider: f.paymentProvider.Get(),
 		PlategaMerchantID: f.plategaMerchantID.Get(), PlategaSecret: f.plategaSecret.Get(),
+		NetMonEnabled: f.netMonEnabled.Get(), NetMonInterval: f.netMonInterval.Get(), NetMonTimeout: f.netMonTimeout.Get(),
+		NetMonRefresh: f.netMonRefresh.Get(), NetMonConcurrency: f.netMonConcurrency.Get(), NetMonDownAfter: f.netMonDownAfter.Get(),
 	}
 	// Validate all required fields
 	err = cfg.validate()
@@ -267,7 +292,43 @@ func (c *Config) validate() error {
 		return fmt.Errorf("TRIAL_RATE_LIMIT must be between 1 and 100")
 	}
 
+	return c.validateNetMon()
+}
+
+// validateNetMon checks the network monitor settings. They are validated
+// even when the monitor is disabled so enabling it later cannot fail. A zero
+// value means "not set" and takes the default; any other value is checked.
+func (c *Config) validateNetMon() error {
+	defaultInt(&c.NetMonInterval, DefaultNetMonInterval)
+	defaultInt(&c.NetMonTimeout, DefaultNetMonTimeout)
+	defaultInt(&c.NetMonRefresh, DefaultNetMonRefresh)
+	defaultInt(&c.NetMonConcurrency, DefaultNetMonConcurrency)
+	defaultInt(&c.NetMonDownAfter, DefaultNetMonDownAfter)
+	if c.NetMonInterval < MinNetMonInterval {
+		return fmt.Errorf("NETMON_INTERVAL must be at least %d seconds", MinNetMonInterval)
+	}
+	if c.NetMonTimeout < 1 || c.NetMonTimeout > MaxNetMonTimeout {
+		return fmt.Errorf("NETMON_TIMEOUT must be between 1 and %d seconds", MaxNetMonTimeout)
+	}
+	if c.NetMonTimeout >= c.NetMonInterval {
+		return fmt.Errorf("NETMON_TIMEOUT must be shorter than NETMON_INTERVAL")
+	}
+	if c.NetMonRefresh < MinNetMonRefresh {
+		return fmt.Errorf("NETMON_REFRESH must be at least %d seconds", MinNetMonRefresh)
+	}
+	if c.NetMonConcurrency < 1 || c.NetMonConcurrency > MaxNetMonConcurrency {
+		return fmt.Errorf("NETMON_CONCURRENCY must be between 1 and %d", MaxNetMonConcurrency)
+	}
+	if c.NetMonDownAfter < 1 || c.NetMonDownAfter > MaxNetMonDownAfter {
+		return fmt.Errorf("NETMON_DOWN_AFTER must be between 1 and %d", MaxNetMonDownAfter)
+	}
 	return nil
+}
+
+func defaultInt(v *int, def int) {
+	if *v == 0 {
+		*v = def
+	}
 }
 
 // validateURL checks if a URL string is valid.

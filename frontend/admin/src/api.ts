@@ -443,6 +443,28 @@ export class AdminApi {
     return page;
   }
 
+  /** GET /admin/api/monitoring: every builder with its current network state. */
+  async monitoring(): Promise<MonitorOverview> {
+    const overview = parseMonitorOverview(await this.#send('GET', '/admin/api/monitoring'));
+    if (!overview) throw new ApiError('invalid_response');
+    return overview;
+  }
+
+  /** GET /admin/api/monitoring/builders/{id}: countries and servers of one builder. */
+  async monitoringBuilder(id: number): Promise<MonitorBuilderDetail> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
+    const detail = parseMonitorBuilderDetail(await this.#send('GET', `/admin/api/monitoring/builders/${id}`), id);
+    if (!detail) throw new ApiError('invalid_response');
+    return detail;
+  }
+
+  /** GET /admin/api/monitoring/history: outages and latency of a builder, country or server. */
+  async monitoringHistory(query: MonitorHistoryQuery): Promise<MonitorHistory> {
+    const history = parseMonitorHistory(await this.#send('GET', monitorHistoryPath(query)), query.period);
+    if (!history) throw new ApiError('invalid_response');
+    return history;
+  }
+
   /** GET /admin/api/users/{telegram_id}. 404 means no linked customer has this ID. */
   async user(telegramId: number): Promise<UserDetail> {
     // The route only accepts canonical positive IDs and answers 404 otherwise.
@@ -1221,4 +1243,325 @@ function parseJournalPage(value: unknown): JournalPage | null {
     events.push(event);
   }
   return { events, total, limit, offset };
+}
+
+// =============================================================================
+// Network monitor (web.adminAPI.routeMonitoring → netmon views, migration 048)
+// Read-only: checks run in the backend worker; reading never triggers one.
+// =============================================================================
+
+/** Target/country status; a builder may also be "disabled". */
+export const MONITOR_STATUSES = ['up', 'degraded', 'down', 'unknown', 'disabled'] as const;
+export type MonitorStatus = (typeof MONITOR_STATUSES)[number];
+
+export const MONITOR_PERIODS = ['24h', '7d', '30d'] as const;
+export type MonitorPeriod = (typeof MONITOR_PERIODS)[number];
+
+/** netmon.Transition: the latest country state change of a builder. */
+export interface MonitorTransition {
+  readonly country_code: string;
+  /** down | degraded (outage opened), up (recovered), removed (no longer served). */
+  readonly event: string;
+  readonly at: string;
+}
+
+/** netmon.BuilderSummary. */
+export interface MonitorBuilderSummary {
+  readonly id: number;
+  readonly name: string;
+  readonly enabled: boolean;
+  readonly status: MonitorStatus;
+  readonly countries_total: number;
+  readonly countries_up: number;
+  readonly countries_degraded: number;
+  readonly countries_down: number;
+  readonly nodes_total: number;
+  readonly nodes_up: number;
+  readonly nodes_down: number;
+  readonly nodes_unknown: number;
+  readonly avg_latency_ms: number | null;
+  readonly last_checked_at: string | null;
+  readonly last_transition: MonitorTransition | null;
+  /** Sources of the builder that failed to fetch at the last resolution. */
+  readonly source_errors: number;
+  /** Served servers without a checkable endpoint (e.g. Xray config without a primary outbound). */
+  readonly unresolved: number;
+}
+
+/** netmon.Overview. */
+export interface MonitorOverview {
+  readonly enabled: boolean;
+  readonly generated_at: string;
+  readonly interval_seconds: number;
+  readonly down_after: number;
+  readonly last_round_at: string | null;
+  readonly last_refresh_at: string | null;
+  readonly builders: readonly MonitorBuilderSummary[];
+}
+
+/** netmon.NodeView: credential-free endpoint of one served server. */
+export interface MonitorNode {
+  readonly target_id: number;
+  readonly name: string;
+  readonly source_id: number;
+  readonly source_name: string;
+  readonly protocol: string;
+  readonly host: string;
+  readonly port: number;
+  readonly security: string;
+  readonly transport: string;
+  /** tcp | tls | quic | unsupported */
+  readonly probe: string;
+  readonly status: MonitorStatus;
+  readonly status_since: string | null;
+  readonly latency_ms: number | null;
+  readonly last_checked_at: string | null;
+  readonly last_up_at: string | null;
+  readonly last_down_at: string | null;
+  readonly last_error: string;
+  /** Other builders serving the same endpoint (checked once for all). */
+  readonly shared_with: number;
+}
+
+/** netmon.CountryView; country_code '' groups servers without a country. */
+export interface MonitorCountry {
+  readonly country_code: string;
+  readonly status: MonitorStatus;
+  readonly status_since: string | null;
+  readonly latency_ms: number | null;
+  readonly nodes_total: number;
+  readonly nodes_up: number;
+  readonly nodes_down: number;
+  readonly last_checked_at: string | null;
+  readonly last_up_at: string | null;
+  readonly last_down_at: string | null;
+  readonly nodes: readonly MonitorNode[];
+}
+
+/** netmon.BuilderDetail. */
+export interface MonitorBuilderDetail {
+  readonly generated_at: string;
+  readonly interval_seconds: number;
+  readonly last_round_at: string | null;
+  readonly builder: MonitorBuilderSummary;
+  readonly countries: readonly MonitorCountry[];
+}
+
+/** netmon.OutageView. */
+export interface MonitorOutage {
+  readonly id: number;
+  /** target | country */
+  readonly scope: string;
+  /** down | degraded */
+  readonly kind: string;
+  readonly country_code: string;
+  readonly target_id: number | null;
+  readonly started_at: string;
+  readonly ended_at: string | null;
+  readonly duration_seconds: number;
+  readonly ongoing: boolean;
+  /** '' (ongoing) | recovered | changed | removed */
+  readonly end_reason: string;
+  readonly error_code: string;
+}
+
+/** netmon.LatencyPoint. */
+export interface MonitorLatencyPoint {
+  readonly at: string;
+  readonly checks: number;
+  readonly failures: number;
+  readonly avg_ms: number | null;
+  readonly min_ms: number | null;
+  readonly max_ms: number | null;
+}
+
+/** netmon.HistorySummary. */
+export interface MonitorHistorySummary {
+  readonly outages: number;
+  readonly down_seconds: number;
+  readonly degraded_seconds: number;
+  /** Percent of the period not DOWN; null for a whole builder. */
+  readonly availability: number | null;
+  readonly checks: number;
+  readonly failures: number;
+}
+
+/** netmon.History. */
+export interface MonitorHistory {
+  /** builder | country | target */
+  readonly scope: string;
+  readonly period: MonitorPeriod;
+  readonly from: string;
+  readonly to: string;
+  readonly step_seconds: number;
+  readonly summary: MonitorHistorySummary;
+  readonly outages: readonly MonitorOutage[];
+  readonly latency: readonly MonitorLatencyPoint[];
+}
+
+/**
+ * Subject of GET /admin/api/monitoring/history: a server (targetId), a
+ * builder country (builderId + country, '' = without country) or a builder.
+ */
+export interface MonitorHistoryQuery {
+  readonly builderId: number | null;
+  readonly country: string | null;
+  readonly targetId: number | null;
+  readonly period: MonitorPeriod;
+}
+
+const isMonitorStatus = (value: unknown): value is MonitorStatus =>
+  typeof value === 'string' && (MONITOR_STATUSES as readonly string[]).includes(value);
+const isNonNegative = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+function parseMonitorTransition(value: unknown): MonitorTransition | null | undefined {
+  if (value === null || value === undefined) return null;
+  if (!isRecord(value)) return undefined;
+  const { country_code, event, at } = value;
+  if (!isText(country_code) || !isText(event) || event === '' || !isTime(at)) return undefined;
+  return { country_code, event, at };
+}
+
+function parseMonitorBuilderSummary(value: unknown): MonitorBuilderSummary | null {
+  if (!isRecord(value)) return null;
+  const {
+    id, name, enabled, status, countries_total, countries_up, countries_degraded, countries_down, nodes_total,
+    nodes_up, nodes_down, nodes_unknown, avg_latency_ms, last_checked_at, source_errors, unresolved,
+  } = value;
+  const last_transition = parseMonitorTransition(value.last_transition);
+  if (!isPositive(id) || !isText(name) || typeof enabled !== 'boolean' || !isMonitorStatus(status) ||
+    ![countries_total, countries_up, countries_degraded, countries_down, nodes_total, nodes_up, nodes_down,
+      nodes_unknown, source_errors, unresolved].every(isCount) ||
+    !isNullable(avg_latency_ms, isCount) || !isNullable(last_checked_at, isTime) || last_transition === undefined) return null;
+  return {
+    id, name, enabled, status, countries_total: countries_total as number, countries_up: countries_up as number,
+    countries_degraded: countries_degraded as number, countries_down: countries_down as number,
+    nodes_total: nodes_total as number, nodes_up: nodes_up as number, nodes_down: nodes_down as number,
+    nodes_unknown: nodes_unknown as number, avg_latency_ms, last_checked_at, last_transition,
+    source_errors: source_errors as number, unresolved: unresolved as number,
+  };
+}
+
+function parseMonitorOverview(value: unknown): MonitorOverview | null {
+  if (!isRecord(value)) return null;
+  const { enabled, generated_at, interval_seconds, down_after, last_round_at, last_refresh_at, builders: list } = value;
+  if (typeof enabled !== 'boolean' || !isTime(generated_at) || !isPositive(interval_seconds) || !isPositive(down_after) ||
+    !isNullable(last_round_at, isTime) || !isNullable(last_refresh_at, isTime) || !Array.isArray(list)) return null;
+  const builders: MonitorBuilderSummary[] = [];
+  for (const item of list) {
+    const b = parseMonitorBuilderSummary(item);
+    if (!b) return null;
+    builders.push(b);
+  }
+  return { enabled, generated_at, interval_seconds, down_after, last_round_at, last_refresh_at, builders };
+}
+
+function parseMonitorNode(value: unknown): MonitorNode | null {
+  if (!isRecord(value)) return null;
+  const {
+    target_id, name, source_id, source_name, protocol, host, port, security, transport, probe, status,
+    status_since, latency_ms, last_checked_at, last_up_at, last_down_at, last_error, shared_with,
+  } = value;
+  if (!isPositive(target_id) || !isText(name) || !isCount(source_id) || !isText(source_name) || !isText(protocol) ||
+    !isText(host) || host === '' || !isPositive(port) || port > 65535 || !isText(security) || !isText(transport) ||
+    !isText(probe) || !isMonitorStatus(status) || !isNullable(status_since, isTime) || !isNullable(latency_ms, isCount) ||
+    !isNullable(last_checked_at, isTime) || !isNullable(last_up_at, isTime) || !isNullable(last_down_at, isTime) ||
+    !isText(last_error) || !isCount(shared_with)) return null;
+  return {
+    target_id, name, source_id, source_name, protocol, host, port, security, transport, probe, status,
+    status_since, latency_ms, last_checked_at, last_up_at, last_down_at, last_error, shared_with,
+  };
+}
+
+function parseMonitorCountry(value: unknown): MonitorCountry | null {
+  if (!isRecord(value)) return null;
+  const {
+    country_code, status, status_since, latency_ms, nodes_total, nodes_up, nodes_down, last_checked_at,
+    last_up_at, last_down_at, nodes: list,
+  } = value;
+  if (!isText(country_code) || !isMonitorStatus(status) || !isNullable(status_since, isTime) ||
+    !isNullable(latency_ms, isCount) || !isCount(nodes_total) || !isCount(nodes_up) || !isCount(nodes_down) ||
+    !isNullable(last_checked_at, isTime) || !isNullable(last_up_at, isTime) || !isNullable(last_down_at, isTime) ||
+    !Array.isArray(list)) return null;
+  const nodes: MonitorNode[] = [];
+  for (const item of list) {
+    const n = parseMonitorNode(item);
+    if (!n) return null;
+    nodes.push(n);
+  }
+  return {
+    country_code, status, status_since, latency_ms, nodes_total, nodes_up, nodes_down, last_checked_at,
+    last_up_at, last_down_at, nodes,
+  };
+}
+
+function parseMonitorBuilderDetail(value: unknown, id: number): MonitorBuilderDetail | null {
+  if (!isRecord(value)) return null;
+  const { generated_at, interval_seconds, last_round_at, countries: list } = value;
+  const builder = parseMonitorBuilderSummary(value.builder);
+  if (!isTime(generated_at) || !isPositive(interval_seconds) || !isNullable(last_round_at, isTime) ||
+    !builder || builder.id !== id || !Array.isArray(list)) return null;
+  const countries: MonitorCountry[] = [];
+  for (const item of list) {
+    const c = parseMonitorCountry(item);
+    if (!c) return null;
+    countries.push(c);
+  }
+  return { generated_at, interval_seconds, last_round_at, builder, countries };
+}
+
+function parseMonitorOutage(value: unknown): MonitorOutage | null {
+  if (!isRecord(value)) return null;
+  const {
+    id, scope, kind, country_code, target_id, started_at, ended_at, duration_seconds, ongoing, end_reason, error_code,
+  } = value;
+  if (!isPositive(id) || !isText(scope) || !isText(kind) || !isText(country_code) || !isNullable(target_id, isPositive) ||
+    !isTime(started_at) || !isNullable(ended_at, isTime) || !isCount(duration_seconds) || typeof ongoing !== 'boolean' ||
+    !isText(end_reason) || !isText(error_code)) return null;
+  return { id, scope, kind, country_code, target_id, started_at, ended_at, duration_seconds, ongoing, end_reason, error_code };
+}
+
+function parseMonitorLatencyPoint(value: unknown): MonitorLatencyPoint | null {
+  if (!isRecord(value)) return null;
+  const { at, checks, failures, avg_ms, min_ms, max_ms } = value;
+  if (!isTime(at) || !isCount(checks) || !isCount(failures) || failures > checks || !isNullable(avg_ms, isCount) ||
+    !isNullable(min_ms, isCount) || !isNullable(max_ms, isCount)) return null;
+  return { at, checks, failures, avg_ms, min_ms, max_ms };
+}
+
+function parseMonitorHistory(value: unknown, period: MonitorPeriod): MonitorHistory | null {
+  if (!isRecord(value) || !isRecord(value.summary)) return null;
+  const { scope, from, to, step_seconds, outages: outageList, latency: latencyList } = value;
+  const { outages: count, down_seconds, degraded_seconds, availability, checks, failures } = value.summary;
+  if (!isText(scope) || value.period !== period || !isTime(from) || !isTime(to) || !isPositive(step_seconds) ||
+    !isCount(count) || !isCount(down_seconds) || !isCount(degraded_seconds) ||
+    !isNullable(availability, isNonNegative) || (availability !== null && availability > 100) ||
+    !isCount(checks) || !isCount(failures) || !Array.isArray(outageList) || !Array.isArray(latencyList)) return null;
+  const outages: MonitorOutage[] = [];
+  for (const item of outageList) {
+    const o = parseMonitorOutage(item);
+    if (!o) return null;
+    outages.push(o);
+  }
+  const latency: MonitorLatencyPoint[] = [];
+  for (const item of latencyList) {
+    const p = parseMonitorLatencyPoint(item);
+    if (!p) return null;
+    latency.push(p);
+  }
+  return {
+    scope, period, from, to, step_seconds,
+    summary: { outages: count, down_seconds, degraded_seconds, availability, checks, failures },
+    outages, latency,
+  };
+}
+
+/** Builds the query string of GET /admin/api/monitoring/history. */
+export function monitorHistoryPath(query: MonitorHistoryQuery): string {
+  const params = new URLSearchParams();
+  if (query.targetId !== null) params.set('target_id', String(query.targetId));
+  if (query.builderId !== null) params.set('builder_id', String(query.builderId));
+  if (query.country !== null) params.set('country', query.country);
+  params.set('period', query.period);
+  return `/admin/api/monitoring/history?${params.toString()}`;
 }

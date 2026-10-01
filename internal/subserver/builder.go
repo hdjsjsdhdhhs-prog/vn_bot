@@ -156,25 +156,9 @@ func fetchAndAggregateBuilder(ctx context.Context, db interfaces.SubscriptionRep
 
 	wg.Wait()
 
-	parsed := make([]builderSource, 0, len(sources))
-
-	for i, resp := range responses {
-		if resp == nil {
-			continue
-		}
-
-		countries, err := sourceCatalogueCountries(ctx, db, sources[i].ID)
-		if err != nil {
-			logger.Error("Failed to load provider source catalogue",
-				zap.String("sub_id", subID),
-				zap.Uint("builder_id", b.ID),
-				zap.Uint("provider_source_id", sources[i].ID),
-				zap.Error(err))
-
-			return builderAggregate{}, 0, len(sources), fmt.Errorf("database error: %w", err)
-		}
-
-		parsed = append(parsed, parseBuilderSource(subID, sources[i], resp, countries))
+	parsed, err := parseFetchedBuilderSources(ctx, db, subID, b.ID, sources, responses)
+	if err != nil {
+		return builderAggregate{}, 0, len(sources), err
 	}
 
 	success := len(parsed)
@@ -190,6 +174,35 @@ func fetchAndAggregateBuilder(ctx context.Context, db interfaces.SubscriptionRep
 		agg:          assembleBuilderAggregate(b, parsed, picks),
 		trafficLimit: builderTrafficLimit(parsed),
 	}, success, total, nil
+}
+
+// parseFetchedBuilderSources parses the fetched responses (nil = fetch failed,
+// skipped) in source order, enriching entries with the stored catalogue
+// countries. It is shared by /sub and the network monitor so both see the
+// same entries; a catalogue read failure is a database error.
+func parseFetchedBuilderSources(ctx context.Context, db interfaces.SubscriptionRepository, subID string, builderID uint, sources []database.ProviderSource, responses []*NodeResponse) ([]builderSource, error) {
+	parsed := make([]builderSource, 0, len(sources))
+
+	for i, resp := range responses {
+		if resp == nil {
+			continue
+		}
+
+		countries, err := sourceCatalogueCountries(ctx, db, sources[i].ID)
+		if err != nil {
+			logger.Error("Failed to load provider source catalogue",
+				zap.String("sub_id", subID),
+				zap.Uint("builder_id", builderID),
+				zap.Uint("provider_source_id", sources[i].ID),
+				zap.Error(err))
+
+			return nil, fmt.Errorf("database error: %w", err)
+		}
+
+		parsed = append(parsed, parseBuilderSource(subID, sources[i], resp, countries))
+	}
+
+	return parsed, nil
 }
 
 // builderSourcesToFetch returns the linked, enabled and valid sources in

@@ -22,6 +22,7 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/logger"
 	"github.com/kereal/rs8kvn_bot/internal/metrics"
+	"github.com/kereal/rs8kvn_bot/internal/netmon"
 	"github.com/kereal/rs8kvn_bot/internal/scheduler"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/subserver"
@@ -228,12 +229,15 @@ func initBot(cfg *config.Config) (*tgbotapi.BotAPI, *bot.BotConfig, error) {
 // startWebServer создаёт и запускает HTTP-сервер (подписки, инвайт/trial-страницы).
 // Сервер стартует асинхронно; функция ждёт до 2 секунд первой ошибки запуска,
 // чтобы не блокировать старт бота, но вернуть ошибку, если сервер точно не поднялся.
-func startWebServer(subService *service.SubscriptionService, cfg *config.Config, botConfig *bot.BotConfig, subServer *subserver.Service, dbService *database.Service, orderService *service.OrderService, adminService *service.AdminService, builderService *service.BuilderService, botAPI interfaces.BotAPI) (*web.Server, error) {
+func startWebServer(subService *service.SubscriptionService, cfg *config.Config, botConfig *bot.BotConfig, subServer *subserver.Service, dbService *database.Service, orderService *service.OrderService, adminService *service.AdminService, builderService *service.BuilderService, netMonitor *netmon.Service, botAPI interfaces.BotAPI) (*web.Server, error) {
 	webServer := web.NewServer(fmt.Sprintf(":%d", cfg.WebServerPort), dbService, cfg, botConfig.Username, subService, subServer)
 	webServer.SetOrderService(orderService)
 	webServer.SetAdminService(adminService)
 	webServer.SetBuilderService(builderService)
 	webServer.SetTariffService(service.NewTariffService(dbService))
+	if netMonitor != nil {
+		webServer.SetNetworkMonitor(netMonitor)
+	}
 	webServer.SetBot(botAPI)
 
 	if cfg.PaymentEnabled {
@@ -404,6 +408,29 @@ func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subServic
 	return &wg
 }
 
+// netMonitorStartDelay lets the bot finish startup before the first
+// resolution fetches provider sources.
+const netMonitorStartDelay = 15 * time.Second
+
+// startNetworkMonitor запускает фоновый мониторинг сети (раздел «Мониторинг»),
+// если он включён (NETMON_ENABLED). Ошибки мониторинга best-effort: они
+// логируются и не влияют на выдачу подписок.
+func startNetworkMonitor(ctx context.Context, wg *sync.WaitGroup, monitor *netmon.Service, cfg *config.Config) {
+	if monitor == nil || !cfg.NetMonEnabled {
+		logger.Info("Network monitor disabled")
+		return
+	}
+
+	wg.Add(1)
+
+	go func() {
+		defer recoverAndReport("Network monitor")
+		defer wg.Done()
+
+		monitor.Run(ctx, netMonitorStartDelay)
+	}()
+}
+
 // main — точка входа: инициализирует конфигурацию и сервисы, запускает фоновые
 // воркеры и веб-сервер, обрабатывает обновления Telegram с ограниченным
 // параллелизмом и выполняет корректное завершение при получении сигнала.
@@ -474,7 +501,7 @@ func main() {
 	// The web server starts with an empty bot username; initBot injects the real
 	// username (from Telegram getMe) via SetBotUsername once the bot is ready, so
 	// the share/invite page shows the correct @username after startup.
-	webServer, err := startWebServer(svc.subService, cfg, botConfig, svc.subServer, dbService, svc.orderService, svc.adminService, svc.builderService, botAPI)
+	webServer, err := startWebServer(svc.subService, cfg, botConfig, svc.subServer, dbService, svc.orderService, svc.adminService, svc.builderService, svc.netMonitor, botAPI)
 	if err != nil {
 		logger.Fatal("Failed to start web server", zap.Error(err))
 	}
@@ -540,6 +567,7 @@ func main() {
 	svc.handler.StartBroadcastWorker(ctx)
 	svc.handler.StartStarsPaymentWorker(ctx)
 	bgWg := startBackgroundWorkers(ctx, svc.handler, svc.subService, svc.syncService, svc.orderService, dbService, cfg)
+	startNetworkMonitor(ctx, bgWg, svc.netMonitor, cfg)
 
 	if webServer != nil {
 		webServer.SetPaymentReady(true)

@@ -101,6 +101,22 @@ const (
 	MinHeartbeatInterval = 10
 )
 
+// Network monitor constants (NETMON_*, seconds unless noted). The defaults
+// need no environment changes: the monitor is on with a 60s round.
+const (
+	DefaultNetMonEnabled     = true
+	DefaultNetMonInterval    = 60
+	MinNetMonInterval        = 15
+	DefaultNetMonTimeout     = 5
+	MaxNetMonTimeout         = 30
+	DefaultNetMonRefresh     = 600
+	MinNetMonRefresh         = 60
+	DefaultNetMonConcurrency = 8
+	MaxNetMonConcurrency     = 64
+	DefaultNetMonDownAfter   = 2 // consecutive failed checks before DOWN
+	MaxNetMonDownAfter       = 10
+)
+
 // Database Pool Statistics Constants
 const (
 	// PoolStatsLogInterval is the interval for logging database pool statistics

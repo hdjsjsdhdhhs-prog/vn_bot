@@ -100,6 +100,7 @@ type Server struct {
 	adminService       *service.AdminService
 	builderService     *service.BuilderService
 	tariffService      *service.TariffService
+	networkMonitor     NetworkMonitor
 	paymentConfig      *PaymentConfig
 	subServer          *subserver.Service
 	subserverLogger    *subserver.AccessLogger
@@ -172,6 +173,16 @@ func (s *Server) SetTariffService(tariffService *service.TariffService) {
 	defer s.mu.Unlock()
 
 	s.tariffService = tariffService
+}
+
+// SetNetworkMonitor wires the read-only monitor API under
+// /admin/api/monitoring. Without it those (still session-protected) routes
+// answer 503. Set before Start.
+func (s *Server) SetNetworkMonitor(monitor NetworkMonitor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.networkMonitor = monitor
 }
 
 // SetPaymentConfig configures runtime payment settings used by the callback
@@ -253,7 +264,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cfg != nil {
 		actor = s.cfg.AdminUsername
 	}
-	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, s.tariffService, actor))
+	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, s.tariffService, s.networkMonitor, actor))
 
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)

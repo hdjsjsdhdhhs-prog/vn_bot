@@ -16,9 +16,9 @@ import (
 )
 
 // Pin the complete Mini App/Purchase/Stars/Admin-audit/Subscription Builder/
-// Tariff catalogue/Journal schema; future-schema fixtures must remain strictly
-// newer than this version.
-const expectedLatestMigrationVersion = 47
+// Tariff catalogue/Journal/network monitor schema; future-schema fixtures must
+// remain strictly newer than this version.
+const expectedLatestMigrationVersion = 48
 
 func TestLatestEmbeddedMigrationVersion(t *testing.T) {
 	t.Parallel()
