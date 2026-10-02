@@ -150,6 +150,9 @@ func initServices(cfg *config.Config, dbService *database.Service, deps *runtime
 	subService := service.NewSubscriptionService(dbService, deps.xuiClients, deps.vpnClients, deps.nodes, cfg)
 	subService.SetBot(botAPI)
 	subService.SetSyncService(syncSvc)
+	// Admin-editable trial (Admin → «Тарифы» → «Пробная подписка»); without a
+	// stored configuration the environment trial values keep applying.
+	subService.SetTrialPolicy(dbService)
 
 	subServer := subserver.NewService(config.SubServerCacheTTL)
 	handler := bot.NewHandler(botAPI, cfg, dbService, botConfig, subService, getVersion())

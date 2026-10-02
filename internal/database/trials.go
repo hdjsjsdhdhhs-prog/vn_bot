@@ -215,6 +215,11 @@ func (s *Service) BindTrialSubscription(ctx context.Context, subscriptionID stri
 // ClaimExpiredTrials marks expired anonymous trials as expired and returns them
 // for external deprovisioning. Keeping the row until deprovisioning succeeds
 // makes cleanup retryable and prevents orphaned panel clients.
+//
+// A trial expires by its own expires_at (set at creation from the duration in
+// force then), so changing the trial duration in the admin never shortens or
+// extends trials already issued. Rows without expires_at (none are created
+// today) keep the legacy rule: created_at older than hours.
 func (s *Service) ClaimExpiredTrials(ctx context.Context, hours int) ([]Subscription, error) {
 	var trialPlan Plan
 	err := s.db.WithContext(ctx).Where("name = ?", TrialPlanName).First(&trialPlan).Error
@@ -222,15 +227,17 @@ func (s *Service) ClaimExpiredTrials(ctx context.Context, hours int) ([]Subscrip
 		return nil, fmt.Errorf("failed to resolve trial plan: %w", err)
 	}
 
+	now := time.Now().UTC()
 	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
 	var subs []Subscription
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Raw(
 			`UPDATE subscriptions
 			 SET status = ?
-			 WHERE plan_id = ? AND telegram_id < 0 AND status IN (?, ?) AND created_at < ?
+			 WHERE plan_id = ? AND telegram_id < 0 AND status IN (?, ?)
+			   AND ((expires_at IS NOT NULL AND expires_at <= ?) OR (expires_at IS NULL AND created_at < ?))
 			 RETURNING id, client_id, subscription_id, plan_id, telegram_id, status`,
-			SubscriptionStatusExpired, trialPlan.ID, SubscriptionStatusActive, SubscriptionStatusExpired, cutoff,
+			SubscriptionStatusExpired, trialPlan.ID, SubscriptionStatusActive, SubscriptionStatusExpired, now, cutoff,
 		).Scan(&subs)
 		if result.Error != nil {
 			return result.Error

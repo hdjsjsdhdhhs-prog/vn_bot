@@ -7,6 +7,7 @@ import {
   type CreateSourceInput, type UpdateSourceInput,
   type CreateBuilderInput, type UpdateBuilderInput, type UpsertBuilderItemInput, type SetBuilderInput,
   TARIFF_LIMITS, type AdminTariff, type TariffPlan, type TariffOutcome,
+  type TrialBuilderSummary, type TrialPreview, type TrialView,
   JOURNAL_EVENT_TYPES, PLAN_KINDS, type JournalEvent, type JournalEventType, type JournalPage, type JournalQuery,
   type JournalState, type PlanKind,
   MONITOR_PERIODS, type MonitorBuilderDetail, type MonitorBuilderSummary, type MonitorCountry, type MonitorHistory,
@@ -29,6 +30,12 @@ import {
   formatLabel, normalizeFormat, pickableEntries, previewSummary, protocolsOf, resolveNode, ruleSummary,
   serversLabel, shortFingerprint, syncErrorText, syncResultMessage, syncState, type EntryFilter, type SyncState,
 } from './sources';
+import {
+  TRIAL_DURATION_PRESETS, TRIAL_LIMITS, TRIAL_SERVER_FIELDS, compositionFromBuilder, countryName, countrySelection,
+  durationHours, formFromView, groupByCountry, hoursLabel, moveRule, nodeSelected, problemText, rulesForSources,
+  sameTrialForm, toggleCountry, toggleNode, trialDurationLabel, validateTrialForm, withComposition,
+  type CompositionState, type TrialErrors, type TrialField, type TrialForm,
+} from './trial';
 
 // ---------------------------------------------------------------------------
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
@@ -208,14 +215,15 @@ const SECTIONS: readonly Section[] = [
 
 // Routes: #/overview, #/users, #/users/{telegram_id}, #/audit. Only canonical
 // positive Telegram IDs open a user, matching the API route.
-// Tariffs: #/tariffs, #/tariffs/new, #/tariffs/{product_id}.
+// Tariffs: #/tariffs, #/tariffs/new, #/tariffs/{product_id}, #/tariffs/trial
+// (the trial editor, part of the Tariffs section).
 // Sources: #/sources, #/sources/{source_id} (catalogue of one source).
 // Monitoring: #/monitoring, #/monitoring/{builder_id} (countries and servers).
 interface Route {
-  section: Section; userId: number | null; tariffId: number | 'new' | null; sourceId: number | null; monitorId: number | null;
+  section: Section; userId: number | null; tariffId: number | 'new' | 'trial' | null; sourceId: number | null; monitorId: number | null;
 }
 const USER_ROUTE = /^users\/([1-9][0-9]{0,15})$/;
-const TARIFF_ROUTE = /^tariffs\/(new|[1-9][0-9]{0,15})$/;
+const TARIFF_ROUTE = /^tariffs\/(new|trial|[1-9][0-9]{0,15})$/;
 const SOURCE_ROUTE = /^sources\/([1-9][0-9]{0,15})$/;
 const MONITOR_ROUTE = /^monitoring\/([1-9][0-9]{0,15})$/;
 
@@ -231,8 +239,8 @@ function currentRoute(): Route {
   const tariff = TARIFF_ROUTE.exec(path);
   const tariffs = SECTIONS.find(section => section.id === 'tariffs');
   if (tariff && tariffs) {
-    const id = tariff[1] === 'new' ? 'new' : Number(tariff[1]);
-    if (id === 'new' || Number.isSafeInteger(id)) return { ...none, section: tariffs, tariffId: id };
+    const id = tariff[1] === 'new' || tariff[1] === 'trial' ? tariff[1] : Number(tariff[1]);
+    if (id === 'new' || id === 'trial' || Number.isSafeInteger(id)) return { ...none, section: tariffs, tariffId: id };
   }
   const source = SOURCE_ROUTE.exec(path);
   const sources = SECTIONS.find(section => section.id === 'sources');
@@ -1305,6 +1313,12 @@ interface TariffEditorView {
   desc: HTMLElement;
 }
 
+interface TrialEditorView {
+  body: HTMLElement;
+  title: HTMLElement;
+  desc: HTMLElement;
+}
+
 interface SourceDetailView {
   id: number;
   body: HTMLElement;
@@ -1426,6 +1440,9 @@ class AdminApp {
   // Outcome of a create or a new version, shown once the editor re-opens on
   // the resulting tariff.
   private tariffNotice: { id: number; notice: Notice } | null = null;
+  // Trial editor (#/tariffs/trial).
+  private trialEditorView: TrialEditorView | null = null;
+  private trialEditorRequest = 0;
   // Reports unsaved changes of the open screen (tariff editor, edited order).
   // Leaving through navigation or reload asks for confirmation first.
   private unsavedChanges: (() => boolean) | null = null;
@@ -1465,6 +1482,7 @@ class AdminApp {
     this.pendingOrder = null;
     this.tariffsView = null;
     this.tariffEditorView = null;
+    this.trialEditorView = null;
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
@@ -1755,10 +1773,12 @@ class AdminApp {
     this.buildersView = null;
     this.tariffsView = null;
     this.tariffEditorView = null;
+    this.trialEditorView = null;
     this.unsavedChanges = null;
     this.pendingOrder = null;
     this.tariffsRequest++;
     this.tariffEditorRequest++;
+    this.trialEditorRequest++;
     this.dashboardRequest++;
     this.usersRequest++;
     this.detailRequest++;
@@ -1790,6 +1810,12 @@ class AdminApp {
     } else if (section.id === 'users') {
       page.append(header, this.buildUsers(header));
       load = () => this.loadUsers();
+    } else if (tariffId === 'trial') {
+      const back = el('a', 'back-link');
+      back.href = '#/tariffs';
+      back.append(icon('back'), el('span', '', 'Назад к тарифам'));
+      page.append(back, header, this.buildTrialEditor(title, desc));
+      load = () => this.loadTrialEditor();
     } else if (tariffId !== null) {
       const back = el('a', 'back-link');
       back.href = '#/tariffs';
@@ -5548,7 +5574,7 @@ class AdminApp {
     toggle.append(retired, el('span', '', 'Показывать прежние версии'));
     toolbar.append(summary, toggle);
     const body = el('div', 'tariffs-body');
-    root.append(toolbar, body);
+    root.append(toolbar, body, trialEntryPanel());
 
     const view: TariffsView = { body, refresh, updated, summary };
     this.tariffsView = view;
@@ -6656,6 +6682,827 @@ class AdminApp {
     return { planName: plan?.name ?? planName, subscriptions: plan ? plan.subscriptions : null };
   }
 
+  // ===========================================================================
+  // Trial editor (#/tariffs/trial). One configuration: settings (switch,
+  // duration, IP limit, landing-page card), the trial plan's builder and, for
+  // a builder used by nothing but the trial, its sources and country/node
+  // rules. The preview is the server's evaluation of the draft — the same one
+  // the invite page runs before issuing a trial.
+  // ===========================================================================
+
+  private buildTrialEditor(title: HTMLElement, desc: HTMLElement): HTMLElement {
+    title.textContent = 'Пробная подписка';
+    desc.textContent = TRIAL_DESC;
+    document.title = 'Пробная подписка · DictatorVPN Admin';
+    const body = el('div', 'tariff-editor trial-editor');
+    const view: TrialEditorView = { body, title, desc };
+    this.trialEditorView = view;
+    this.paintTrialSkeleton(view);
+    return body;
+  }
+
+  private paintTrialSkeleton(view: TrialEditorView) {
+    setLoading(view.body, 'Загружаем пробную подписку');
+    const grid = el('div', 'editor-grid');
+    const main = el('div', 'editor-main');
+    main.append(skeletonPanel(6), skeletonPanel(5));
+    const side = el('div', 'editor-side');
+    side.append(skeletonPanel(5));
+    grid.append(main, side);
+    view.body.replaceChildren(grid);
+  }
+
+  private async loadTrialEditor() {
+    const view = this.trialEditorView;
+    if (!view) return;
+    const request = ++this.trialEditorRequest;
+    const current = () => this.trialEditorView === view && request === this.trialEditorRequest;
+    this.unsavedChanges = null;
+    this.paintTrialSkeleton(view);
+    try {
+      const [trial, sources] = await Promise.all([this.api.getTrial(), this.api.listSources()]);
+      if (!current()) return;
+      this.lastSessionCheck = Date.now();
+      this.paintTrialEditor(view, trial, sources);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      setLoading(view.body, null);
+      view.body.replaceChildren(messagePanel('alert', 'Не удалось загрузить пробную подписку', errorText(error), 'alert',
+        retryButton(() => void this.loadTrialEditor())));
+    }
+  }
+
+  private paintTrialEditor(view: TrialEditorView, loaded: TrialView, sources: readonly AdminSource[]) {
+    setLoading(view.body, null);
+    let base = loaded;
+    let baseline = formFromView(base);
+    let form: TrialForm = cloneTrialForm(baseline);
+    // Stored composition per builder (the one the trial uses comes with the
+    // view, others are read with GET /builders/{id} when picked).
+    const stored = new Map<number, CompositionState>();
+    const remember = (v: TrialView) => {
+      if (v.builder_id !== null && v.composition) {
+        stored.set(v.builder_id, {
+          builderVersion: v.composition.builder_version, mode: v.composition.mode,
+          sourceIds: [...v.composition.source_ids], rules: v.composition.rules.map(rule => ({ ...rule })),
+        });
+      }
+    };
+    remember(base);
+    const catalogue = new Map<number, readonly SourceEntry[] | 'loading' | 'error'>();
+    const expanded = new Set<string>();
+    let parkedRules: TrialForm['rules'] = [];
+    let saving = false;
+    let builderLoading = false;
+    let pending: { payload: string; key: string } | null = null;
+    const isCurrent = () => this.trialEditorView === view;
+    const dirty = () => !sameTrialForm(form, baseline);
+    this.unsavedChanges = () => isCurrent() && dirty();
+    const summaryOf = (id: number | null): TrialBuilderSummary | null => base.builders.find(b => b.id === id) ?? null;
+    const editable = () => { const s = summaryOf(form.builderId); return s !== null && !s.shared; };
+    const storedFor = () => (form.builderId === null ? null : stored.get(form.builderId) ?? null);
+    const sourceName = (id: number) => sources.find(s => s.id === id)?.name ?? `Источник #${id}`;
+
+    // Status ------------------------------------------------------------------
+    const statusSlot = el('div', 'editor-status');
+    const showStatus = (next: Notice | null, actions: HTMLElement[] = []) => {
+      if (!next) { statusSlot.replaceChildren(); return; }
+      const node = noticeWithActions(next, actions);
+      node.setAttribute('role', next.tone === 'error' ? 'alert' : 'status');
+      node.tabIndex = -1;
+      statusSlot.replaceChildren(node);
+      node.focus();
+    };
+
+    // Controls ----------------------------------------------------------------
+    const setters = new Map<TrialField, (text: string) => void>();
+    const targets = new Map<TrialField, HTMLElement>();
+    const textInput = (id: string, inputMode: 'text' | 'numeric' = 'text') => {
+      const node = el('input', 'input');
+      node.id = id;
+      node.type = 'text';
+      node.autocomplete = 'off';
+      node.inputMode = inputMode;
+      return node;
+    };
+    const hint = (root: HTMLElement, text: string) => {
+      const node = el('p', 'field-hint', text);
+      root.append(node);
+      return node;
+    };
+
+    const enabled = el('input');
+    enabled.type = 'checkbox';
+    enabled.id = 'tr-enabled';
+    const enabledRow = el('label', 'toggle');
+    enabledRow.htmlFor = enabled.id;
+    enabledRow.append(enabled, el('span', '', 'Выдавать пробную подписку новым посетителям'));
+    const enabledHint = el('p', 'field-hint', 'Выключение не трогает уже выданные пробные подписки: они работают до своего срока. Новые посетители увидят «Пробный доступ временно недоступен».');
+
+    const duration = textInput('tr-duration', 'numeric');
+    const durationField = field('Срок', duration);
+    setters.set('duration', durationField.setError);
+    targets.set('duration', duration);
+    const unit = el('select', 'input');
+    unit.id = 'tr-unit';
+    unit.append(option('hours', 'часов'), option('days', 'дней'));
+    const unitField = field('Единица', unit);
+    const durationRow = el('div', 'form-row');
+    durationRow.append(durationField.root, unitField.root);
+    const presets = el('div', 'chips');
+    presets.setAttribute('role', 'group');
+    presets.setAttribute('aria-label', 'Быстрый выбор срока');
+    for (const hours of TRIAL_DURATION_PRESETS) {
+      const chip = button(trialDurationLabel(hours).replace(/ \(.*\)$/, ''), 'chip');
+      chip.dataset.hours = String(hours);
+      chip.addEventListener('click', () => {
+        const days = hours >= 24 && hours % 24 === 0;
+        duration.value = String(days ? hours / 24 : hours);
+        unit.value = days ? 'days' : 'hours';
+        durationField.setError('');
+        onInput();
+      });
+      presets.append(chip);
+    }
+    const expiryHint = el('p', 'field-hint');
+    expiryHint.setAttribute('aria-live', 'polite');
+
+    const titleInput = textInput('tr-title');
+    const titleField = field('Название', titleInput);
+    setters.set('title', titleField.setError);
+    targets.set('title', titleInput);
+    hint(titleField.root, 'Заголовок карточки на странице приглашения /i/<код>. Пусто — без заголовка.');
+    const description = el('textarea', 'input textarea');
+    description.id = 'tr-description';
+    description.rows = 3;
+    const descriptionField = field('Описание', description);
+    setters.set('description', descriptionField.setError);
+    targets.set('description', description);
+    const features = el('textarea', 'input textarea');
+    features.id = 'tr-features';
+    features.rows = 4;
+    const featuresField = field('Преимущества', features);
+    setters.set('features', featuresField.setError);
+    targets.set('features', features);
+    hint(featuresField.root, `По одному на строку, не больше ${TRIAL_LIMITS.features}.`);
+    const badge = textInput('tr-badge');
+    const badgeField = field('Бейдж', badge);
+    setters.set('badge', badgeField.setError);
+    targets.set('badge', badge);
+
+    const rate = textInput('tr-rate', 'numeric');
+    const rateField = field('Пробных подписок с одного IP в час', rate);
+    setters.set('rateLimit', rateField.setError);
+    targets.set('rateLimit', rate);
+    hint(rateField.root, `От ${TRIAL_LIMITS.minRate} до ${TRIAL_LIMITS.maxRate}. По умолчанию из окружения: ${base.defaults.rate_limit_per_hour}.`);
+
+    const builderSelect = el('select', 'input');
+    builderSelect.id = 'tr-builder';
+    const builderField = field('Построитель', builderSelect);
+    setters.set('builderId', builderField.setError);
+    targets.set('builderId', builderSelect);
+    const fillBuilders = () => {
+      builderSelect.replaceChildren(option('', 'Без построителя — узлы тарифа «trial»'));
+      for (const b of base.builders) {
+        const notes = [b.enabled ? '' : 'отключён', b.shared ? 'общий' : ''].filter(Boolean).join(', ');
+        builderSelect.append(option(String(b.id), notes ? `${b.name} — ${notes}` : b.name));
+      }
+    };
+    fillBuilders();
+
+    const read = () => {
+      form.enabled = enabled.checked;
+      form.duration = duration.value;
+      form.unit = unit.value === 'days' ? 'days' : 'hours';
+      form.rateLimit = rate.value;
+      form.title = titleInput.value;
+      form.description = description.value;
+      form.features = features.value;
+      form.badge = badge.value;
+    };
+    const write = () => {
+      enabled.checked = form.enabled;
+      duration.value = form.duration;
+      unit.value = form.unit;
+      rate.value = form.rateLimit;
+      titleInput.value = form.title;
+      description.value = form.description;
+      features.value = form.features;
+      badge.value = form.badge;
+      builderSelect.value = form.builderId === null ? '' : String(form.builderId);
+    };
+    const clearErrors = () => { for (const setError of setters.values()) setError(''); compositionError.textContent = ''; };
+    const compositionError = el('p', 'field-error');
+    compositionError.setAttribute('role', 'alert');
+    const showErrors = (errors: TrialErrors) => {
+      let first: HTMLElement | null = null;
+      for (const key of TRIAL_FIELD_ORDER) {
+        const text = errors[key];
+        if (!text) continue;
+        if (key === 'composition') compositionError.textContent = text;
+        else setters.get(key)?.(text);
+        first ??= targets.get(key) ?? compositionError;
+      }
+      first?.focus();
+    };
+
+    // Sections ----------------------------------------------------------------
+    const section = (id: string, titleText: string, meta?: string) => {
+      const panel = el('section', 'panel trial-section');
+      panel.id = id;
+      panel.setAttribute('aria-labelledby', `${id}-title`);
+      panel.append(panelHead(`${id}-title`, titleText, meta));
+      const content = el('div', 'tariff-form');
+      panel.append(content);
+      return { panel, content };
+    };
+    const basics = section('tr-basic', 'Основные');
+    basics.content.append(enabledRow, enabledHint, durationRow, presets, expiryHint, titleField.root, descriptionField.root, featuresField.root, badgeField.root,
+      el('p', 'field-hint', 'В Mini App пробная подписка не показывается: её выдаёт страница приглашения по реферальной ссылке.'));
+    const composition = section('tr-composition', 'Состав', 'Построитель и источники');
+    const builderBody = el('div', 'trial-builder');
+    composition.content.append(builderField.root, builderBody);
+    const countries = section('tr-countries', 'Страны', 'Страны и серверы');
+    const countriesBody = el('div', 'trial-countries');
+    countries.content.append(countriesBody, compositionError);
+    const limitsSection = section('tr-limits', 'Ограничения', 'Правила выдачи');
+    const rulesList = el('ul', 'trial-facts');
+    for (const text of TRIAL_RULE_FACTS) rulesList.append(el('li', '', text));
+    limitsSection.content.append(rateField.root, el('p', 'preview-caption', 'Действующие правила (не настраиваются)'), rulesList);
+    const extra = section('tr-extra', 'Дополнительно', 'Заголовки подписки и история');
+    const extraBody = el('div', 'trial-extra');
+    extra.content.append(extraBody);
+
+    const nav = el('nav', 'chips trial-nav');
+    nav.setAttribute('aria-label', 'Разделы пробной подписки');
+    for (const [panel, label] of [[basics.panel, 'Основные'], [composition.panel, 'Состав'], [countries.panel, 'Страны'],
+      [limitsSection.panel, 'Ограничения'], [extra.panel, 'Дополнительно']] as const) {
+      const jump = button(label, 'chip');
+      jump.addEventListener('click', () => {
+        panel.scrollIntoView({ block: 'start' });
+        const heading = panel.querySelector<HTMLElement>('.panel-title');
+        if (heading) { heading.tabIndex = -1; heading.focus(); }
+      });
+      nav.append(jump);
+    }
+
+    const dirtyNote = el('p', 'unsaved-text');
+    dirtyNote.setAttribute('aria-live', 'polite');
+    const reset = button('Отменить изменения', 'btn btn-secondary');
+    const save = button('Сохранить', 'btn btn-primary');
+    save.type = 'submit';
+    const actionBar = el('div', 'panel editor-actions');
+    actionBar.append(dirtyNote, reset, save);
+
+    const formEl = el('form', 'editor-main');
+    formEl.noValidate = true;
+    formEl.setAttribute('aria-label', 'Параметры пробной подписки');
+    formEl.append(nav, statusSlot, basics.panel, composition.panel, countries.panel, limitsSection.panel, extra.panel, actionBar);
+
+    const previewPanel = el('section', 'panel');
+    previewPanel.id = 'tr-preview';
+    previewPanel.setAttribute('aria-labelledby', 'tr-preview-title');
+    const previewBody = el('div', 'tariff-preview trial-preview');
+    previewBody.setAttribute('aria-live', 'polite');
+    previewPanel.append(panelHead('tr-preview-title', 'Предпросмотр', 'Что получит новая пробная подписка'), previewBody);
+    const side = el('div', 'editor-side');
+    side.append(previewPanel);
+    const grid = el('div', 'editor-grid');
+    grid.append(formEl, side);
+    view.body.replaceChildren(grid);
+
+    // Painters ----------------------------------------------------------------
+    const paintHeading = () => {
+      const s = base.settings;
+      view.desc.textContent = s.stored
+        ? `${TRIAL_DESC} Версия ${s.version}${s.updated_at ? `, изменено ${formatDateTime(s.updated_at)}` : ''}.`
+        : `${TRIAL_DESC} Сейчас действуют значения из окружения сервера.`;
+    };
+
+    const paintExpiry = () => {
+      const hours = durationHours(form);
+      expiryHint.textContent = Number.isInteger(hours) && hours >= TRIAL_LIMITS.minHours && hours <= TRIAL_LIMITS.maxHours
+        ? `${trialDurationLabel(hours)}. Выданная сейчас подписка истечёт ${formatDateTime(new Date(Date.now() + hours * HOUR_MS).toISOString())}. Уже выданные сохраняют свой срок.`
+        : `От ${hoursLabel(TRIAL_LIMITS.minHours)} до ${hoursLabel(TRIAL_LIMITS.maxHours)} (7 дней).`;
+      for (const chip of presets.querySelectorAll<HTMLButtonElement>('.chip')) {
+        chip.setAttribute('aria-pressed', String(Number(chip.dataset.hours) === hours));
+      }
+    };
+
+    const ensureCatalogue = (sourceId: number) => {
+      if (catalogue.has(sourceId)) return;
+      catalogue.set(sourceId, 'loading');
+      this.api.listSourceEntries(sourceId).then(entries => {
+        if (!isCurrent()) return;
+        catalogue.set(sourceId, entries);
+        paintCountries();
+      }, (error: unknown) => {
+        if (!isCurrent()) return;
+        catalogue.set(sourceId, 'error');
+        paintCountries();
+        void this.endIfSignedOut(error, isCurrent);
+      });
+    };
+
+    const paintBuilder = () => {
+      const summary = summaryOf(form.builderId);
+      const busy = saving || builderLoading;
+      builderSelect.disabled = busy;
+      const nodes: HTMLElement[] = [];
+      if (form.builderId === null) {
+        nodes.push(el('p', 'field-hint', `Без построителя подписка собирается из узлов тарифа «trial» (сейчас ${formatCount(base.preview.legacy_nodes)}). Страны и серверы при этом не настраиваются.`));
+        builderBody.replaceChildren(...nodes);
+        return;
+      }
+      if (!summary) {
+        builderBody.replaceChildren(notice({ tone: 'error', text: 'Построитель не найден: возможно, его удалили. Выберите другой.' }));
+        return;
+      }
+      const facts = el('dl', 'facts facts-single');
+      const usage = [
+        summary.usage.plans.length ? `тарифы: ${summary.usage.plans.join(', ')}` : '',
+        summary.usage.subscriptions ? `подписок с переопределением: ${formatCount(summary.usage.subscriptions)}` : '',
+      ].filter(Boolean).join('; ');
+      facts.append(
+        fact('Состояние', enabledBadge(summary.enabled), summary.enabled ? undefined : 'Новые пробные подписки не выдаются, пока построитель отключён.', 'is-danger'),
+        fact('Сейчас выдаёт', `${serversLabel(summary.total)}, ${countriesLabel(summary.countries)}`, 'По сохранённым правилам построителя.'),
+        fact('Источники', summary.source_ids.map(sourceName).join(', ') || 'Не выбраны'),
+        fact('Используется', usage || 'Только пробной подпиской'),
+      );
+      nodes.push(facts);
+      if (summary.shared) {
+        const copy = button('Создать копию для пробной подписки', 'btn btn-secondary btn-sm', 'plus');
+        copy.disabled = busy;
+        copy.addEventListener('click', () => void copyBuilder(summary));
+        nodes.push(noticeWithActions({
+          tone: 'info',
+          text: 'Этот построитель используют другие тарифы или подписки. Пробная подписка может использовать его как есть; изменить страны и серверы только для неё можно в копии — исходный построитель и платные тарифы не изменятся.',
+        }, [copy]));
+      } else if (summary.disabled_rules > 0) {
+        nodes.push(el('p', 'field-hint', `У построителя есть отключённые правила (${formatCount(summary.disabled_rules)}): при сохранении изменённого состава они будут удалены.`));
+      }
+      if (builderLoading) {
+        nodes.push(el('p', 'field-hint', 'Загружаем правила построителя…'));
+      } else if (editable()) {
+        const list = el('div', 'trial-source-pick');
+        list.setAttribute('role', 'group');
+        list.setAttribute('aria-label', 'Источники построителя');
+        list.append(el('p', 'preview-caption', 'Источники состава'));
+        if (!sources.length) list.append(el('p', 'field-hint', 'Источников нет: добавьте их в разделе «Источники».'));
+        for (const src of sources) {
+          const row = el('label', 'toggle trial-source-row');
+          const box = el('input');
+          box.type = 'checkbox';
+          box.checked = form.sourceIds.includes(src.id);
+          box.disabled = busy;
+          box.addEventListener('change', () => {
+            form.sourceIds = box.checked ? [...form.sourceIds, src.id] : form.sourceIds.filter(id => id !== src.id);
+            form.rules = rulesForSources(form.rules, form.sourceIds);
+            onCompositionChange();
+          });
+          row.append(box, el('span', '', src.name), el('span', 'slot-status', `${catalogueSummary(src.catalogue)}${src.enabled ? '' : ' · отключён'}`));
+          list.append(row);
+        }
+        nodes.push(list);
+      }
+      builderBody.replaceChildren(...nodes);
+    };
+
+    const paintCountries = () => {
+      const nodes: HTMLElement[] = [];
+      const summary = summaryOf(form.builderId);
+      if (form.builderId === null || !summary) {
+        countriesBody.replaceChildren(el('p', 'field-hint', 'Выберите построитель в разделе «Состав», чтобы настроить страны и серверы.'));
+        return;
+      }
+      if (builderLoading) {
+        countriesBody.replaceChildren(el('p', 'field-hint', 'Загружаем правила построителя…'));
+        return;
+      }
+      const canEdit = editable() && !saving;
+      const modes = el('div', 'trial-modes');
+      modes.setAttribute('role', 'radiogroup');
+      modes.setAttribute('aria-label', 'Какие страны входят');
+      for (const [value, label] of [['all', 'Все страны выбранных источников — новые страны и серверы добавляются автоматически'],
+        ['selected', 'Только выбранные страны и серверы']] as const) {
+        const row = el('label', 'toggle');
+        const radio = el('input');
+        radio.type = 'radio';
+        radio.name = 'tr-mode';
+        radio.value = value;
+        radio.checked = form.mode === value;
+        radio.disabled = !canEdit;
+        radio.addEventListener('change', () => {
+          if (!radio.checked) return;
+          if (value === 'all') { parkedRules = form.rules; form.rules = []; } else { form.rules = rulesForSources(parkedRules, form.sourceIds); }
+          form.mode = value;
+          onCompositionChange();
+        });
+        row.append(radio, el('span', '', label));
+        modes.append(row);
+      }
+      nodes.push(modes);
+      if (!editable()) {
+        nodes.push(el('p', 'field-hint', 'Только просмотр: состав общего построителя меняется в разделе «Построители» или в копии для пробной подписки.'));
+      }
+
+      if (form.mode === 'all') {
+        nodes.push(el('p', 'field-hint', 'Подписка получит все серверы всех выбранных источников в порядке источников. Отдельные страны исключить в этом режиме нельзя.'));
+        countriesBody.replaceChildren(...nodes);
+        return;
+      }
+
+      for (const sourceId of form.sourceIds) {
+        ensureCatalogue(sourceId);
+        const block = el('div', 'trial-source');
+        block.append(el('p', 'preview-caption', sourceName(sourceId)));
+        const entries = catalogue.get(sourceId);
+        if (entries === 'loading' || entries === undefined) {
+          block.append(el('p', 'field-hint', 'Загружаем каталог источника…'));
+        } else if (entries === 'error') {
+          const retry = button('Повторить', 'btn btn-secondary btn-sm');
+          retry.addEventListener('click', () => { catalogue.delete(sourceId); paintCountries(); });
+          block.append(noticeWithActions({ tone: 'error', text: 'Не удалось загрузить каталог источника.' }, [retry]));
+        } else {
+          const groups = groupByCountry(entries);
+          if (!groups.length) block.append(el('p', 'field-hint', 'Каталог пуст: синхронизируйте источник в разделе «Источники».'));
+          const list = el('ul', 'trial-country-list');
+          for (const group of groups) {
+            const key = `${sourceId}|${group.code}`;
+            const { state, nodes: picked } = countrySelection(form.rules, sourceId, group);
+            const item = el('li', 'trial-country');
+            const head = el('div', 'trial-country-head');
+            const box = el('input');
+            box.type = 'checkbox';
+            box.id = `tr-c-${sourceId}-${group.code || 'none'}`;
+            box.checked = state === 'country' || (state === 'nodes' && picked === group.entries.length);
+            box.indeterminate = state === 'nodes' && picked < group.entries.length;
+            box.disabled = !canEdit;
+            box.addEventListener('change', () => { form.rules = toggleCountry(form.rules, sourceId, group); onCompositionChange(); });
+            const label = el('label', 'trial-country-name', countryName(group.code));
+            label.htmlFor = box.id;
+            const meta = [serversLabel(group.entries.length)];
+            if (state === 'country') meta.push('вся страна, новые серверы — автоматически');
+            else if (state === 'nodes') meta.push(`выбрано ${formatCount(picked)}`);
+            if (!group.code) meta.push('выбирается по серверам');
+            const open = expanded.has(key);
+            const toggleNodes = button(open ? 'Скрыть серверы' : 'Серверы', 'btn btn-ghost btn-sm');
+            toggleNodes.setAttribute('aria-expanded', String(open));
+            toggleNodes.addEventListener('click', () => {
+              if (expanded.has(key)) expanded.delete(key); else expanded.add(key);
+              paintCountries();
+              countriesBody.querySelector<HTMLButtonElement>(`[data-expand='${CSS.escape(key)}']`)?.focus();
+            });
+            toggleNodes.dataset.expand = key;
+            head.append(box, label, el('span', 'slot-status', meta.join(' · ')), toggleNodes);
+            item.append(head);
+            if (open) {
+              const nodeList = el('ul', 'trial-node-list');
+              nodeList.setAttribute('aria-label', `Серверы: ${countryName(group.code)}`);
+              for (const entry of group.entries) {
+                const row = el('li', 'trial-node');
+                const nodeBox = el('input');
+                nodeBox.type = 'checkbox';
+                nodeBox.id = `tr-n-${sourceId}-${entry.id}`;
+                nodeBox.checked = nodeSelected(form.rules, sourceId, group, entry);
+                nodeBox.disabled = !canEdit;
+                nodeBox.addEventListener('change', () => { form.rules = toggleNode(form.rules, sourceId, group, entry); onCompositionChange(); });
+                const nodeLabel = el('label', 'trial-node-name', entry.original_name || shortFingerprint(entry.fingerprint));
+                nodeLabel.htmlFor = nodeBox.id;
+                row.append(nodeBox, nodeLabel, el('span', 'tag', entry.protocol || '—'), el('span', 'slot-status', sourceName(sourceId)));
+                nodeList.append(row);
+              }
+              item.append(nodeList);
+            }
+            list.append(item);
+          }
+          block.append(list);
+        }
+        nodes.push(block);
+      }
+
+      const order = el('div', 'trial-order');
+      order.append(el('p', 'preview-caption', 'Порядок в подписке'));
+      if (!form.rules.length) {
+        order.append(el('p', 'field-hint', 'Ничего не выбрано.'));
+      } else {
+        const list = el('ol', 'rule-list');
+        form.rules.forEach((rule, index) => {
+          const item = el('li', 'rule-item trial-rule');
+          const kind = el('span', `rule-kind ${rule.kind}`, rule.kind === 'country' ? 'Страна' : 'Сервер');
+          const bodyNode = el('div', 'rule-body');
+          bodyNode.append(el('span', 'slot-name', rule.kind === 'country' ? countryName(rule.country_code) : rule.original_name || shortFingerprint(rule.fingerprint)),
+            el('span', 'slot-status', sourceName(rule.source_id)));
+          const moves = el('div', 'tariff-actions');
+          const up = iconButton('up', 'Выше');
+          up.disabled = !canEdit || index === 0;
+          up.addEventListener('click', () => { form.rules = moveRule(form.rules, index, -1); onCompositionChange(); });
+          const down = iconButton('chevron', 'Ниже');
+          down.disabled = !canEdit || index === form.rules.length - 1;
+          down.addEventListener('click', () => { form.rules = moveRule(form.rules, index, 1); onCompositionChange(); });
+          moves.append(up, down);
+          item.append(kind, bodyNode, moves);
+          list.append(item);
+        });
+        order.append(list);
+      }
+      nodes.push(order);
+      countriesBody.replaceChildren(...nodes);
+    };
+
+    const paintExtra = () => {
+      const summary = summaryOf(form.builderId);
+      const facts = el('dl', 'facts facts-single');
+      facts.append(
+        fact('Profile title', summary ? summary.profile_title || 'Не задан' : '—', 'Заголовок подписки в клиенте берётся из построителя.'),
+        fact('Support URL', summary ? summary.support_url || 'Не задан' : '—'),
+        fact('Пробных без привязки', formatCount(base.active_trials), 'Активные анонимные пробные подписки.'),
+      );
+      const link = el('a', 'btn btn-secondary btn-sm', 'Открыть «Построители»');
+      link.href = '#/builders';
+      const foot = el('div', 'panel-foot');
+      foot.append(link);
+      const history = el('div', 'trial-history');
+      history.append(el('p', 'preview-caption', 'История изменений'));
+      if (!base.history.length) {
+        history.append(el('p', 'field-hint', 'Изменений ещё не было.'));
+      } else {
+        const list = el('ul', 'trial-facts');
+        for (const entry of base.history) {
+          list.append(el('li', '', `${TRIAL_ACTIONS[entry.action] ?? entry.action} · ${entry.actor} · ${formatDateTime(entry.created_at)}`));
+        }
+        history.append(list);
+      }
+      extraBody.replaceChildren(facts, foot, history);
+    };
+
+    type PreviewState = { kind: 'data'; preview: TrialPreview } | { kind: 'busy' } | { kind: 'invalid' } | { kind: 'error'; error: unknown };
+    let lastPreview: TrialPreview = base.preview;
+    const paintPreview = (state: PreviewState) => {
+      if (state.kind === 'busy') { previewBody.setAttribute('aria-busy', 'true'); return; }
+      previewBody.removeAttribute('aria-busy');
+      if (state.kind === 'invalid') {
+        previewBody.replaceChildren(notice({ tone: 'info', text: 'Исправьте ошибки в полях — предпросмотр обновится.' }));
+        return;
+      }
+      if (state.kind === 'error') {
+        previewBody.replaceChildren(notice({ tone: 'error', text: `Не удалось получить предпросмотр. ${errorText(state.error)}` }));
+        return;
+      }
+      const p = state.preview;
+      lastPreview = p;
+      const nodes: HTMLElement[] = [];
+      if (p.problems.length) {
+        const status = notice({ tone: 'error', text: form.enabled ? 'С такой конфигурацией пробная подписка не выдаётся.' : 'Конфигурация неполная: включить пробную подписку с ней нельзя.' });
+        status.dataset.preview = 'blocked';
+        nodes.push(status);
+        const list = el('ul', 'trial-facts trial-problems');
+        for (const problem of p.problems) list.append(el('li', '', problemText(problem)));
+        nodes.push(list);
+      } else if (!form.enabled) {
+        const status = notice({ tone: 'info', text: 'Выдача выключена. Конфигурация корректна: после включения подписки будут выдаваться с этим составом.' });
+        status.dataset.preview = 'off';
+        nodes.push(status);
+      } else {
+        const status = notice({ tone: 'success', text: 'Новая пробная подписка будет выдана с этим составом.' });
+        status.dataset.preview = 'ok';
+        nodes.push(status);
+      }
+      const facts = el('dl', 'facts facts-single');
+      facts.append(
+        fact('Срок', p.duration_hours ? trialDurationLabel(p.duration_hours) : '—',
+          p.duration_hours ? `Выданная сейчас истечёт ${formatDateTime(p.expires_at)}` : undefined),
+        fact('Построитель', p.builder ? p.builder.name : 'Узлы тарифа «trial»', p.builder && !p.builder.enabled ? 'Отключён' : undefined, 'is-danger'),
+        fact('Серверов', p.serve === 'builder' ? formatCount(p.total) : 'По узлам тарифа'),
+        fact('Стран', p.serve === 'builder' ? formatCount(p.countries.length) : '—',
+          p.countries.length ? p.countries.map(c => `${c.code || 'без страны'} ${formatCount(c.count)}`).join(' · ') : undefined),
+        fact('Profile title', p.builder?.profile_title || 'Не задан'),
+        fact('Support URL', p.builder?.support_url || 'Не задан'),
+      );
+      nodes.push(facts);
+      const served = p.items.filter(item => item.entry);
+      if (served.length) {
+        nodes.push(el('p', 'preview-caption', 'Пример состава'));
+        const list = el('ol', 'trial-facts trial-sample');
+        for (const item of served.slice(0, TRIAL_SAMPLE)) list.append(el('li', '', `${item.display_name} · ${sourceName(item.source_id)}`));
+        nodes.push(list);
+        if (served.length > TRIAL_SAMPLE) nodes.push(el('p', 'field-hint', `И ещё ${serversLabel(served.length - TRIAL_SAMPLE)}.`));
+      }
+      if (p.warnings.length || p.missing) {
+        nodes.push(el('p', 'field-hint', `Предупреждений: ${formatCount(p.warnings.length)}${p.missing ? `, не найдено серверов: ${formatCount(p.missing)}` : ''}. Недоступные источники и серверы пропускаются, как в выдаче.`));
+      }
+      previewBody.replaceChildren(...nodes);
+    };
+
+    let previewTimer = 0;
+    let previewRequest = 0;
+    const runPreview = async () => {
+      const { draft } = validateTrialForm(form, storedFor(), editable());
+      if (!draft) { paintPreview({ kind: 'invalid' }); return; }
+      const request = ++previewRequest;
+      paintPreview({ kind: 'busy' });
+      try {
+        const p = await this.api.previewTrial(draft);
+        if (!isCurrent() || request !== previewRequest) return;
+        paintPreview({ kind: 'data', preview: p });
+      } catch (error) {
+        if (!isCurrent() || request !== previewRequest) return;
+        if (await this.endIfSignedOut(error, isCurrent)) return;
+        paintPreview({ kind: 'error', error });
+      }
+    };
+    const schedulePreview = () => {
+      window.clearTimeout(previewTimer);
+      previewTimer = window.setTimeout(() => { if (isCurrent()) void runPreview(); }, TRIAL_PREVIEW_DEBOUNCE_MS);
+    };
+
+    const paintActions = () => {
+      const changed = dirty();
+      dirtyNote.textContent = saving ? 'Сохраняем…' : changed ? 'Есть несохранённые изменения.' : 'Изменений нет.';
+      dirtyNote.classList.toggle('is-dirty', changed);
+      save.disabled = saving || !changed;
+      reset.disabled = saving || !changed;
+      setLabel(save, saving ? 'Сохраняем…' : 'Сохранить');
+      if (saving) save.setAttribute('aria-busy', 'true'); else save.removeAttribute('aria-busy');
+      for (const control of [enabled, duration, unit, rate, titleInput, description, features, badge]) control.disabled = saving;
+    };
+
+    const refreshAll = () => {
+      paintHeading();
+      paintExpiry();
+      paintBuilder();
+      paintCountries();
+      paintExtra();
+      paintActions();
+    };
+    const onInput = () => {
+      read();
+      paintExpiry();
+      paintActions();
+      schedulePreview();
+    };
+    const onCompositionChange = () => {
+      compositionError.textContent = '';
+      paintBuilder();
+      paintCountries();
+      paintActions();
+      schedulePreview();
+    };
+
+    const chooseBuilder = async (id: number | null) => {
+      setters.get('builderId')?.('');
+      if (id === null) {
+        form = withComposition(form, null, null);
+        refreshAll();
+        schedulePreview();
+        return;
+      }
+      let c = stored.get(id) ?? null;
+      if (!c) {
+        builderLoading = true;
+        refreshAll();
+        try {
+          const b = await this.api.getBuilder(id);
+          c = compositionFromBuilder(b.version, (b.sources ?? []).map(s => s.source_id), b.items ?? []);
+          stored.set(id, c);
+        } catch (error) {
+          builderLoading = false;
+          if (!isCurrent()) return;
+          if (await this.endIfSignedOut(error, isCurrent)) return;
+          builderSelect.value = form.builderId === null ? '' : String(form.builderId);
+          refreshAll();
+          showStatus({ tone: 'error', text: `Не удалось загрузить построитель. ${errorText(error)}` });
+          return;
+        }
+        builderLoading = false;
+        if (!isCurrent()) return;
+      }
+      parkedRules = [];
+      form = withComposition(form, id, c);
+      refreshAll();
+      schedulePreview();
+    };
+
+    const copyBuilder = async (summary: TrialBuilderSummary) => {
+      if (saving) return;
+      const ok = await this.confirmAction('Создать копию построителя?',
+        `Будет создан построитель «${summary.name} · пробная» с теми же источниками и правилами и назначен пробной подписке. ` +
+        `Тарифы и подписки, которые используют «${summary.name}», не изменятся.`, 'Создать копию');
+      if (!ok || !isCurrent()) return;
+      saving = true;
+      paintActions();
+      paintBuilder();
+      try {
+        const out = await this.api.copyTrialBuilder(summary.id, newRequestKey());
+        if (!isCurrent()) return;
+        saving = false;
+        base = out.trial;
+        stored.clear();
+        remember(base);
+        const fresh = formFromView(base);
+        const assigned = { builderId: fresh.builderId, mode: fresh.mode, sourceIds: fresh.sourceIds, rules: fresh.rules };
+        // The copy is saved and assigned already; edits of the other fields stay.
+        baseline = cloneTrialForm({ ...baseline, ...assigned });
+        form = cloneTrialForm({ ...form, ...assigned });
+        parkedRules = [];
+        fillBuilders();
+        write();
+        refreshAll();
+        schedulePreview();
+        showStatus({ tone: 'success', text: `Создан построитель «${summaryOf(out.target_id)?.name ?? `#${out.target_id}`}» и назначен пробной подписке.` });
+      } catch (error) {
+        if (!isCurrent()) return;
+        saving = false;
+        refreshAll();
+        if (await this.endIfSignedOut(error, isCurrent)) return;
+        showStatus({ tone: 'error', text: `Не удалось создать копию. ${trialErrorText(error)}` });
+      }
+    };
+
+    const submit = async () => {
+      if (saving) return;
+      read();
+      clearErrors();
+      const { draft, errors } = validateTrialForm(form, storedFor(), editable());
+      if (!draft) {
+        showErrors(errors);
+        return;
+      }
+      const payload = JSON.stringify([base.settings.version, draft]);
+      const key = pending?.payload === payload ? pending.key : newRequestKey();
+      pending = { payload, key };
+      saving = true;
+      showStatus(null);
+      refreshAll();
+      try {
+        const out = await this.api.saveTrial(draft, base.settings.version, key);
+        if (!isCurrent()) return;
+        pending = null;
+        saving = false;
+        base = out.trial;
+        stored.clear();
+        remember(base);
+        baseline = formFromView(base);
+        form = cloneTrialForm(baseline);
+        parkedRules = [];
+        fillBuilders();
+        write();
+        refreshAll();
+        paintPreview({ kind: 'data', preview: base.preview });
+        showStatus({ tone: 'success', text: out.replayed ? 'Эти изменения уже были сохранены.' : 'Пробная подписка сохранена.' });
+      } catch (error) {
+        if (!isCurrent()) return;
+        saving = false;
+        refreshAll();
+        if (await this.endIfSignedOut(error, isCurrent)) return;
+        // A definite rejection is never retried with the same key.
+        if (error instanceof ApiError && error.status >= 400 && error.status < 500) pending = null;
+        if (error instanceof ApiError && error.code === 'invalid_trial') {
+          const fieldKey = TRIAL_SERVER_FIELDS[error.field] ?? 'composition';
+          showErrors({ [fieldKey]: problemText({ code: error.reason }) });
+          showStatus({ tone: 'error', text: `Сервер не сохранил настройки: ${problemText({ code: error.reason })}` });
+          return;
+        }
+        if (error instanceof ApiError && (error.code === 'version_conflict' || error.code === 'builder_version_conflict')) {
+          const reload = button('Загрузить актуальную версию', 'btn btn-secondary btn-sm');
+          reload.addEventListener('click', () => { this.unsavedChanges = null; void this.loadTrialEditor(); });
+          showStatus({ tone: 'error', text: `${trialErrorText(error)} Загрузите актуальную версию: несохранённые изменения будут потеряны.` }, [reload]);
+          return;
+        }
+        showStatus({ tone: 'error', text: `Не удалось сохранить. ${trialErrorText(error)}` });
+      }
+    };
+
+    // Wiring ------------------------------------------------------------------
+    for (const control of [duration, rate, titleInput, description, features, badge]) {
+      control.addEventListener('input', () => {
+        const key = ([['duration', duration], ['rateLimit', rate], ['title', titleInput], ['description', description], ['features', features], ['badge', badge]] as const)
+          .find(([, node]) => node === control)?.[0];
+        if (key) setters.get(key)?.('');
+        onInput();
+      });
+    }
+    enabled.addEventListener('change', onInput);
+    unit.addEventListener('change', onInput);
+    builderSelect.addEventListener('change', () => void chooseBuilder(builderSelect.value === '' ? null : Number(builderSelect.value)));
+    reset.addEventListener('click', () => {
+      form = cloneTrialForm(baseline);
+      parkedRules = [];
+      pending = null;
+      clearErrors();
+      showStatus(null);
+      write();
+      refreshAll();
+      paintPreview({ kind: 'data', preview: base.preview });
+    });
+    formEl.addEventListener('submit', event => { event.preventDefault(); void submit(); });
+
+    write();
+    refreshAll();
+    paintPreview({ kind: 'data', preview: lastPreview });
+  }
+
   /** A modal yes/no confirmation; resolves false when dismissed in any way. */
   private confirmAction(titleText: string, text: string, confirmLabel: string): Promise<boolean> {
     return new Promise(resolve => {
@@ -6695,6 +7542,61 @@ class AdminApp {
       cancel.focus();
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Trial helpers
+
+const TRIAL_DESC = 'Как выдаётся пробная подписка по реферальной ссылке: срок, состав, страны и серверы, ограничения и карточка на странице приглашения.';
+const TRIAL_FIELD_ORDER: readonly TrialField[] = ['duration', 'title', 'description', 'features', 'badge', 'builderId', 'composition', 'rateLimit'];
+const TRIAL_SAMPLE = 8;
+const TRIAL_PREVIEW_DEBOUNCE_MS = 350;
+
+/** The rules the trial already follows (internal/web handleInvite, BindTrial, cleanup). */
+const TRIAL_RULE_FACTS: readonly string[] = [
+  'Выдаётся только по реферальной ссылке /i/<код>; в Mini App и боте не продаётся.',
+  'Повторный заход по той же ссылке в том же браузере показывает уже выданную подписку (cookie на срок пробной).',
+  'Активировать в Telegram нельзя, если у пользователя уже есть активная подписка.',
+  'После истечения или отзыва своей подписки пользователь может активировать новую пробную.',
+  'После активации в Telegram пробная становится бессрочной бесплатной подпиской (тариф free).',
+  'Неактивированная пробная подписка отключается и удаляется после своего срока (проверка каждые 3 часа).',
+  'Ограничения «одна пробная на Telegram-аккаунт» нет: пробная анонимна до активации.',
+];
+
+const TRIAL_ACTIONS: Readonly<Record<string, string>> = {
+  trial_updated: 'Настройки сохранены',
+  trial_builder_copied: 'Создана копия построителя',
+};
+
+const TRIAL_REJECTIONS: Readonly<Record<string, string>> = {
+  version_conflict: 'Настройки пробной подписки изменили в другом окне.',
+  builder_version_conflict: 'Построитель изменили в другом окне.',
+  builder_name_taken: 'Имя копии построителя уже занято.',
+  request_key_conflict: 'Запрос конфликтует с ранее отправленным.',
+  invalid_request: 'Сервер отклонил параметры запроса.',
+};
+
+function trialErrorText(error: unknown): string {
+  if (!(error instanceof ApiError)) return errorText(error);
+  if (error.code === 'invalid_trial' || error.code === 'builder_shared') return problemText({ code: error.reason || error.code });
+  return TRIAL_REJECTIONS[error.code] ?? errorText(error);
+}
+
+const cloneTrialForm = (form: TrialForm): TrialForm => JSON.parse(JSON.stringify(form)) as TrialForm;
+
+/** Entry of the trial editor on the Tariffs page (no request of its own). */
+function trialEntryPanel(): HTMLElement {
+  const panel = el('section', 'panel trial-entry');
+  panel.setAttribute('aria-labelledby', 'trial-entry-title');
+  panel.append(panelHead('trial-entry-title', 'Пробная подписка', 'Выдаётся по реферальной ссылке'),
+    el('p', 'panel-note', 'Срок, построитель и источники, страны и конкретные серверы, ограничения выдачи и карточка на странице приглашения. Платные тарифы и их построители не меняются.'));
+  const link = el('a', 'btn btn-secondary btn-sm');
+  link.href = '#/tariffs/trial';
+  link.append(el('span', 'btn-label', 'Настроить пробную подписку'));
+  const foot = el('div', 'panel-foot');
+  foot.append(link);
+  panel.append(foot);
+  return panel;
 }
 
 // ---------------------------------------------------------------------------

@@ -102,6 +102,15 @@ func (s *Service) PreviewBuilder(ctx context.Context, builderID uint) (*PreviewB
 		return nil, err
 	}
 
+	return s.previewBuilderModel(ctx, b)
+}
+
+// previewBuilderModel is the PreviewBuilder resolver over an in-memory builder
+// (its Sources and Items). The trial editor previews an unsaved composition
+// through it, so the draft, the saved builder and the trial issuance check all
+// resolve with exactly the same rules.
+func (s *Service) previewBuilderModel(ctx context.Context, b *SubscriptionBuilder) (*PreviewBuilderResult, error) {
+	builderID := b.ID
 	result := &PreviewBuilderResult{
 		BuilderID:   builderID,
 		PreviewedAt: time.Now().UTC(),

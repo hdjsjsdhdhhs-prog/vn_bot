@@ -12,6 +12,8 @@ export class ApiError extends Error {
     readonly retryAfter = 0,
     /** Offending input field named by the server (tariff editor: invalid_tariff). */
     readonly field = '',
+    /** Stable rejection reason (trial editor: invalid_trial, builder_shared). */
+    readonly reason = '',
   ) {
     super(code);
     this.name = 'ApiError';
@@ -524,8 +526,9 @@ export class AdminApi {
       const data: unknown = await response.json().catch(() => undefined);
       if (!response.ok) {
         const retryAfter = response.status === 429 ? retryAfterSeconds(response) : 0;
-        const field = isRecord(data) && typeof data.field === 'string' && /^[a-z_]{1,40}$/.test(data.field) ? data.field : '';
-        throw new ApiError(errorCode(data, response.status), response.status, retryAfter, field);
+        const field = isRecord(data) && typeof data.field === 'string' && /^[a-z_.]{1,40}$/.test(data.field) ? data.field : '';
+        const reason = isRecord(data) && typeof data.reason === 'string' && /^[a-z_]{1,40}$/.test(data.reason) ? data.reason : '';
+        throw new ApiError(errorCode(data, response.status), response.status, retryAfter, field, reason);
       }
       return data;
     } catch (error) {
@@ -762,6 +765,211 @@ export class AdminApi {
     return { tariff, previous, versioned: data.versioned, replayed: data.replayed };
   }
 
+  // ---------------------------------------------------------------------------
+  // Trial (web.adminAPI.routeTrial → service.TrialService). Same request_key
+  // contract as the tariffs. Rejections: 400 invalid_trial (+field, reason) |
+  // invalid_request, 409 version_conflict | builder_version_conflict |
+  // builder_shared | request_key_conflict.
+  // ---------------------------------------------------------------------------
+
+  /** GET /admin/api/trial: settings in force, builders, composition, preview. */
+  async getTrial(): Promise<TrialView> {
+    return parseTrialView(await this.#send('GET', '/admin/api/trial'));
+  }
+
+  /** POST /admin/api/trial/preview: evaluates an unsaved draft (nothing is written). */
+  async previewTrial(draft: TrialDraft): Promise<TrialPreview> {
+    const data = await this.#send('POST', '/admin/api/trial/preview', JSON.stringify(draft));
+    if (!isTrialPreview(data)) throw new ApiError('invalid_response');
+    return data;
+  }
+
+  /** PUT /admin/api/trial; version is the settings version loaded (0 when nothing is stored). */
+  async saveTrial(draft: TrialDraft, version: number, requestKey: string): Promise<TrialOutcome> {
+    const data = await this.#send('PUT', '/admin/api/trial', JSON.stringify({ request_key: requestKey, version, ...draft }));
+    return parseTrialOutcome(data);
+  }
+
+  /** POST /admin/api/trial/builder-copy: copies a builder and assigns the copy to the trial. */
+  async copyTrialBuilder(builderId: number, requestKey: string): Promise<TrialOutcome> {
+    const data = await this.#send('POST', '/admin/api/trial/builder-copy', JSON.stringify({ request_key: requestKey, builder_id: builderId }));
+    return parseTrialOutcome(data);
+  }
+
+}
+
+// =============================================================================
+// Trial types (database.TrialAdminView and friends)
+// =============================================================================
+
+export type TrialMode = 'all' | 'selected';
+export type TrialRuleKind = 'country' | 'node';
+
+/** database.TrialEffective. */
+export interface TrialSettings {
+  readonly enabled: boolean;
+  readonly duration_hours: number;
+  readonly rate_limit_per_hour: number;
+  readonly title: string;
+  readonly description: string;
+  readonly features: readonly string[];
+  readonly badge: string;
+  /** 0 while nothing is stored (the environment values apply). */
+  readonly version: number;
+  readonly stored: boolean;
+  readonly updated_at: string | null;
+}
+
+/** database.TrialRule: a whole country of a source, or one node. */
+export interface TrialRule {
+  readonly kind: TrialRuleKind;
+  readonly source_id: number;
+  readonly country_code: string;
+  readonly fingerprint: string;
+  readonly original_name: string;
+}
+
+export interface TrialComposition {
+  readonly builder_version: number;
+  readonly mode: TrialMode;
+  readonly source_ids: readonly number[];
+  readonly rules: readonly TrialRule[];
+}
+
+export interface TrialProblem {
+  readonly field: string;
+  readonly code: string;
+  /** invalid: never saved; unavailable: saved only with the trial switched off. */
+  readonly severity: 'invalid' | 'unavailable';
+}
+
+export interface TrialBuilderRef {
+  readonly id: number;
+  readonly name: string;
+  readonly enabled: boolean;
+  readonly profile_title: string;
+  readonly support_url: string;
+  readonly announce: string;
+  readonly version: number;
+}
+
+export interface TrialBuilderSummary extends TrialBuilderRef {
+  readonly source_ids: readonly number[];
+  readonly rules: number;
+  readonly disabled_rules: number;
+  readonly total: number;
+  readonly countries: number;
+  readonly usage: { readonly plans: readonly string[]; readonly subscriptions: number; readonly trial_plan: boolean };
+  /** Used by another plan or a subscription override: composition is read-only here. */
+  readonly shared: boolean;
+  readonly assigned_to_trial: boolean;
+}
+
+export interface TrialPreviewItem {
+  readonly kind: string;
+  readonly source_id: number;
+  readonly display_name: string;
+  readonly status: string;
+  readonly entry?: SourceEntry;
+}
+
+export interface TrialPreview {
+  readonly issuable: boolean;
+  readonly enabled: boolean;
+  readonly problems: readonly TrialProblem[];
+  /** builder | legacy (trial plan nodes, no builder). */
+  readonly serve: string;
+  readonly duration_hours: number;
+  readonly expires_at: string;
+  readonly builder: TrialBuilderRef | null;
+  readonly mode: string;
+  readonly sources: readonly { readonly id: number; readonly name: string; readonly enabled: boolean; readonly usable: boolean }[];
+  readonly legacy_nodes: number;
+  readonly total: number;
+  readonly countries: readonly { readonly code: string; readonly count: number }[];
+  readonly items: readonly TrialPreviewItem[];
+  readonly warnings: readonly string[];
+  readonly missing: number;
+  readonly conflicts: number;
+}
+
+export interface TrialHistoryEntry {
+  readonly id: number;
+  readonly actor: string;
+  readonly action: string;
+  readonly created_at: string;
+}
+
+export interface TrialView {
+  readonly settings: TrialSettings;
+  readonly defaults: { readonly duration_hours: number; readonly rate_limit_per_hour: number };
+  readonly plan_id: number;
+  readonly builder_id: number | null;
+  readonly composition: TrialComposition | null;
+  readonly builders: readonly TrialBuilderSummary[];
+  readonly preview: TrialPreview;
+  readonly active_trials: number;
+  readonly history: readonly TrialHistoryEntry[];
+}
+
+/** PUT/preview body (web.trialDraftBody); composition null keeps the builder's rules. */
+export interface TrialDraft {
+  enabled: boolean;
+  duration_hours: number;
+  rate_limit_per_hour: number;
+  title: string;
+  description: string;
+  features: string[];
+  badge: string;
+  builder_id: number | null;
+  composition: { builder_version: number; mode: TrialMode; source_ids: number[]; rules: TrialRule[] } | null;
+}
+
+export interface TrialOutcome {
+  readonly trial: TrialView;
+  readonly target_id: number;
+  readonly replayed: boolean;
+}
+
+const isTextList = (v: unknown): v is string[] => Array.isArray(v) && v.every(item => typeof item === 'string');
+
+function isTrialSettings(v: unknown): v is TrialSettings {
+  return isRecord(v) && typeof v.enabled === 'boolean' && isCount(v.duration_hours) && isCount(v.rate_limit_per_hour) &&
+    typeof v.title === 'string' && typeof v.description === 'string' && isTextList(v.features) && typeof v.badge === 'string' &&
+    isCount(v.version) && typeof v.stored === 'boolean' && (v.updated_at === null || typeof v.updated_at === 'string');
+}
+
+function isTrialRule(v: unknown): v is TrialRule {
+  return isRecord(v) && (v.kind === 'country' || v.kind === 'node') && isCount(v.source_id) && typeof v.country_code === 'string' &&
+    typeof v.fingerprint === 'string' && typeof v.original_name === 'string';
+}
+
+function isTrialComposition(v: unknown): v is TrialComposition {
+  return isRecord(v) && isCount(v.builder_version) && (v.mode === 'all' || v.mode === 'selected') &&
+    Array.isArray(v.source_ids) && v.source_ids.every(isCount) && Array.isArray(v.rules) && v.rules.every(isTrialRule);
+}
+
+function isTrialPreview(v: unknown): v is TrialPreview {
+  return isRecord(v) && typeof v.issuable === 'boolean' && Array.isArray(v.problems) &&
+    v.problems.every(p => isRecord(p) && typeof p.field === 'string' && typeof p.code === 'string' && typeof p.severity === 'string') &&
+    typeof v.serve === 'string' && isCount(v.duration_hours) && isCount(v.total) && isCount(v.legacy_nodes) &&
+    Array.isArray(v.countries) && Array.isArray(v.items) && Array.isArray(v.warnings) && Array.isArray(v.sources) &&
+    (v.builder === null || isRecord(v.builder));
+}
+
+function parseTrialView(v: unknown): TrialView {
+  if (!isRecord(v) || !isTrialSettings(v.settings) || !isRecord(v.defaults) || !isCount(v.plan_id) ||
+    !(v.builder_id === null || isCount(v.builder_id)) || !(v.composition === null || isTrialComposition(v.composition)) ||
+    !Array.isArray(v.builders) || !v.builders.every(b => isRecord(b) && isCount(b.id) && typeof b.name === 'string' && isRecord(b.usage)) ||
+    !isTrialPreview(v.preview) || !isCount(v.active_trials) || !Array.isArray(v.history)) {
+    throw new ApiError('invalid_response');
+  }
+  return v as unknown as TrialView;
+}
+
+function parseTrialOutcome(v: unknown): TrialOutcome {
+  if (!isRecord(v) || typeof v.replayed !== 'boolean' || !isCount(v.target_id)) throw new ApiError('invalid_response');
+  return { trial: parseTrialView(v.trial), target_id: v.target_id, replayed: v.replayed };
 }
 
 // =============================================================================

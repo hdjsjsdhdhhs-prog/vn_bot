@@ -18,6 +18,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -100,6 +101,7 @@ type Server struct {
 	adminService       *service.AdminService
 	builderService     *service.BuilderService
 	tariffService      *service.TariffService
+	trialService       *service.TrialService
 	networkMonitor     NetworkMonitor
 	paymentConfig      *PaymentConfig
 	subServer          *subserver.Service
@@ -173,6 +175,16 @@ func (s *Server) SetTariffService(tariffService *service.TariffService) {
 	defer s.mu.Unlock()
 
 	s.tariffService = tariffService
+}
+
+// SetTrialService wires the trial editor JSON API under /admin/api/trial.
+// Without it those (still session-protected) routes answer 503. Set before
+// Start.
+func (s *Server) SetTrialService(trialService *service.TrialService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.trialService = trialService
 }
 
 // SetNetworkMonitor wires the read-only monitor API under
@@ -264,7 +276,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cfg != nil {
 		actor = s.cfg.AdminUsername
 	}
-	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, s.tariffService, s.networkMonitor, actor))
+	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, s.tariffService, s.trialService, s.networkMonitor, actor))
 
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
@@ -980,11 +992,34 @@ func (s *Server) HandleInvite(w http.ResponseWriter, r *http.Request) {
 		logger.Info("Existing trial found via cookie", zap.String("sub_id", existingSub.SubscriptionID))
 		telegramLink := "https://t.me/" + s.effectiveBotUsername() + "?start=trial_" + existingSub.SubscriptionID
 
+		// An issued trial keeps being shown (and served) even if the trial was
+		// switched off meanwhile. Its term is its own expires_at, not the
+		// duration configured now.
+		offer := s.trialOffer(ctx)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 
 		subURL := s.cfg.SubURL(existingSub.Token)
-		s.renderTrialPage(w, existingSub.SubscriptionID, subURL, telegramLink, s.cfg.TrialDurationHours)
+		s.renderTrialPageIssued(w, existingSub.SubscriptionID, subURL, telegramLink, offer, existingSub.ExpiresAt)
+
+		return
+	}
+
+	// A switched-off or unusable trial configuration issues nothing and does
+	// not consume the visitor's IP quota.
+	offer, issueErr := s.trialIssuance(ctx)
+	if issueErr != nil {
+		if errors.Is(issueErr, database.ErrTrialDisabled) || errors.Is(issueErr, database.ErrTrialUnavailable) {
+			logger.Warn("Trial not issued", zap.String("code", code), zap.Error(issueErr))
+			s.renderTrialUnavailable(w)
+
+			return
+		}
+
+		logger.Error("Failed to check trial configuration", zap.Error(issueErr))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		s.renderErrorPage(w, "Ошибка сервера. Попробуйте позже.")
 
 		return
 	}
@@ -1006,7 +1041,7 @@ func (s *Server) HandleInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if count >= s.cfg.TrialRateLimit {
+	if count >= offer.RateLimitPerHour {
 		logger.Warn("Rate limit exceeded", zap.String("ip", ip), zap.Int("count", count))
 		s.trialRateMu.Unlock()
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1039,6 +1074,14 @@ func (s *Server) HandleInvite(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.subService.CreateTrial(ctx, code)
 	if err != nil {
+		if errors.Is(err, database.ErrTrialDisabled) || errors.Is(err, database.ErrTrialUnavailable) {
+			// The configuration changed between the check and the creation.
+			logger.Warn("Trial not issued", zap.String("code", code), zap.Error(err))
+			s.renderTrialUnavailable(w)
+
+			return
+		}
+
 		logger.Error("Failed to create trial subscription", zap.Error(err))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1057,7 +1100,7 @@ func (s *Server) HandleInvite(w http.ResponseWriter, r *http.Request) {
 		Name:     "rs8kvn_trial_" + code,
 		Value:    result.SubID,
 		Path:     "/i/" + code,
-		Expires:  time.Now().Add(time.Duration(s.cfg.TrialDurationHours) * time.Hour),
+		Expires:  time.Now().Add(time.Duration(offer.DurationHours) * time.Hour),
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
@@ -1067,7 +1110,48 @@ func (s *Server) HandleInvite(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	telegramLink := "https://t.me/" + s.effectiveBotUsername() + "?start=trial_" + result.SubID
-	s.renderTrialPage(w, result.SubID, result.SubscriptionURL, telegramLink, s.cfg.TrialDurationHours)
+	s.renderTrialPageOffer(w, result.SubID, result.SubscriptionURL, telegramLink, offer)
+}
+
+// trialUnavailableMessage is shown instead of creating a trial when it is
+// switched off or its configuration cannot issue a working subscription.
+const trialUnavailableMessage = "Пробный доступ временно недоступен"
+
+func (s *Server) renderTrialUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	s.renderErrorPage(w, trialUnavailableMessage)
+}
+
+// trialDefaultOffer is the environment trial (no admin configuration).
+func (s *Server) trialDefaultOffer() database.TrialEffective {
+	offer := database.TrialEffective{Enabled: true, Features: []string{}}
+	if s.cfg != nil {
+		offer.DurationHours, offer.RateLimitPerHour = s.cfg.TrialDurationHours, s.cfg.TrialRateLimit
+	}
+	return offer
+}
+
+// trialOffer returns the trial offer in force for the landing page. A failed
+// read falls back to the environment values (the page still renders).
+func (s *Server) trialOffer(ctx context.Context) database.TrialEffective {
+	if s.subService == nil {
+		return s.trialDefaultOffer()
+	}
+	offer, err := s.subService.TrialOffer(ctx)
+	if err != nil {
+		logger.Warn("Failed to load trial settings, using defaults", zap.Error(err))
+	}
+	return offer
+}
+
+// trialIssuance returns the offer in force and whether a new trial may be
+// issued (database.ErrTrialDisabled / ErrTrialUnavailable otherwise).
+func (s *Server) trialIssuance(ctx context.Context) (database.TrialEffective, error) {
+	if s.subService == nil {
+		return s.trialDefaultOffer(), nil
+	}
+	return s.subService.CheckTrialIssuance(ctx)
 }
 
 // getExistingTrialFromCookie checks the cookie and returns an existing unactivated trial.
@@ -1127,18 +1211,74 @@ type trialPageData struct {
 	SubURL       string
 	TelegramLink template.URL
 	TrialHours   int
+	// TrialDuration is the human duration, e.g. "3 часа", "1 час", "5 часов",
+	// or the expiry of an already issued trial ("до 02.10.2026 15:04 UTC").
+	TrialDuration string
+	// Offer is the admin-edited card (title, description, features, badge);
+	// an empty card renders the page exactly as before.
+	Offer trialOfferView
+}
+
+// trialOfferView is the landing-page card of the trial editor. Text is
+// escaped by html/template.
+type trialOfferView struct {
+	Visible     bool
+	Title       string
+	Description string
+	Features    []string
+	Badge       string
+}
+
+// trialHoursText formats a duration in hours with Russian plural forms.
+func trialHoursText(hours int) string {
+	mod10, mod100 := hours%10, hours%100
+	unit := "часов"
+	switch {
+	case mod10 == 1 && mod100 != 11:
+		unit = "час"
+	case mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14):
+		unit = "часа"
+	}
+	return strconv.Itoa(hours) + " " + unit
 }
 
 // renderTrialPage executes the invite landing page template using server-generated
-// subscription and Telegram links.
+// subscription and Telegram links, without an admin-edited card.
 func (s *Server) renderTrialPage(w http.ResponseWriter, subID, subURL, telegramLink string, trialHours int) {
+	s.renderTrialPageOffer(w, subID, subURL, telegramLink, database.TrialEffective{DurationHours: trialHours})
+}
+
+// renderTrialPageOffer renders the landing page with the trial offer in force.
+func (s *Server) renderTrialPageOffer(w http.ResponseWriter, subID, subURL, telegramLink string, offer database.TrialEffective) {
+	s.renderTrialPageIssued(w, subID, subURL, telegramLink, offer, nil)
+}
+
+// trialExpiryText is the term of an issued trial (same format as the
+// connection page).
+func trialExpiryText(expiresAt time.Time) string {
+	return "до " + expiresAt.UTC().Format("02.01.2006 15:04 UTC")
+}
+
+// renderTrialPageIssued renders the landing page. With issuedExpiry (the
+// expires_at of a trial already issued to this visitor) the term shown is that
+// subscription's own expiry; without it, the duration configured now.
+func (s *Server) renderTrialPageIssued(w http.ResponseWriter, subID, subURL, telegramLink string, offer database.TrialEffective, issuedExpiry *time.Time) {
 	happLink := "happ://add/" + subURL
+	duration := trialHoursText(offer.DurationHours)
+	if issuedExpiry != nil {
+		duration = trialExpiryText(*issuedExpiry)
+	}
+
+	card := trialOfferView{Title: offer.Title, Description: offer.Description, Features: offer.Features, Badge: offer.Badge}
+	card.Visible = card.Title != "" || card.Description != "" || len(card.Features) > 0 || card.Badge != ""
 
 	data := trialPageData{
-		HappLink:     template.URL(happLink), // #nosec G203 -- scheme is server-generated from validated subscription URL
-		SubURL:       subURL,
-		TelegramLink: template.URL(telegramLink), // #nosec G203 -- link is server-generated from the Telegram username and subscription ID
-		TrialHours:   trialHours,
+		HappLink:      template.URL(happLink), // #nosec G203 -- scheme is server-generated from validated subscription URL
+		SubURL:        subURL,
+		TelegramLink:  template.URL(telegramLink), // #nosec G203 -- link is server-generated from the Telegram username and subscription ID
+		TrialHours:    offer.DurationHours,
+		TrialDuration: duration,
+		Offer:         card,
 	}
 
 	err := s.trialTemplate.Execute(w, data)

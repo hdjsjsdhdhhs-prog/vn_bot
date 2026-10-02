@@ -235,6 +235,7 @@ func startWebServer(subService *service.SubscriptionService, cfg *config.Config,
 	webServer.SetAdminService(adminService)
 	webServer.SetBuilderService(builderService)
 	webServer.SetTariffService(service.NewTariffService(dbService))
+	webServer.SetTrialService(service.NewTrialService(dbService, subService.TrialDefaults()))
 	if netMonitor != nil {
 		webServer.SetNetworkMonitor(netMonitor)
 	}

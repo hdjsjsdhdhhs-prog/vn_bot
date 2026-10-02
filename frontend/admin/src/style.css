@@ -1502,3 +1502,34 @@ input[type='datetime-local'].input { min-width: 0; }
   .monitor-table td.monitor-nodes-cell { padding-left: 0; }
   .monitor-chart, .monitor-periods { padding-left: var(--sp-4); padding-right: var(--sp-4); }
 }
+
+/* Trial editor (#/tariffs/trial): the tariff editor layout and controls. */
+.tariffs-body + .trial-entry { margin-top: var(--sp-4); }
+.trial-nav { position: sticky; top: 0; z-index: 1; padding: var(--sp-2) 0; background: var(--bg); }
+.trial-section { scroll-margin-top: 56px; }
+.trial-builder, .trial-countries, .trial-extra { display: grid; gap: var(--sp-3); min-width: 0; }
+.trial-source-pick, .trial-modes { display: grid; gap: var(--sp-2); }
+.trial-source-row { flex-wrap: wrap; }
+.trial-source { display: grid; gap: var(--sp-2); }
+.trial-country-list, .trial-node-list { display: grid; margin: 0; padding: 0; list-style: none; }
+.trial-country-list { border: 1px solid var(--line); border-radius: var(--r-md); }
+.trial-country { border-bottom: 1px solid var(--line); }
+.trial-country:last-child { border-bottom: 0; }
+.trial-country-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); }
+.trial-country-name { font-size: 13px; font-weight: 550; cursor: pointer; }
+.trial-country-head .btn { margin-left: auto; }
+.trial-node-list { padding: 0 var(--sp-3) var(--sp-2) calc(var(--sp-3) + 24px); }
+.trial-node { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); padding: var(--sp-1) 0; font-size: 13px; }
+.trial-node-name { min-width: 0; overflow-wrap: anywhere; cursor: pointer; }
+.trial-order { display: grid; gap: var(--sp-2); }
+.trial-order .rule-list { border: 1px solid var(--line); border-radius: var(--r-md); }
+.trial-rule { grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; }
+.trial-facts { display: grid; gap: var(--sp-1); margin: 0; padding-left: var(--sp-5, 20px); font-size: 13px; color: var(--muted); }
+.trial-problems { color: var(--danger); }
+.trial-sample { color: var(--text); }
+.trial-preview .facts { padding: 0; }
+@media (max-width: 767px) {
+  .trial-nav { position: static; }
+  .trial-country-head .btn { margin-left: 0; height: 44px; }
+  .trial-node-list { padding-left: var(--sp-3); }
+}

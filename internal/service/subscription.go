@@ -33,6 +33,65 @@ type SubscriptionService struct {
 	invalidateBySubID func(subID string)
 	syncService       *SyncService
 	bot               interfaces.BotAPI
+	trialPolicy       TrialPolicy
+}
+
+// TrialPolicy is the admin-editable trial configuration (database.Service).
+// Without one the trial keeps the environment configuration: always enabled,
+// TRIAL_DURATION_HOURS, TRIAL_RATE_LIMIT.
+type TrialPolicy interface {
+	GetTrialEffective(ctx context.Context, d database.TrialDefaults) (*database.TrialEffective, error)
+	CheckTrialIssuance(ctx context.Context, d database.TrialDefaults) (*database.TrialIssuance, error)
+}
+
+var _ TrialPolicy = (*database.Service)(nil)
+
+// SetTrialPolicy links the admin trial configuration. Set before serving.
+func (s *SubscriptionService) SetTrialPolicy(p TrialPolicy) {
+	s.trialPolicy = p
+}
+
+// TrialDefaults are the environment trial values (used while nothing is stored).
+func (s *SubscriptionService) TrialDefaults() database.TrialDefaults {
+	if s.cfg == nil {
+		return database.TrialDefaults{}
+	}
+	return database.TrialDefaults{DurationHours: s.cfg.TrialDurationHours, RateLimitPerHour: s.cfg.TrialRateLimit}
+}
+
+func (s *SubscriptionService) defaultTrialOffer() database.TrialEffective {
+	d := s.TrialDefaults()
+	return database.TrialEffective{Enabled: true, DurationHours: d.DurationHours, RateLimitPerHour: d.RateLimitPerHour, Features: []string{}}
+}
+
+// TrialOffer returns the trial offer in force (switch, duration, IP limit and
+// landing-page texts) without checking whether a trial can be issued.
+func (s *SubscriptionService) TrialOffer(ctx context.Context) (database.TrialEffective, error) {
+	if s.trialPolicy == nil {
+		return s.defaultTrialOffer(), nil
+	}
+	eff, err := s.trialPolicy.GetTrialEffective(ctx, s.TrialDefaults())
+	if err != nil {
+		return s.defaultTrialOffer(), fmt.Errorf("load trial settings: %w", err)
+	}
+	return *eff, nil
+}
+
+// CheckTrialIssuance returns the offer in force and whether a new trial may be
+// issued now: database.ErrTrialDisabled or database.ErrTrialUnavailable
+// otherwise. It is the same evaluation as the admin preview.
+func (s *SubscriptionService) CheckTrialIssuance(ctx context.Context) (database.TrialEffective, error) {
+	if s.trialPolicy == nil {
+		return s.defaultTrialOffer(), nil
+	}
+	issuance, err := s.trialPolicy.CheckTrialIssuance(ctx, s.TrialDefaults())
+	if issuance == nil {
+		if err == nil {
+			err = errors.New("trial issuance check returned no result")
+		}
+		return s.defaultTrialOffer(), err
+	}
+	return issuance.Settings, err
 }
 
 // CreateResult contains the subscription and referral information produced by
@@ -610,6 +669,13 @@ type TrialCreateResult struct {
 // creates a client on that node via XUI, and persists the subscription
 // in the database with a negative telegram_id (unactivated).
 func (s *SubscriptionService) CreateTrial(ctx context.Context, inviteCode string) (*TrialCreateResult, error) {
+	// A switched-off or broken trial configuration never issues a subscription
+	// (no panel client, no row). Already issued trials are not affected.
+	offer, err := s.CheckTrialIssuance(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("trial issuance: %w", err)
+	}
+
 	subID, err := utils.GenerateSubID()
 	if err != nil {
 		return nil, fmt.Errorf("generate sub id: %w", err)
@@ -626,7 +692,7 @@ func (s *SubscriptionService) CreateTrial(ctx context.Context, inviteCode string
 	}
 
 	trafficBytes := trialPlan.TrafficLimit
-	expiryTime := time.Now().UTC().Add(time.Duration(s.cfg.TrialDurationHours) * time.Hour)
+	expiryTime := time.Now().UTC().Add(time.Duration(offer.DurationHours) * time.Hour)
 	email := "trial_" + subID
 	// Trials must not auto-renew. resetDays=0 disables the 3x-ui auto-renew,
 	// which (reset>0 + expiryTime>0) would otherwise reset traffic and extend
