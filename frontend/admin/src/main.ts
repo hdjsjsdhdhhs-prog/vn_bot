@@ -32,8 +32,8 @@ import {
 } from './sources';
 import {
   TRIAL_DURATION_PRESETS, TRIAL_LIMITS, TRIAL_SERVER_FIELDS, compositionFromBuilder, countryName, countrySelection,
-  durationHours, formFromView, groupByCountry, hoursLabel, moveRule, nodeSelected, problemText, rulesForSources,
-  sameTrialForm, toggleCountry, toggleNode, trialDurationLabel, validateTrialForm, withComposition,
+  durationHours, formFromView, groupByCountry, hoursLabel, legacyNodeType, moveRule, nodeSelected, problemText, rulesForSources,
+  sameTrialForm, toggleCountry, toggleLegacyNode, toggleNode, trialDurationLabel, validateTrialForm, withComposition,
   type CompositionState, type TrialErrors, type TrialField, type TrialForm,
 } from './trial';
 
@@ -6871,6 +6871,22 @@ class AdminApp {
     };
     fillBuilders();
 
+    // Issuance node: plan_nodes of the trial plan. Only the client CreateTrial
+    // provisions lives there; the VPN composition comes from the builder.
+    const legacyBody = el('div', 'trial-legacy');
+    legacyBody.id = 'tr-legacy';
+    legacyBody.setAttribute('role', 'group');
+    legacyBody.setAttribute('aria-labelledby', 'tr-legacy-title');
+    legacyBody.tabIndex = -1;
+    const legacyError = el('p', 'field-error');
+    legacyError.id = 'tr-legacy-error';
+    legacyError.setAttribute('role', 'alert');
+    setters.set('legacyNodes', text => {
+      legacyError.textContent = text;
+      if (text) legacyBody.setAttribute('aria-describedby', legacyError.id); else legacyBody.removeAttribute('aria-describedby');
+    });
+    targets.set('legacyNodes', legacyBody);
+
     const read = () => {
       form.enabled = enabled.checked;
       form.duration = duration.value;
@@ -6922,7 +6938,7 @@ class AdminApp {
       el('p', 'field-hint', 'В Mini App пробная подписка не показывается: её выдаёт страница приглашения по реферальной ссылке.'));
     const composition = section('tr-composition', 'Состав', 'Построитель и источники');
     const builderBody = el('div', 'trial-builder');
-    composition.content.append(builderField.root, builderBody);
+    composition.content.append(builderField.root, builderBody, legacyBody);
     const countries = section('tr-countries', 'Страны', 'Страны и серверы');
     const countriesBody = el('div', 'trial-countries');
     countries.content.append(countriesBody, compositionError);
@@ -7067,6 +7083,49 @@ class AdminApp {
         nodes.push(list);
       }
       builderBody.replaceChildren(...nodes);
+    };
+
+    const paintLegacyNodes = (focusId?: number) => {
+      const nodes: HTMLElement[] = [];
+      const title = el('p', 'preview-caption', 'Узел выдачи');
+      title.id = 'tr-legacy-title';
+      nodes.push(title, notice({ tone: 'info', text: TRIAL_LEGACY_NOTE }));
+      if (!base.legacy_nodes.length) {
+        nodes.push(el('p', 'field-hint', 'Узлов нет: их список (таблица nodes) в админке не редактируется.'));
+      } else {
+        const list = el('ul', 'trial-node-list');
+        list.setAttribute('aria-label', 'Узлы выдачи');
+        for (const n of base.legacy_nodes) {
+          const row = el('li', 'trial-node');
+          const box = el('input');
+          box.type = 'checkbox';
+          box.id = `tr-ln-${n.id}`;
+          box.checked = form.legacyNodeIds.includes(n.id);
+          box.disabled = saving || !n.is_active;
+          box.addEventListener('change', () => {
+            form.legacyNodeIds = toggleLegacyNode(form.legacyNodeIds, n.id);
+            setters.get('legacyNodes')?.('');
+            paintLegacyNodes(n.id);
+            paintActions();
+            schedulePreview();
+          });
+          const label = el('label', 'trial-node-name', n.name || `Узел #${n.id}`);
+          label.htmlFor = box.id;
+          const state = n.is_active ? el('span', 'tag tag-on', 'Активен') : el('span', 'tag', 'Отключён');
+          const note = !n.is_active && n.linked ? 'привязан, но не используется' : n.linked ? 'привязан сейчас' : '';
+          row.append(box, label, el('span', 'tag', legacyNodeType(n.type)), state);
+          if (note) row.append(el('span', 'slot-status', note));
+          list.append(row);
+        }
+        nodes.push(list);
+      }
+      const count = form.legacyNodeIds.length;
+      nodes.push(el('p', 'field-hint', count
+        ? `Выбрано: ${formatCount(count)} ${pluralRu(count, 'узел', 'узла', 'узлов')}. Пробная подписка создаётся на первом из них по порядку id. Отключённые узлы выбрать нельзя.`
+        : 'Узел не выбран: пробную подписку не на чем создать.'));
+      nodes.push(legacyError);
+      legacyBody.replaceChildren(...nodes);
+      if (focusId !== undefined) legacyBody.querySelector<HTMLInputElement>(`#tr-ln-${focusId}`)?.focus();
     };
 
     const paintCountries = () => {
@@ -7274,6 +7333,7 @@ class AdminApp {
         fact('Срок', p.duration_hours ? trialDurationLabel(p.duration_hours) : '—',
           p.duration_hours ? `Выданная сейчас истечёт ${formatDateTime(p.expires_at)}` : undefined),
         fact('Построитель', p.builder ? p.builder.name : 'Узлы тарифа «trial»', p.builder && !p.builder.enabled ? 'Отключён' : undefined, 'is-danger'),
+        fact('Узлов выдачи', formatCount(p.legacy_nodes), p.legacy_nodes ? undefined : 'Пробную подписку не на чем создать.', 'is-danger'),
         fact('Серверов', p.serve === 'builder' ? formatCount(p.total) : 'По узлам тарифа'),
         fact('Стран', p.serve === 'builder' ? formatCount(p.countries.length) : '—',
           p.countries.length ? p.countries.map(c => `${c.code || 'без страны'} ${formatCount(c.count)}`).join(' · ') : undefined),
@@ -7298,7 +7358,7 @@ class AdminApp {
     let previewTimer = 0;
     let previewRequest = 0;
     const runPreview = async () => {
-      const { draft } = validateTrialForm(form, storedFor(), editable());
+      const { draft } = validateTrialForm(form, storedFor(), editable(), baseline.legacyNodeIds);
       if (!draft) { paintPreview({ kind: 'invalid' }); return; }
       const request = ++previewRequest;
       paintPreview({ kind: 'busy' });
@@ -7332,6 +7392,7 @@ class AdminApp {
       paintHeading();
       paintExpiry();
       paintBuilder();
+      paintLegacyNodes();
       paintCountries();
       paintExtra();
       paintActions();
@@ -7424,7 +7485,7 @@ class AdminApp {
       if (saving) return;
       read();
       clearErrors();
-      const { draft, errors } = validateTrialForm(form, storedFor(), editable());
+      const { draft, errors } = validateTrialForm(form, storedFor(), editable(), baseline.legacyNodeIds);
       if (!draft) {
         showErrors(errors);
         return;
@@ -7460,8 +7521,8 @@ class AdminApp {
         if (error instanceof ApiError && error.status >= 400 && error.status < 500) pending = null;
         if (error instanceof ApiError && error.code === 'invalid_trial') {
           const fieldKey = TRIAL_SERVER_FIELDS[error.field] ?? 'composition';
-          showErrors({ [fieldKey]: problemText({ code: error.reason }) });
-          showStatus({ tone: 'error', text: `Сервер не сохранил настройки: ${problemText({ code: error.reason })}` });
+          showErrors({ [fieldKey]: problemText({ code: error.reason, field: error.field }) });
+          showStatus({ tone: 'error', text: `Сервер не сохранил настройки: ${problemText({ code: error.reason, field: error.field })}` });
           return;
         }
         if (error instanceof ApiError && (error.code === 'version_conflict' || error.code === 'builder_version_conflict')) {
@@ -7548,8 +7609,9 @@ class AdminApp {
 // Trial helpers
 
 const TRIAL_DESC = 'Как выдаётся пробная подписка по реферальной ссылке: срок, состав, страны и серверы, ограничения и карточка на странице приглашения.';
-const TRIAL_FIELD_ORDER: readonly TrialField[] = ['duration', 'title', 'description', 'features', 'badge', 'builderId', 'composition', 'rateLimit'];
+const TRIAL_FIELD_ORDER: readonly TrialField[] = ['duration', 'title', 'description', 'features', 'badge', 'builderId', 'composition', 'legacyNodes', 'rateLimit'];
 const TRIAL_SAMPLE = 8;
+const TRIAL_LEGACY_NOTE = 'Используется только для механизма выдачи trial. VPN-состав берётся из Builder.';
 const TRIAL_PREVIEW_DEBOUNCE_MS = 350;
 
 /** The rules the trial already follows (internal/web handleInvite, BindTrial, cleanup). */

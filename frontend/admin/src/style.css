@@ -1521,6 +1521,9 @@ input[type='datetime-local'].input { min-width: 0; }
 .trial-node-list { padding: 0 var(--sp-3) var(--sp-2) calc(var(--sp-3) + 24px); }
 .trial-node { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); padding: var(--sp-1) 0; font-size: 13px; }
 .trial-node-name { min-width: 0; overflow-wrap: anywhere; cursor: pointer; }
+/* Issuance node (plan_nodes of the trial plan) under the builder in «Состав». */
+.trial-legacy { display: grid; gap: var(--sp-2); min-width: 0; padding-top: var(--sp-3); border-top: 1px solid var(--line); }
+.trial-legacy .trial-node-list { padding: 0; }
 .trial-order { display: grid; gap: var(--sp-2); }
 .trial-order .rule-list { border: 1px solid var(--line); border-radius: var(--r-md); }
 .trial-rule { grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; }

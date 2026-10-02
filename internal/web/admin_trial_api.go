@@ -80,13 +80,15 @@ type trialDraftBody struct {
 	Badge            string                     `json:"badge"`
 	BuilderID        *uint                      `json:"builder_id"`
 	Composition      *database.TrialComposition `json:"composition"`
+	// LegacyNodeIDs: issuance nodes of the trial plan; null keeps the links.
+	LegacyNodeIDs *[]uint `json:"legacy_node_ids"`
 }
 
 func (b trialDraftBody) input() service.TrialInput {
 	return service.TrialInput{
 		Enabled: b.Enabled, DurationHours: b.DurationHours, RateLimitPerHour: b.RateLimitPerHour,
 		Title: b.Title, Description: b.Description, Features: b.Features, Badge: b.Badge,
-		BuilderID: b.BuilderID, Composition: b.Composition,
+		BuilderID: b.BuilderID, Composition: b.Composition, LegacyNodeIDs: b.LegacyNodeIDs,
 	}
 }
 

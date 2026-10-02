@@ -20,7 +20,9 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 	return nodes, nil
 }
 
-// GetNodesByPlanName returns nodes for the plan with the given name.
+// GetNodesByPlanName returns the active nodes linked to the plan with the
+// given name, ordered by id. Disabled nodes have no runtime client, so they
+// are never offered (the trial issues onto the first returned node).
 func (s *Service) GetNodesByPlanName(ctx context.Context, planName string) ([]Node, error) {
 	var nodes []Node
 
@@ -29,7 +31,8 @@ func (s *Service) GetNodesByPlanName(ctx context.Context, planName string) ([]No
 		Select("nodes.*").
 		Joins("JOIN plan_nodes ON plan_nodes.node_id = nodes.id").
 		Joins("JOIN plans ON plans.id = plan_nodes.plan_id").
-		Where("plans.name = ?", planName).
+		Where("plans.name = ? AND nodes.is_active = ?", planName, true).
+		Order("nodes.id ASC").
 		Find(&nodes)
 	if result.Error != nil {
 		return nil, fmt.Errorf("failed to get nodes by plan name: %w", result.Error)

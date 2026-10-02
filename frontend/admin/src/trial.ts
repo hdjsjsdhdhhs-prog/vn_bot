@@ -5,7 +5,7 @@
 // builder rules (country rule = whole country, node rule = one server). No DOM,
 // no network: covered by tests/admin-trial.test.ts.
 
-import type { BuilderItem, SourceEntry, TrialDraft, TrialMode, TrialProblem, TrialRule, TrialView } from './api';
+import type { BuilderItem, SourceEntry, TrialDraft, TrialLegacyNode, TrialMode, TrialProblem, TrialRule, TrialView } from './api';
 import { featuresFromText, moveItem, pluralRu } from './tariffs';
 
 export const TRIAL_LIMITS = {
@@ -44,17 +44,39 @@ export interface TrialForm {
   mode: TrialMode;
   sourceIds: number[];
   rules: TrialRule[];
+  /** Issuance nodes of the trial plan (plan_nodes), sorted by id. */
+  legacyNodeIds: number[];
 }
 
-export type TrialField = 'duration' | 'rateLimit' | 'title' | 'description' | 'features' | 'badge' | 'builderId' | 'composition';
+export type TrialField = 'duration' | 'rateLimit' | 'title' | 'description' | 'features' | 'badge' | 'builderId' | 'composition' | 'legacyNodes';
 export type TrialErrors = Partial<Record<TrialField, string>>;
 
 /** Server field (database.TrialProblem.Field) → editor field. */
 export const TRIAL_SERVER_FIELDS: Readonly<Record<string, TrialField>> = {
   duration_hours: 'duration', rate_limit_per_hour: 'rateLimit', title: 'title', description: 'description',
   features: 'features', badge: 'badge', builder_id: 'builderId', composition: 'composition',
-  'composition.rules': 'composition', 'composition.source_ids': 'composition', legacy_nodes: 'builderId',
+  'composition.rules': 'composition', 'composition.source_ids': 'composition',
+  legacy_nodes: 'legacyNodes', legacy_node_ids: 'legacyNodes',
 };
+
+// ---------------------------------------------------------------------------
+// Issuance node (legacy nodes of the trial plan). It only carries the client
+// CreateTrial provisions; the VPN composition comes from the builder.
+
+/** Linked active nodes: the choice the editor starts from (sorted by id). */
+export const linkedNodeIds = (nodes: readonly TrialLegacyNode[]) =>
+  nodes.filter(n => n.linked && n.is_active).map(n => n.id).sort((a, b) => a - b);
+
+/** Ticks or unticks one node; the result stays sorted by id. */
+export function toggleLegacyNode(ids: readonly number[], id: number): number[] {
+  return (ids.includes(id) ? ids.filter(other => other !== id) : [...ids, id]).sort((a, b) => a - b);
+}
+
+export const sameNodeIds = (a: readonly number[], b: readonly number[]) =>
+  a.length === b.length && a.every((id, i) => id === b[i]);
+
+/** Node type as stored (3x-ui | proxman | fetch). */
+export const legacyNodeType = (type: string) => type || '—';
 
 /** Builder composition as edited: stored rules of a builder (enabled only). */
 export interface CompositionState { builderVersion: number; mode: TrialMode; sourceIds: number[]; rules: TrialRule[] }
@@ -80,6 +102,7 @@ export function formFromView(view: TrialView): TrialForm {
     rateLimit: String(s.rate_limit_per_hour), title: s.title, description: s.description, features: s.features.join('\n'),
     badge: s.badge, builderId: view.builder_id,
     mode: c?.mode ?? 'all', sourceIds: c ? [...c.source_ids] : [], rules: c ? c.rules.map(rule => ({ ...rule })) : [],
+    legacyNodeIds: linkedNodeIds(view.legacy_nodes),
   };
 }
 
@@ -110,9 +133,12 @@ export function compositionChanged(form: TrialForm, stored: CompositionState | n
 /**
  * Validates with the server bounds. The draft carries the composition only
  * when it was edited and may be edited (a builder used by nothing but the
- * trial), so saving never rewrites rules nobody touched.
+ * trial), so saving never rewrites rules nobody touched. Likewise the issuance
+ * nodes are sent only when they differ from storedNodes (the linked active
+ * nodes the editor loaded); without storedNodes they are never sent.
  */
-export function validateTrialForm(form: TrialForm, stored: CompositionState | null, editable: boolean): { draft: TrialDraft | null; errors: TrialErrors } {
+export function validateTrialForm(form: TrialForm, stored: CompositionState | null, editable: boolean,
+  storedNodes: readonly number[] | null = null): { draft: TrialDraft | null; errors: TrialErrors } {
   const errors: TrialErrors = {};
   const hours = durationHours(form);
   if (!Number.isInteger(hours) || hours < TRIAL_LIMITS.minHours || hours > TRIAL_LIMITS.maxHours) {
@@ -140,6 +166,11 @@ export function validateTrialForm(form: TrialForm, stored: CompositionState | nu
     else if (form.mode === 'selected' && form.rules.length === 0) errors.composition = 'Выберите хотя бы одну страну или сервер.';
   }
 
+  const nodesChanged = storedNodes !== null && !sameNodeIds(form.legacyNodeIds, storedNodes);
+  if (nodesChanged && form.enabled && form.legacyNodeIds.length === 0) {
+    errors.legacyNodes = 'Выберите хотя бы один активный узел выдачи или выключите выдачу пробной подписки.';
+  }
+
   if (Object.keys(errors).length > 0) return { draft: null, errors };
   return {
     draft: {
@@ -148,6 +179,7 @@ export function validateTrialForm(form: TrialForm, stored: CompositionState | nu
       composition: changed && stored
         ? { builder_version: stored.builderVersion, mode: form.mode, source_ids: [...form.sourceIds], rules: form.mode === 'all' ? [] : form.rules.map(r => ({ ...r })) }
         : null,
+      legacy_node_ids: nodesChanged ? [...form.legacyNodeIds] : null,
     },
     errors,
   };
@@ -282,6 +314,15 @@ const PROBLEM_TEXT: Readonly<Record<string, string>> = {
   node_covered_by_country: 'Сервер уже входит в выбранную целиком страну.',
   no_sources: 'У построителя нет источников.',
   empty_result: 'Состав пуст: ни одного доступного сервера.',
+  legacy_node_not_found: 'Выбранный узел выдачи не найден: возможно, его удалили.',
+  legacy_node_inactive: 'Выбранный узел выдачи отключён: на нём пробную подписку не создать.',
 };
 
-export const problemText = (p: Pick<TrialProblem, 'code'>) => PROBLEM_TEXT[p.code] ?? `Конфигурация отклонена (${p.code}).`;
+/** Codes whose meaning depends on the field. */
+const FIELD_PROBLEM_TEXT: Readonly<Record<string, string>> = {
+  'legacy_node_ids|duplicate': 'Узел выдачи выбран дважды.',
+  'legacy_node_ids|too_many': 'Слишком много узлов выдачи.',
+};
+
+export const problemText = (p: Pick<TrialProblem, 'code'> & { field?: string }) =>
+  FIELD_PROBLEM_TEXT[`${p.field ?? ''}|${p.code}`] ?? PROBLEM_TEXT[p.code] ?? `Конфигурация отклонена (${p.code}).`;

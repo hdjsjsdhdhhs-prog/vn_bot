@@ -900,6 +900,19 @@ export interface TrialHistoryEntry {
   readonly created_at: string;
 }
 
+/**
+ * database.TrialLegacyNode: a node of the nodes table offered as the trial
+ * issuance node (plan_nodes of the trial plan). No host, token or URL.
+ */
+export interface TrialLegacyNode {
+  readonly id: number;
+  readonly name: string;
+  readonly type: string;
+  readonly is_active: boolean;
+  /** Currently linked to the trial plan. */
+  readonly linked: boolean;
+}
+
 export interface TrialView {
   readonly settings: TrialSettings;
   readonly defaults: { readonly duration_hours: number; readonly rate_limit_per_hour: number };
@@ -907,6 +920,7 @@ export interface TrialView {
   readonly builder_id: number | null;
   readonly composition: TrialComposition | null;
   readonly builders: readonly TrialBuilderSummary[];
+  readonly legacy_nodes: readonly TrialLegacyNode[];
   readonly preview: TrialPreview;
   readonly active_trials: number;
   readonly history: readonly TrialHistoryEntry[];
@@ -923,6 +937,8 @@ export interface TrialDraft {
   badge: string;
   builder_id: number | null;
   composition: { builder_version: number; mode: TrialMode; source_ids: number[]; rules: TrialRule[] } | null;
+  /** Issuance nodes of the trial plan; null keeps the stored links. */
+  legacy_node_ids: number[] | null;
 }
 
 export interface TrialOutcome {
@@ -957,10 +973,16 @@ function isTrialPreview(v: unknown): v is TrialPreview {
     (v.builder === null || isRecord(v.builder));
 }
 
+function isTrialLegacyNode(v: unknown): v is TrialLegacyNode {
+  return isRecord(v) && isCount(v.id) && typeof v.name === 'string' && typeof v.type === 'string' &&
+    typeof v.is_active === 'boolean' && typeof v.linked === 'boolean';
+}
+
 function parseTrialView(v: unknown): TrialView {
   if (!isRecord(v) || !isTrialSettings(v.settings) || !isRecord(v.defaults) || !isCount(v.plan_id) ||
     !(v.builder_id === null || isCount(v.builder_id)) || !(v.composition === null || isTrialComposition(v.composition)) ||
     !Array.isArray(v.builders) || !v.builders.every(b => isRecord(b) && isCount(b.id) && typeof b.name === 'string' && isRecord(b.usage)) ||
+    !Array.isArray(v.legacy_nodes) || !v.legacy_nodes.every(isTrialLegacyNode) ||
     !isTrialPreview(v.preview) || !isCount(v.active_trials) || !Array.isArray(v.history)) {
     throw new ApiError('invalid_response');
   }

@@ -2,7 +2,9 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -156,6 +158,104 @@ func TestAdminTrialAPI_ViewSaveReplayAndPreview(t *testing.T) {
 	// A stale settings version is a conflict.
 	f.expectError(f.do(http.MethodPut, "/admin/api/trial", f.withCSRF(),
 		withJSON(f.draft("trial-save-2", 0, true, 12, builderID, "null"))), http.StatusConflict, "version_conflict")
+}
+
+// withNodes adds "legacy_node_ids" (raw JSON) to a draft body.
+func withNodes(body, ids string) string {
+	return strings.TrimSuffix(body, "}") + `,"legacy_node_ids":` + ids + `}`
+}
+
+func (f *trialAPIFixture) trialLinks(t *testing.T) []uint {
+	t.Helper()
+	ids := []uint{}
+	require.NoError(t, f.db.GetDB().Model(&database.PlanNode{}).
+		Joins("JOIN plans ON plans.id = plan_nodes.plan_id").Where("plans.name = ?", database.TrialPlanName).
+		Order("plan_nodes.node_id ASC").Pluck("plan_nodes.node_id", &ids).Error)
+	return ids
+}
+
+func TestAdminTrialAPI_LegacyNodeSelection(t *testing.T) {
+	f := newTrialAPIFixture(t, true)
+	f.login()
+	ctx := context.Background()
+	original := f.trialLinks(t)
+	require.Len(t, original, 1)
+	fetch := database.Node{Name: "issuance-fetch", IsActive: true, Type: database.NodeTypeFetch, SubscriptionURL: "https://fetch-secret.example/sub", InboundIDs: "[]"}
+	require.NoError(t, f.db.CreateNode(ctx, &fetch))
+	off := database.Node{Name: "disabled-panel", IsActive: true, Host: "off-secret.example", APIToken: "off-secret-token", Type: database.NodeType3xUI, InboundIDs: "[1]"}
+	require.NoError(t, f.db.CreateNode(ctx, &off))
+	require.NoError(t, f.db.GetDB().Model(&database.Node{}).Where("id = ?", off.ID).UpdateColumn("is_active", false).Error)
+
+	// GET lists the nodes with their link; the wire never carries host, token or URL.
+	resp := f.do(http.MethodGet, "/admin/api/trial")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	rawBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	resp.Body.Close()
+	for _, secret := range []string{"secret", "trial.example", "api_token", `"host"`, "subscription_url"} {
+		assert.NotContains(t, string(rawBody), secret)
+	}
+	var view database.TrialAdminView
+	require.NoError(t, json.Unmarshal(rawBody, &view))
+	assert.Equal(t, []database.TrialLegacyNode{
+		{ID: original[0], Name: "trial-node", Type: database.NodeType3xUI, IsActive: true, Linked: true},
+		{ID: fetch.ID, Name: "issuance-fetch", Type: database.NodeTypeFetch, IsActive: true},
+		{ID: off.ID, Name: "disabled-panel", Type: database.NodeType3xUI, IsActive: false},
+	}, view.LegacyNodes)
+
+	// The preview evaluates the chosen nodes and writes nothing.
+	audits := f.auditCount()
+	resp = f.do(http.MethodPost, "/admin/api/trial/preview", f.withCSRF(), withJSON(withNodes(f.draft("", 0, true, 6, "null", "null"), "[]")))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var preview database.TrialPreview
+	f.decode(resp, &preview)
+	assert.False(t, preview.Issuable)
+	require.Len(t, preview.Problems, 1)
+	assert.Equal(t, "no_trial_node", preview.Problems[0].Code)
+	resp = f.do(http.MethodPost, "/admin/api/trial/preview", f.withCSRF(),
+		withJSON(withNodes(f.draft("", 0, true, 6, "null", "null"), fmt.Sprintf("[%d]", fetch.ID))))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	f.decode(resp, &preview)
+	assert.True(t, preview.Issuable, "%+v", preview.Problems)
+	assert.Equal(t, 1, preview.LegacyNodes)
+	assert.Equal(t, audits, f.auditCount())
+	assert.Equal(t, original, f.trialLinks(t))
+
+	// A disabled node is refused with its field.
+	resp = f.do(http.MethodPut, "/admin/api/trial", f.withCSRF(),
+		withJSON(withNodes(f.draft("nodes-off", 0, true, 6, "null", "null"), fmt.Sprintf("[%d]", off.ID))))
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	payload := f.raw(resp)
+	assert.Equal(t, "invalid_trial", payload["error"])
+	assert.Equal(t, "legacy_node_ids", payload["field"])
+	assert.Equal(t, "legacy_node_inactive", payload["reason"])
+	assert.Equal(t, original, f.trialLinks(t))
+
+	// Saving replaces the trial plan links, audited, and returns the new view.
+	resp = f.do(http.MethodPut, "/admin/api/trial", f.withCSRF(),
+		withJSON(withNodes(f.draft("nodes-1", 0, true, 6, "null", "null"), fmt.Sprintf("[%d]", fetch.ID))))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var out trialOutcomeWire
+	f.decode(resp, &out)
+	assert.Equal(t, string(database.AdminActionTrialUpdated), out.Audit.Action)
+	assert.Equal(t, []uint{fetch.ID}, f.trialLinks(t))
+	linked := []uint{}
+	for _, n := range out.Trial.LegacyNodes {
+		if n.Linked {
+			linked = append(linked, n.ID)
+		}
+	}
+	assert.Equal(t, []uint{fetch.ID}, linked)
+	assert.True(t, out.Trial.Preview.Issuable, "%+v", out.Trial.Preview.Problems)
+
+	// null keeps the links; a stale version is a conflict.
+	resp = f.do(http.MethodPut, "/admin/api/trial", f.withCSRF(), withJSON(withNodes(f.draft("nodes-2", 1, true, 12, "null", "null"), "null")))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	resp.Body.Close()
+	assert.Equal(t, []uint{fetch.ID}, f.trialLinks(t))
+	f.expectError(f.do(http.MethodPut, "/admin/api/trial", f.withCSRF(),
+		withJSON(withNodes(f.draft("nodes-3", 1, true, 6, "null", "null"), fmt.Sprintf("[%d]", original[0])))), http.StatusConflict, "version_conflict")
+	assert.Equal(t, []uint{fetch.ID}, f.trialLinks(t))
 }
 
 func TestAdminTrialAPI_Rejections(t *testing.T) {

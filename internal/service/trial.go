@@ -46,6 +46,8 @@ type TrialInput struct {
 	Badge            string
 	BuilderID        *uint
 	Composition      *database.TrialComposition
+	// LegacyNodeIDs: issuance nodes of the trial plan; nil keeps the links.
+	LegacyNodeIDs *[]uint
 }
 
 // normalize trims text, unifies line breaks and drops blank feature lines,
@@ -70,11 +72,17 @@ func (in TrialInput) normalize() database.TrialDraft {
 		}
 		composition = &c
 	}
+	var legacyNodeIDs *[]uint
+	if in.LegacyNodeIDs != nil {
+		ids := append([]uint{}, *in.LegacyNodeIDs...)
+		legacyNodeIDs = &ids
+	}
 	return database.TrialDraft{
 		Enabled: in.Enabled, DurationHours: in.DurationHours, RateLimitPerHour: in.RateLimitPerHour,
 		Title:       strings.TrimSpace(in.Title),
 		Description: strings.TrimSpace(strings.ReplaceAll(in.Description, "\r\n", "\n")),
 		Features:    features, Badge: strings.TrimSpace(in.Badge), BuilderID: in.BuilderID, Composition: composition,
+		LegacyNodeIDs: legacyNodeIDs,
 	}
 }
 

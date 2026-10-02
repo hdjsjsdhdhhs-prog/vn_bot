@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/kereal/rs8kvn_bot/internal/config"
@@ -148,19 +149,30 @@ func (s *SubscriptionService) activeNodes() []database.Node {
 	return result
 }
 
-// trialNodes returns nodes linked to the trial plan.
-// Returns an error if the trial plan has no linked nodes (fail-fast).
+// trialNodes returns the active nodes linked to the trial plan, ordered by id,
+// so the trial is always issued onto the same, enabled node.
+// Returns an error if the trial plan has no active linked node (fail-fast).
 func (s *SubscriptionService) trialNodes(ctx context.Context) ([]database.Node, error) {
 	nodes, err := s.db.GetNodesByPlanName(ctx, database.TrialPlanName)
 	if err != nil {
 		return nil, fmt.Errorf("load trial nodes: %w", err)
 	}
 
-	if len(nodes) == 0 {
+	// The repository already filters and orders; this keeps the contract for
+	// any implementation of the interface.
+	active := make([]database.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node.IsActive {
+			active = append(active, node)
+		}
+	}
+	sort.SliceStable(active, func(i, j int) bool { return active[i].ID < active[j].ID })
+
+	if len(active) == 0 {
 		return nil, fmt.Errorf("trial plan has no linked nodes")
 	}
 
-	return nodes, nil
+	return active, nil
 }
 
 // Create is the application creation entry point. CustomerSubscriptionTerms

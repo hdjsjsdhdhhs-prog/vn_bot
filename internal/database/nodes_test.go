@@ -161,6 +161,27 @@ func TestGetNodesByPlanName_FilterByName(t *testing.T) {
 	assert.Equal(t, "default", freeNodes[0].Name)
 }
 
+func TestGetNodesByPlanName_ActiveOnlyOrderedByID(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	first := createTestNode(t, svc, "first", "http://x1", "t1")
+	disabled := createTestNode(t, svc, "disabled", "http://x2", "t2")
+	third := createTestNode(t, svc, "third", "http://x3", "t3")
+	// GORM would substitute default:true for a false IsActive on create.
+	require.NoError(t, svc.db.Model(&Node{}).Where("id = ?", disabled.ID).UpdateColumn("is_active", false).Error)
+
+	nodes, err := svc.GetNodesByPlanName(ctx, TrialPlanName)
+	require.NoError(t, err)
+	ids := []uint{}
+	for _, n := range nodes {
+		ids = append(ids, n.ID)
+	}
+	assert.Equal(t, []uint{first.ID, third.ID}, ids, "disabled nodes are never offered, the rest by id")
+}
+
 // ==================== Subscription Active Check (model) ====================
 
 func TestSubscription_IsActive_StatusCases(t *testing.T) {
