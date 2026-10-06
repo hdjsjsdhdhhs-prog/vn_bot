@@ -14,6 +14,8 @@ export class ApiError extends Error {
     readonly field = '',
     /** Stable rejection reason (trial editor: invalid_trial, builder_shared). */
     readonly reason = '',
+    /** Free-form context of a rejection (warm-up editor: buttons[1], 3/1024); display only. */
+    readonly detail = '',
   ) {
     super(code);
     this.name = 'ApiError';
@@ -503,6 +505,15 @@ export class AdminApi {
     return outcome;
   }
 
+  /**
+   * One request through the session transport (CSRF on writes, timeout,
+   * ApiError mapping) for section clients that keep their own types and
+   * parsers (admin/src/warmup.ts). The CSRF token itself stays private.
+   */
+  request(method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE', path: string, body?: string): Promise<unknown> {
+    return this.#send(method, path, body);
+  }
+
   #adopt(payload: unknown): Session {
     if (!isSessionPayload(payload)) throw new ApiError('invalid_response');
     this.#csrf = payload.csrf_token;
@@ -528,7 +539,8 @@ export class AdminApi {
         const retryAfter = response.status === 429 ? retryAfterSeconds(response) : 0;
         const field = isRecord(data) && typeof data.field === 'string' && /^[a-z_.]{1,40}$/.test(data.field) ? data.field : '';
         const reason = isRecord(data) && typeof data.reason === 'string' && /^[a-z_]{1,40}$/.test(data.reason) ? data.reason : '';
-        throw new ApiError(errorCode(data, response.status), response.status, retryAfter, field, reason);
+        const detail = isRecord(data) && typeof data.detail === 'string' ? data.detail.slice(0, 200) : '';
+        throw new ApiError(errorCode(data, response.status), response.status, retryAfter, field, reason, detail);
       }
       return data;
     } catch (error) {

@@ -75,6 +75,7 @@ type Handler struct {
 	paymentEnabled      bool
 	version             string
 	referral            *ReferralHandler
+	warmupContacts      WarmupContactRecorder
 
 	// Admin rate limiting (separate from user rate limit)
 	adminRateLimiters map[int64]*ratelimiter.TokenBucket

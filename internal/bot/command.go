@@ -46,6 +46,9 @@ func (c *CommandHandler) HandleStart(ctx context.Context, update tgbotapi.Update
 	chatID := update.Message.Chat.ID
 	username := c.h.getUsername(update.Message.From)
 
+	// Every /start (also trial_/share_ deep links) is a warm-up contact.
+	c.h.recordWarmupContact(ctx, update.Message)
+
 	args := update.Message.CommandArguments()
 	if after, ok := strings.CutPrefix(args, "trial_"); ok {
 		return c.handleBindTrial(ctx, chatID, username, after)

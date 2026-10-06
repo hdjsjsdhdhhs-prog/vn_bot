@@ -36,12 +36,14 @@ import {
   sameTrialForm, toggleCountry, toggleLegacyNode, toggleNode, trialDurationLabel, validateTrialForm, withComposition,
   type CompositionState, type TrialErrors, type TrialField, type TrialForm,
 } from './trial';
+import { WarmupApi, parseWarmupRoute, warmupHash, type WarmupRoute } from './warmup';
+import { WarmupScreen, resetWarmupMemory, type WarmupHost } from './warmup-ui';
 
 // ---------------------------------------------------------------------------
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
 // handful of glyphs does not add a runtime dependency. One family, one stroke.
 
-type IconName = 'overview' | 'users' | 'tariffs' | 'up' | 'audit' | 'sources' | 'builders' | 'monitoring' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
+type IconName = 'overview' | 'users' | 'tariffs' | 'warmup' | 'up' | 'audit' | 'sources' | 'builders' | 'monitoring' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
   | 'search' | 'back' | 'prev' | 'next' | 'chevron' | 'check' | 'plus' | 'trash' | 'drag' | 'edit';
 type Shape = readonly ['path' | 'circle' | 'rect', Readonly<Record<string, string>>];
 
@@ -61,6 +63,9 @@ const ICONS: Record<IconName, readonly Shape[]> = {
   tariffs: [
     ['path', { d: 'M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z' }],
     ['circle', { cx: '7.5', cy: '7.5', r: '.5' }],
+  ],
+  warmup: [
+    ['path', { d: 'M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z' }],
   ],
   up: [['path', { d: 'm18 15-6-6-6 6' }]],
   audit: [
@@ -174,7 +179,7 @@ const clock = (date: Date) => date.toLocaleTimeString('ru-RU', { hour: '2-digit'
 // Sections. Overview reads /admin/api/dashboard, Users reads /admin/api/users,
 // the Journal (route #/audit) reads /admin/api/journal.
 
-type SectionId = 'overview' | 'users' | 'tariffs' | 'audit' | 'sources' | 'builders' | 'monitoring';
+type SectionId = 'overview' | 'users' | 'tariffs' | 'warmup' | 'audit' | 'sources' | 'builders' | 'monitoring';
 interface Section {
   id: SectionId;
   label: string;
@@ -194,6 +199,10 @@ const SECTIONS: readonly Section[] = [
   {
     id: 'tariffs', label: 'Тарифы',
     description: 'Предложения для покупки в Mini App и боте: цена, срок, карточка и порядок показа.',
+  },
+  {
+    id: 'warmup', label: 'Прогрев клиентов',
+    description: 'Автоматические сообщения в боте: пробный период, окончание подписки и возврат клиентов. Сценарии, тексты, кнопки, скидки и история отправок.',
   },
   {
     id: 'sources', label: 'Источники',
@@ -219,8 +228,11 @@ const SECTIONS: readonly Section[] = [
 // (the trial editor, part of the Tariffs section).
 // Sources: #/sources, #/sources/{source_id} (catalogue of one source).
 // Monitoring: #/monitoring, #/monitoring/{builder_id} (countries and servers).
+// Warm-up: #/warmup, #/warmup/create, #/warmup/scenario/{id}, #/warmup/settings,
+// #/warmup/deliveries, #/warmup/coupons (an unknown warm-up path opens #/warmup).
 interface Route {
   section: Section; userId: number | null; tariffId: number | 'new' | 'trial' | null; sourceId: number | null; monitorId: number | null;
+  warmup: WarmupRoute | null;
 }
 const USER_ROUTE = /^users\/([1-9][0-9]{0,15})$/;
 const TARIFF_ROUTE = /^tariffs\/(new|trial|[1-9][0-9]{0,15})$/;
@@ -229,7 +241,11 @@ const MONITOR_ROUTE = /^monitoring\/([1-9][0-9]{0,15})$/;
 
 function currentRoute(): Route {
   const path = location.hash.replace(/^#\/?/, '');
-  const none = { userId: null, tariffId: null, sourceId: null, monitorId: null };
+  const none = { userId: null, tariffId: null, sourceId: null, monitorId: null, warmup: null };
+  const warmupSection = SECTIONS.find(section => section.id === 'warmup');
+  if (warmupSection && (path === 'warmup' || path.startsWith('warmup/'))) {
+    return { ...none, section: warmupSection, warmup: parseWarmupRoute(path) ?? { view: 'overview' } };
+  }
   const match = USER_ROUTE.exec(path);
   const users = SECTIONS.find(section => section.id === 'users');
   if (match && users) {
@@ -1446,8 +1462,12 @@ class AdminApp {
   // Reports unsaved changes of the open screen (tariff editor, edited order).
   // Leaving through navigation or reload asks for confirmation first.
   private unsavedChanges: (() => boolean) | null = null;
+  // Customer warm-up (#/warmup…): one screen per route, disposed on leaving.
+  private readonly warmupApi: WarmupApi;
+  private warmupScreen: WarmupScreen | null = null;
 
   constructor(private readonly root: HTMLElement, private readonly api: AdminApi) {
+    this.warmupApi = new WarmupApi(api);
     this.toasts.setAttribute('aria-live', 'polite');
     window.addEventListener('beforeunload', event => {
       if (this.unsavedChanges?.()) event.preventDefault();
@@ -1483,6 +1503,7 @@ class AdminApp {
     this.tariffsView = null;
     this.tariffEditorView = null;
     this.trialEditorView = null;
+    this.disposeWarmup();
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
@@ -1551,6 +1572,7 @@ class AdminApp {
     this.tariffsAt = null;
     this.plansCache = null;
     this.orderKey = null;
+    resetWarmupMemory();
 
     const card = el('section', 'auth-card');
     card.setAttribute('aria-labelledby', 'login-title');
@@ -1748,9 +1770,10 @@ class AdminApp {
 
   private renderSection(focus: boolean) {
     if (!this.shell) return;
-    const { section, userId, tariffId, sourceId, monitorId } = currentRoute();
+    const { section, userId, tariffId, sourceId, monitorId, warmup } = currentRoute();
     const canonical = userId !== null ? `#/users/${userId}` : tariffId !== null ? `#/tariffs/${tariffId}`
-      : sourceId !== null ? `#/sources/${sourceId}` : monitorId !== null ? `#/monitoring/${monitorId}` : `#/${section.id}`;
+      : sourceId !== null ? `#/sources/${sourceId}` : monitorId !== null ? `#/monitoring/${monitorId}`
+        : warmup !== null ? warmupHash(warmup) : `#/${section.id}`;
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
     for (const [id, link] of this.shell.links) {
       if (id === section.id) link.setAttribute('aria-current', 'page');
@@ -1774,6 +1797,7 @@ class AdminApp {
     this.tariffsView = null;
     this.tariffEditorView = null;
     this.trialEditorView = null;
+    this.disposeWarmup();
     this.unsavedChanges = null;
     this.pendingOrder = null;
     this.tariffsRequest++;
@@ -1804,6 +1828,17 @@ class AdminApp {
       back.append(icon('back'), el('span', '', 'Назад к пользователям'));
       page.append(back, header, this.buildUserDetail(userId, header, title, desc));
       load = () => this.loadUser();
+    } else if (warmup !== null) {
+      if (warmup.view === 'create' || warmup.view === 'scenario') {
+        const back = el('a', 'back-link');
+        back.href = '#/warmup';
+        back.append(icon('back'), el('span', '', 'Назад к сценариям'));
+        page.append(back);
+      }
+      const screen = new WarmupScreen(this.warmupHost(), warmup, { header, title, desc });
+      this.warmupScreen = screen;
+      page.append(header, screen.body);
+      load = () => screen.load();
     } else if (section.id === 'overview') {
       page.append(header, this.buildOverview(header));
       load = () => this.loadDashboard();
@@ -7562,6 +7597,30 @@ class AdminApp {
     write();
     refreshAll();
     paintPreview({ kind: 'data', preview: lastPreview });
+  }
+
+  // Customer warm-up ---------------------------------------------------------
+
+  private disposeWarmup() {
+    this.warmupScreen?.dispose();
+    this.warmupScreen = null;
+  }
+
+  /** What a warm-up screen may use of the shell: session, dialogs, guard, routing. */
+  private warmupHost(): WarmupHost {
+    return {
+      api: this.warmupApi,
+      icon: name => icon(name),
+      toast: text => this.toast(text),
+      confirm: (titleText, text, confirmLabel) => this.confirmAction(titleText, text, confirmLabel),
+      setUnsaved: check => { this.unsavedChanges = check; },
+      signedOut: (error, current) => this.endIfSignedOut(error, current),
+      navigate: hash => {
+        this.unsavedChanges = null;
+        location.hash = hash;
+      },
+      sessionUsed: () => { this.lastSessionCheck = Date.now(); },
+    };
   }
 
   /** A modal yes/no confirmation; resolves false when dismissed in any way. */

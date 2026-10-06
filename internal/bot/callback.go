@@ -51,6 +51,14 @@ func (c *CallbackHandler) HandleCallback(ctx context.Context, update tgbotapi.Up
 		return nil
 	}
 
+	// A warm-up button pressed on a photo message: re-target the callback to a
+	// fresh text message the handler can edit (see detachWarmupMediaCallback).
+	update, detached := c.h.detachWarmupMediaCallback(update)
+	if !detached {
+		c.answerCallback(update.CallbackQuery.ID)
+		return nil
+	}
+
 	data := update.CallbackQuery.Data
 	chatID := update.CallbackQuery.Message.Chat.ID
 	username := c.h.getUsername(update.CallbackQuery.From)

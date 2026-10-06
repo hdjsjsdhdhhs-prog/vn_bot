@@ -236,6 +236,7 @@ func startWebServer(subService *service.SubscriptionService, cfg *config.Config,
 	webServer.SetBuilderService(builderService)
 	webServer.SetTariffService(service.NewTariffService(dbService))
 	webServer.SetTrialService(service.NewTrialService(dbService, subService.TrialDefaults()))
+	webServer.SetWarmupService(service.NewWarmupService(dbService, subService.TrialDefaults()))
 	if netMonitor != nil {
 		webServer.SetNetworkMonitor(netMonitor)
 	}
@@ -283,7 +284,12 @@ func startWebServer(subService *service.SubscriptionService, cfg *config.Config,
 // завершения при штатном выключении.
 func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subService *service.SubscriptionService, syncSvc *service.SyncService, orderSvc *service.OrderService, dbService *database.Service, cfg *config.Config) *sync.WaitGroup {
 	var wg sync.WaitGroup
-	wg.Add(9)
+	wg.Add(10)
+
+	// Customer warm-up: /start records contacts (wired before the update loop
+	// starts), the worker sends the scenarios through the handler's sender.
+	warmupSvc := service.NewWarmupService(dbService, subService.TrialDefaults())
+	handler.SetWarmupContacts(warmupSvc)
 
 	// The services are wired before any background goroutine starts. Reuse the
 	// same SyncService instance that was injected into payment/subscription
@@ -404,6 +410,14 @@ func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subServic
 
 		trafficWorker := scheduler.NewSubscriptionTrafficWorker(dbService, subService)
 		trafficWorker.Run(ctx)
+	}()
+
+	go func() {
+		defer recoverAndReport("Warmup worker")
+		defer wg.Done()
+
+		warmupWorker := scheduler.NewWarmupWorker(warmupSvc, handler.WarmupSender(dbService))
+		warmupWorker.Run(ctx)
 	}()
 
 	return &wg

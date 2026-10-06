@@ -37,12 +37,21 @@ func (ms *MessageSender) Send(ctx context.Context, msg tgbotapi.MessageConfig) {
 func (ms *MessageSender) SendWithError(ctx context.Context, msg tgbotapi.MessageConfig) error {
 	msg.DisableWebPagePreview = true
 
-	if !ms.rateLimiter.Wait(ctx, msg.ChatID) {
-		return ctx.Err()
+	_, err := ms.SendChattable(ctx, msg.ChatID, msg)
+
+	return err
+}
+
+// SendChattable sends any Chattable (text, photo, ...) to chatID with the same
+// per-user rate limiting, metrics and logging as SendWithError, and returns
+// the sent message (its ID and, for photos, the Telegram file IDs).
+func (ms *MessageSender) SendChattable(ctx context.Context, chatID int64, chattable tgbotapi.Chattable) (tgbotapi.Message, error) {
+	if !ms.rateLimiter.Wait(ctx, chatID) {
+		return tgbotapi.Message{}, ctx.Err()
 	}
 
 	start := time.Now()
-	_, err := ms.bot.Send(msg)
+	sent, err := ms.bot.Send(chattable)
 	duration := time.Since(start).Seconds()
 
 	if err != nil {
@@ -55,13 +64,13 @@ func (ms *MessageSender) SendWithError(ctx context.Context, msg tgbotapi.Message
 			logger.Error("Failed to send message", zap.Error(err))
 		}
 
-		return err
+		return tgbotapi.Message{}, err
 	}
 
 	metrics.TelegramAPICallsTotal.WithLabelValues("send", "success").Inc()
 	metrics.TelegramAPIDuration.WithLabelValues("send").Observe(duration)
 
-	return nil
+	return sent, nil
 }
 
 // SafeSend sends a message without rate limiting and logs errors.

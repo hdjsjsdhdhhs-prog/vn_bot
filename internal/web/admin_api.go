@@ -31,12 +31,13 @@ type adminAPI struct {
 	builderSvc *service.BuilderService
 	tariffSvc  *service.TariffService
 	trialSvc   *service.TrialService
+	warmupSvc  *service.WarmupService
 	monitor    NetworkMonitor
 	actor      string
 }
 
-func newAdminAPI(svc *service.AdminService, builderSvc *service.BuilderService, tariffSvc *service.TariffService, trialSvc *service.TrialService, monitor NetworkMonitor, actor string) http.Handler {
-	return &adminAPI{svc: svc, builderSvc: builderSvc, tariffSvc: tariffSvc, trialSvc: trialSvc, monitor: monitor, actor: actor}
+func newAdminAPI(svc *service.AdminService, builderSvc *service.BuilderService, tariffSvc *service.TariffService, trialSvc *service.TrialService, warmupSvc *service.WarmupService, monitor NetworkMonitor, actor string) http.Handler {
+	return &adminAPI{svc: svc, builderSvc: builderSvc, tariffSvc: tariffSvc, trialSvc: trialSvc, warmupSvc: warmupSvc, monitor: monitor, actor: actor}
 }
 
 func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -81,6 +82,8 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.routeTariffs(w, r, segments)
 	case segments[0] == "trial":
 		a.routeTrial(w, r, segments)
+	case segments[0] == "warmup":
+		a.routeWarmup(w, r, segments)
 	case len(segments) == 1 && segments[0] == "plans":
 		a.get(w, r, a.plansList)
 	case len(segments) == 2 && segments[0] == "subscriptions":

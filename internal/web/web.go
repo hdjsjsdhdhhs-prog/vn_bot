@@ -102,6 +102,7 @@ type Server struct {
 	builderService     *service.BuilderService
 	tariffService      *service.TariffService
 	trialService       *service.TrialService
+	warmupService      *service.WarmupService
 	networkMonitor     NetworkMonitor
 	paymentConfig      *PaymentConfig
 	subServer          *subserver.Service
@@ -185,6 +186,16 @@ func (s *Server) SetTrialService(trialService *service.TrialService) {
 	defer s.mu.Unlock()
 
 	s.trialService = trialService
+}
+
+// SetWarmupService wires the customer warm-up JSON API under
+// /admin/api/warmup. Without it those (still session-protected) routes
+// answer 503. Set before Start.
+func (s *Server) SetWarmupService(warmupService *service.WarmupService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.warmupService = warmupService
 }
 
 // SetNetworkMonitor wires the read-only monitor API under
@@ -276,7 +287,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cfg != nil {
 		actor = s.cfg.AdminUsername
 	}
-	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, s.tariffService, s.trialService, s.networkMonitor, actor))
+	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, s.tariffService, s.trialService, s.warmupService, s.networkMonitor, actor))
 
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
