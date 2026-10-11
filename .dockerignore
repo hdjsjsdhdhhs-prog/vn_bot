@@ -20,6 +20,9 @@ frontend/playwright-report/
 internal/web/miniapp_dist/public/
 internal/web/admin_dist/public/
 
+# Local scratch data (gitignored, never needed by the build)
+tmp/
+
 # IDE
 .idea/
 .vscode/
