@@ -3,6 +3,9 @@ import { catalogOrder, errorText } from './api';
 import type { Store, Resource } from './store';
 import { safeHTTPS } from './telegram';
 import type { WebApp } from './telegram';
+import type { Choice } from './vpnapps';
+import { choose, connectPageLink, detectPlatform, loadChoice, platformLabel, saveChoice } from './vpnapps';
+import { appList, appName, choiceSummary, downloadButtons, enableSteps, isBestEffort, platformSwitch } from './picker';
 
 export function el<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text?: string): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
@@ -118,9 +121,32 @@ export function productDetail(offer: Offer) {
   return card;
 }
 
-export function mount(root: HTMLElement, store: Store, telegram?: WebApp) {
+export function mount(root: HTMLElement, store: Store, telegram?: WebApp, preferences?: Storage) {
   let notice = '';
   let previousRoute = '';
+  // VPN client choice: only platform/app identifiers are ever persisted.
+  const saved = loadChoice(preferences);
+  let chosen = saved !== null;
+  let choice: Choice = saved ?? choose(detectPlatform(navigator.userAgent, telegram?.platform, navigator.maxTouchPoints, navigator.platform));
+  let pendingFocus = '';
+  const setChoice = (next: Choice, focus = '') => {
+    choice = next; chosen = true; pendingFocus = focus; saveChoice(choice, preferences); notice = ''; render();
+  };
+  const openExternal = (url: string, failure: string) => {
+    try { telegram?.openLink(safeHTTPS(url)); } catch { notice = failure; render(); }
+  };
+  // Opens THIS subscription's https connection page in the browser with the
+  // choice preselected in the fragment. Custom schemes are never opened from
+  // the Telegram WebView; the page launches the app from the user's own tap.
+  const addToApp = (sub: Subscription) => {
+    if (!chosen) { chosen = true; saveChoice(choice, preferences); }
+    try {
+      telegram?.openLink(connectPageLink(sub.connection_url, choice));
+      notice = `Открываем страницу подключения в браузере. Нажмите там «Добавить подписку в ${appName(choice)}». Если ${appName(choice)} не откроется, используйте QR-код или ссылку на той же странице.`;
+    } catch { notice = 'Не удалось открыть страницу подключения. Скопируйте ссылку подписки ниже и добавьте её в приложение вручную.'; }
+    render();
+  };
+  const addButton = (sub: Subscription) => button(`Добавить подписку в ${appName(choice)}`, () => addToApp(sub));
   const refresh = () => { void store.refresh(); };
   const back = () => {
     const route = location.hash.slice(1);
@@ -200,25 +226,57 @@ export function mount(root: HTMLElement, store: Store, telegram?: WebApp) {
         if (store.error) main.append(errorCard(store.error, retry));
       }
     } else if (route === 'subscriptions') {
-      main.append(heading('Мои подписки', 'Ваш доступ и срок действия.'), resource(store.subscription, sub => subscriptionCard(sub, true), refresh), button('Обновить статус', refresh, true, store.subscription.loading));
+      main.append(heading('Мои подписки', 'Ваш доступ и срок действия.'), resource(store.subscription, sub => {
+        const card = subscriptionCard(sub, true);
+        // Each card's button carries the connection link of ITS subscription.
+        if (sub && sub.status === 'active') {
+          const direct = el('div', 'direct-connect');
+          if (chosen) {
+            direct.append(addButton(sub));
+            const change = link(`Устройство: ${choiceSummary(choice)} · Изменить`, 'connection', true); change.classList.add('choice-link');
+            direct.append(change);
+          } else direct.append(el('p', 'small muted', 'Выберите систему и VPN-приложение один раз — и добавляйте подписку в него одной кнопкой.'), link('Выбрать приложение', 'connection', true));
+          card.append(direct);
+        }
+        return card;
+      }, refresh), button('Обновить статус', refresh, true, store.subscription.loading));
     } else if (route === 'connection') {
       main.append(heading('Вы на шаг ближе', 'Подключите доступ на вашем устройстве.'));
       main.append(resource(store.subscription, sub => {
         if (!sub || sub.status !== 'active') return subscriptionCard(sub, true);
-        const card = el('section', 'card steps');
-        for (const [index, [title, text]] of [['Откройте инструкцию', 'Готовая страница с QR-кодом и ссылкой подключения.'], ['Добавьте подписку', 'Следуйте инструкции в вашем VPN-приложении.'], ['Подключитесь', 'Выберите сервер и включите соединение.']].entries()) {
-          const step = el('div', 'step'); const copy = el('div'); copy.append(el('h2', '', title), el('p', 'muted', text)); step.append(el('span', 'step-number', String(index + 1)), copy); card.append(step);
-        }
-        card.append(button('Открыть подключение ↗', () => {
-          try { telegram.openLink(safeHTTPS(sub.connection_url)); } catch { notice = 'Не удалось открыть подключение. Обновите подписку.'; render(); }
-        }), button('Скопировать ссылку подписки', () => {
+        const wrap = el('div', 'stack');
+        const card = el('section', 'card steps connect-steps');
+        const step = (index: number, title: string, id = '') => {
+          const item = el('div', 'step'); const head = el('div', 'step-head');
+          const number = el('span', 'step-number', String(index)); number.setAttribute('aria-hidden', 'true');
+          const h = el('h2', '', title); if (id) h.id = id;
+          head.append(number, h); item.append(head); card.append(item); return item;
+        };
+        const name = appName(choice);
+        const s1 = step(1, 'Выберите систему', 'pick-os');
+        s1.append(platformSwitch(choice, setChoice, 'pick-os'));
+        if (!chosen) s1.append(el('p', 'small muted', 'Система определена автоматически — её можно сменить.'));
+        step(2, 'Выберите приложение', 'pick-app').append(appList(choice, setChoice, 'pick-app'));
+        const s3 = step(3, `Установите ${name}`);
+        s3.append(el('p', 'small muted', `Пропустите шаг, если ${name} уже установлен. Ссылки ведут на официальные страницы разработчика.`), downloadButtons(choice, url => {
+          if (!chosen) { chosen = true; saveChoice(choice, preferences); }
+          openExternal(url, 'Не удалось открыть страницу загрузки.');
+        }));
+        const s4 = step(4, 'Добавьте подписку');
+        s4.append(addButton(sub), el('p', 'small muted', `Откроется страница подключения в браузере, где уже выбраны ${platformLabel(choice.platform)} и ${name}. Нажмите там «Добавить подписку в ${name}» — приложение предложит сохранить подписку.`));
+        if (isBestEffort(choice)) s4.append(el('p', 'notice', `На ${platformLabel(choice.platform)} запуск ${name} по ссылке зависит от версии приложения. Если ничего не произошло, скопируйте ссылку и добавьте её в ${name} вручную.`));
+        step(5, 'Включите VPN').append(enableSteps(choice));
+        const fallback = el('section', 'card fallback');
+        fallback.append(el('h2', '', 'Другие способы'), el('p', 'small muted', 'QR-код, ссылка подписки и подробная инструкция — на странице подключения.'));
+        fallback.append(button('Открыть подключение ↗', () => openExternal(sub.connection_url, 'Не удалось открыть подключение. Обновите подписку.')), button('Скопировать ссылку подписки', () => {
           void (async () => {
             try { await navigator.clipboard.writeText(safeHTTPS(sub.subscription_url)); notice = 'Ссылка скопирована. Не передавайте её другим.'; }
             catch { notice = 'Копирование недоступно. Откройте страницу подключения и скопируйте ссылку там.'; }
             render();
           })();
         }, true), el('p', 'small muted', 'Ссылка — ваш личный ключ доступа. Не делитесь ей.'));
-        return card;
+        wrap.append(card, fallback);
+        return wrap;
       }, refresh));
     } else if (route === 'profile') {
       main.append(heading('Профиль', 'Покупки и настройки приложения.'));
@@ -253,7 +311,11 @@ export function mount(root: HTMLElement, store: Store, telegram?: WebApp) {
     // Restore keyboard focus across state renders, without HTML interpolation.
     for (const [index, node] of Array.from(view.querySelectorAll<HTMLElement>('button, a')).entries()) node.dataset.focus = `${route}:${node.textContent}:${index}`;
     root.replaceChildren(view);
-    if (focusKey) Array.from(root.querySelectorAll<HTMLElement>('[data-focus]')).find(node => node.dataset.focus === focusKey)?.focus({ preventScroll: true });
+    if (pendingFocus) {
+      // Radio groups keep focus on the newly selected option (arrow keys/click).
+      Array.from(root.querySelectorAll<HTMLElement>('[data-radio]')).find(node => node.dataset.radio === pendingFocus)?.focus({ preventScroll: true });
+      pendingFocus = '';
+    } else if (focusKey) Array.from(root.querySelectorAll<HTMLElement>('[data-focus]')).find(node => node.dataset.focus === focusKey)?.focus({ preventScroll: true });
     if (route !== previousRoute) { previousRoute = route; window.scrollTo(0, 0); }
   };
   const routeChanged = () => {

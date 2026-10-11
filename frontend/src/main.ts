@@ -13,10 +13,13 @@ if (new URLSearchParams(location.hash.slice(1)).has('tgWebAppData')) {
 }
 let storage: Storage | undefined;
 try { storage = window.sessionStorage; } catch { /* Telegram privacy modes may disable storage. */ }
+// Remembers only the chosen platform/app identifiers (see vpnapps.ts).
+let preferences: Storage | undefined;
+try { preferences = window.localStorage; } catch { /* Fall back to an in-memory choice. */ }
 const store = new Store(new Api(telegram?.initData ?? ''), telegram, storage);
 const root = document.getElementById('app');
 if (root) {
-  const cleanupUI = mount(root, store, telegram);
+  const cleanupUI = mount(root, store, telegram, preferences);
   if (telegram?.initData) void store.refresh();
   window.addEventListener('pagehide', event => {
     if (!event.persisted) { cleanupUI(); cleanupTelegram(); store.dispose(); }

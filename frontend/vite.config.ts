@@ -11,6 +11,11 @@ const admin = {
 export default defineConfig(({ mode }) => mode === 'admin' ? admin : {
   base: '/miniapp/',
   build: { outDir: '../internal/web/miniapp_dist/public', emptyOutDir: true, sourcemap: false },
-  server: { proxy: { '/api/miniapp': 'http://127.0.0.1:8880' } },
+  // The shared VPN app catalog lives with the Go templates (single source);
+  // the golden pages are Go-rendered /connect fixtures used by unit tests.
+  server: {
+    proxy: { '/api/miniapp': 'http://127.0.0.1:8880' },
+    fs: { allow: ['.', '../internal/web/templates/vpn_apps.json', '../internal/web/testdata'] },
+  },
   test: { environment: 'jsdom', include: ['tests/**/*.test.ts'], maxWorkers: 1 },
 });

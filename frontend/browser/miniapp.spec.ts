@@ -264,6 +264,95 @@ test('tariff editor presentation: sort_order, badge, description, features and f
   await expect(page.getByText('✦ Без автоматических списаний')).toBeVisible();
 });
 
+const tokenA = 'c'.repeat(64);
+const tokenB = 'd'.repeat(64);
+const activeSub = (token: string) => ({ status: 'active', expires_at: '2026-12-19T12:00:00Z', subscription_url: `https://customer.example/sub/${token}`, connection_url: `https://customer.example/connect/${token}` });
+const lastLink = (page: Page) => page.evaluate(() => (window as unknown as { testTelegram: { link: string } }).testTelegram.link);
+const noScroll = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth);
+
+test('#connection at 390px: platform → app → official download → add via the external connection page', async ({ page }) => {
+  await fixture(page);
+  await page.route('**/api/miniapp/subscription', route => route.fulfill({ json: activeSub(tokenA) }));
+  await page.goto('/miniapp/#connection');
+  const os = page.getByRole('radiogroup', { name: 'Выберите систему' }).getByRole('radio');
+  await expect(os).toHaveText(['iOS', 'Android', 'Windows', 'Linux', 'macOS']);
+  const apps = page.getByRole('radiogroup', { name: 'Выберите приложение' }).locator('.app-name');
+  for (const [label, names] of [['iOS', ['Happ', 'Инси (Incy)', 'V2RayTun']], ['Android', ['Happ', 'Инси (Incy)', 'V2RayTun']], ['Windows', ['Happ']], ['Linux', ['Happ']], ['macOS', ['Happ']]] as const) {
+    await page.getByRole('radio', { name: label, exact: true }).click();
+    await expect(page.getByRole('radio', { name: label, exact: true })).toHaveAttribute('aria-checked', 'true');
+    await expect(apps).toHaveText([...names]);
+    expect(await noScroll(page)).toBe(true);
+  }
+  // Desktop Happ: best-effort notice.
+  await expect(page.getByText('запуск Happ по ссылке зависит от версии приложения', { exact: false })).toBeVisible();
+  // Switching to a platform without the chosen app falls back to Happ.
+  await page.getByRole('radio', { name: 'Android', exact: true }).click();
+  await page.locator('[data-radio="app:v2raytun"]').click();
+  await page.getByRole('radio', { name: 'Linux', exact: true }).click();
+  await expect(page.locator('[data-radio="app:happ"]')).toHaveAttribute('aria-checked', 'true');
+  await page.getByRole('radio', { name: 'Android', exact: true }).click();
+  await page.locator('[data-radio="app:incy"]').click();
+  await expect(page.getByRole('heading', { name: 'Установите Инси (Incy)' })).toBeVisible();
+  await page.getByRole('button', { name: 'Google Play ↗' }).click();
+  expect(await lastLink(page)).toBe('https://play.google.com/store/apps/details?id=llc.itdev.incy');
+  await page.getByRole('button', { name: 'Добавить подписку в Инси (Incy)' }).click();
+  // Variant A: Telegram opens THIS subscription's https page with os/app only.
+  expect(await lastLink(page)).toBe(`https://customer.example/connect/${tokenA}#os=android&app=incy`);
+  await expect(page.getByRole('status').filter({ hasText: 'Открываем страницу подключения' })).toBeVisible();
+  await expect(page.getByText('добавлена', { exact: false })).toHaveCount(0);
+  // Fallbacks stay: QR/instructions page and copy.
+  await expect(page.getByRole('button', { name: 'Открыть подключение ↗' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Скопировать ссылку подписки' })).toBeVisible();
+  await expect(page).toHaveURL(/\/miniapp\/#connection$/);
+  expect(await page.evaluate(() => localStorage.getItem('dictatorvpn.vpn-client'))).toBe('{"platform":"android","app":"incy"}');
+  expect(await noScroll(page)).toBe(true);
+  await page.screenshot({ path: 'test-results/miniapp-connection-390.png', fullPage: true });
+});
+
+test('#subscriptions remembers the choice and each card uses its own subscription link', async ({ page }) => {
+  await fixture(page);
+  let current = tokenA;
+  await page.route('**/api/miniapp/subscription', route => route.fulfill({ json: activeSub(current) }));
+  await page.goto('/miniapp/#subscriptions');
+  // No choice yet: ask once instead of guessing silently.
+  await expect(page.getByRole('link', { name: 'Выбрать приложение' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Добавить подписку в/ })).toHaveCount(0);
+  await page.getByRole('link', { name: 'Выбрать приложение' }).click();
+  await page.getByRole('radio', { name: 'iOS', exact: true }).click();
+  await page.locator('[data-radio="app:v2raytun"]').click();
+  await page.getByRole('link', { name: 'Подписки', exact: true }).click();
+  await expect(page.getByText('Устройство: iOS · V2RayTun · Изменить')).toBeVisible();
+  await page.getByRole('button', { name: 'Добавить подписку в V2RayTun' }).click();
+  expect(await lastLink(page)).toBe(`https://customer.example/connect/${tokenA}#os=ios&app=v2raytun`);
+  // Another subscription arrives from the server: the button follows it.
+  current = tokenB;
+  await page.getByRole('button', { name: 'Обновить статус' }).click();
+  await page.getByRole('button', { name: 'Добавить подписку в V2RayTun' }).click();
+  const link = await lastLink(page);
+  expect(link).toBe(`https://customer.example/connect/${tokenB}#os=ios&app=v2raytun`);
+  expect(link).not.toContain(tokenA);
+  // Survives a reload; storage never holds the bearer URLs.
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Добавить подписку в V2RayTun' })).toBeVisible();
+  const stored = await page.evaluate(() => JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage }));
+  expect(stored).not.toContain(tokenA);
+  expect(stored).not.toContain(tokenB);
+  expect(stored).not.toContain('customer.example');
+  // Home and the existing renewal/connection affordances are unchanged.
+  await expect(page.getByRole('link', { name: 'Подключиться ↗' })).toBeVisible();
+  expect(await noScroll(page)).toBe(true);
+  await page.screenshot({ path: 'test-results/miniapp-subscriptions-390.png', fullPage: true });
+});
+
+test('unexpected connection URL degrades to the manual fallback, never a custom scheme', async ({ page }) => {
+  await fixture(page);
+  await page.goto('/miniapp/#connection');
+  await page.getByRole('button', { name: /Добавить подписку в/ }).click();
+  await expect(page.getByText('Не удалось открыть страницу подключения.', { exact: false })).toBeVisible();
+  expect(await lastLink(page)).toBe('');
+  await expect(page.getByRole('button', { name: 'Скопировать ссылку подписки' })).toBeVisible();
+});
+
 test('responsive layout at narrow and wide sizes', async ({ page }) => {
   await fixture(page); await page.goto('/miniapp/');
   for (const width of [320, 390, 768]) {

@@ -1,6 +1,8 @@
 export type InvoiceResult = 'paid' | 'cancelled' | 'failed' | 'pending';
 export interface WebApp {
   initData: string;
+  /** Display hint only (e.g. "ios", "android", "tdesktop"); never authorization. */
+  platform?: string;
   initDataUnsafe?: { user?: { first_name?: string; last_name?: string; username?: string } };
   colorScheme: 'light' | 'dark';
   themeParams: { bg_color?: string; text_color?: string; secondary_bg_color?: string; hint_color?: string; button_color?: string };

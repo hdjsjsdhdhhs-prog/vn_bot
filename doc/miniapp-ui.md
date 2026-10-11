@@ -15,7 +15,7 @@ Foundation and Stars already own pricing, ownership, eligibility and settlement.
 | Invoice | POST /api/miniapp/orders/{reference}/invoice, no body/query; invoice_url. |
 | Payment | Telegram.WebApp.openInvoice(invoice_url); callback is only a hint to re-fetch, never proof of payment. |
 | Result | GET /api/miniapp/orders/{reference}; pending / paid / expired / canceled. Only server paid means settlement. |
-| Connection | Use supplied connection_url for existing /connect/{token} page (QR / import instructions); copy subscription_url only on explicit user action. |
+| Connection | Use supplied connection_url for existing /connect/{token} page (QR / import instructions); copy subscription_url only on explicit user action. `#connection` has the OS/app picker (shared catalog, [vpn-apps.md](vpn-apps.md)); "Добавить подписку в {App}" (on `#connection` and on the active card in `#subscriptions`) opens `connection_url#os=…&app=…` of that card's subscription via `openLink`. The WebView never opens custom schemes. Only `{platform, app}` is stored in localStorage (`dictatorvpn.vpn-client`). |
 | Subscription states | active / expired / revoked / paused / canceled. No client renewal endpoint. |
 
 For XTR, amount_cents is an integer number of Stars, not cents. Other currencies

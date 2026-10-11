@@ -4,6 +4,8 @@ WORKDIR /ui
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
+# Shared VPN app catalog (also embedded by Go): imported as ../../internal/web/templates/vpn_apps.json
+COPY internal/web/templates/vpn_apps.json /internal/web/templates/vpn_apps.json
 RUN npm run lint && npm run typecheck && npm run build && npm run build:admin
 
 # Build stage

@@ -2,62 +2,189 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Подключение к подписке</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#000000">
+    <meta name="referrer" content="no-referrer">
+    <title>Подключение к подписке · DictatorVPN</title>
     <style>
+        :root {
+            --bg: #000000; --surface: #111317; --surface-2: #181b21; --line: rgba(255, 255, 255, 0.09); --line-strong: rgba(255, 255, 255, 0.16);
+            --text: #ffffff; --muted: #a3aab6; --accent: #4690ff; --accent-ink: #00112e; --accent-soft: rgba(70, 144, 255, 0.14);
+            --positive: #3ddc97; --warning: #f5b84a;
+            --radius: 20px; --radius-sm: 14px; --gap: 16px;
+            color-scheme: dark;
+        }
         * { box-sizing: border-box; }
-        body { margin: 0; min-width: 320px; background: #f4f6f8; color: #20262d; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-        main { width: min(100% - 32px, 560px); margin: 0 auto; padding: 32px 0 48px; }
-        .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; font-size: 18px; font-weight: 700; }
-        .brand img { width: 36px; height: 36px; object-fit: contain; }
-        .panel { background: #ffffff; border: 1px solid #dce2e8; border-radius: 8px; padding: 24px; box-shadow: 0 8px 24px rgba(32, 38, 45, 0.08); }
-        h1 { margin: 0 0 8px; font-size: 24px; line-height: 1.25; }
-        .lead { margin: 0 0 24px; color: #5c6975; line-height: 1.5; }
-        .details { border-top: 1px solid #e6ebef; border-bottom: 1px solid #e6ebef; margin: 20px 0 24px; padding: 4px 0; }
-        .detail { display: flex; justify-content: space-between; gap: 16px; padding: 12px 0; font-size: 14px; }
-        .detail dt { color: #5c6975; }
-        .detail dd { margin: 0; text-align: right; font-weight: 600; }
-        .status { color: #735215; }
-        .status.active { color: #106c4b; }
-        .privacy { margin: 16px 0 0; color: #5c6975; font-size: 14px; line-height: 1.5; }
-        .qr { display: block; width: min(100%, 280px); height: auto; margin: 0 auto 12px; image-rendering: pixelated; }
-        .qr-note { margin: 0 0 24px; color: #5c6975; text-align: center; font-size: 14px; line-height: 1.5; }
-        label { display: block; margin-bottom: 8px; font-size: 14px; font-weight: 600; }
-        .url-row { display: flex; gap: 8px; }
-        input { min-width: 0; flex: 1; border: 1px solid #b8c3cd; border-radius: 6px; background: #f9fafb; color: #20262d; padding: 12px; font: 16px ui-monospace, SFMono-Regular, Menlo, monospace; }
-        button { flex: 0 0 auto; border: 1px solid #106c4b; border-radius: 6px; background: #106c4b; color: #ffffff; padding: 12px 16px; font: inherit; font-weight: 600; cursor: pointer; }
-        button:hover { background: #0d5a3f; }
-        button:focus-visible, input:focus-visible { outline: 3px solid #8acdb4; outline-offset: 2px; }
-        #copy-status { min-height: 20px; margin: 10px 0 0; color: #106c4b; font-size: 14px; }
-        @media (max-width: 480px) { main { width: min(100% - 24px, 560px); padding-top: 20px; } .panel { padding: 20px; } .url-row { flex-direction: column; } button { width: 100%; } .detail { align-items: flex-start; flex-direction: column; gap: 4px; } .detail dd { text-align: left; } }
+        [hidden] { display: none !important; }
+        html { -webkit-text-size-adjust: 100%; }
+        body { margin: 0; min-width: 300px; background: var(--bg); color: var(--text); font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+        a { color: inherit; }
+        h1, h2, h3, p, dl, dd, ol { margin: 0; }
+        button, a, input { font: inherit; -webkit-tap-highlight-color: transparent; }
+        button, a, h1, h2, h3, p, dd { overflow-wrap: anywhere; }
+        button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+        .page { width: min(100% - 32px, 1080px); margin: 0 auto; padding: max(20px, env(safe-area-inset-top)) 0 max(40px, env(safe-area-inset-bottom)); }
+        .top { display: flex; align-items: center; gap: 12px; min-height: 48px; margin-bottom: 20px; }
+        .top img { width: 36px; height: 36px; object-fit: contain; border-radius: 10px; }
+        .top .brand { font-size: 19px; font-weight: 750; letter-spacing: -0.02em; }
+        .top .caption { margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; }
+        .layout { display: grid; gap: var(--gap); grid-template-columns: minmax(0, 1fr); grid-template-areas: "status" "connect" "fallback"; }
+        .area-status { grid-area: status; } .area-connect { grid-area: connect; } .area-fallback { grid-area: fallback; }
+        .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; }
+        h1 { font-size: clamp(24px, 6.4vw, 30px); line-height: 1.2; letter-spacing: -0.03em; font-weight: 750; }
+        h2 { font-size: 20px; line-height: 1.3; letter-spacing: -0.02em; font-weight: 700; }
+        h3 { font-size: 16px; line-height: 1.35; font-weight: 650; }
+        .muted { color: var(--muted); }
+        .small { font-size: 14px; }
+        .pill { display: inline-flex; align-items: center; gap: 8px; min-height: 30px; padding: 4px 12px; border-radius: 999px; background: rgba(245, 184, 74, 0.12); color: var(--warning); font-size: 13px; font-weight: 650; margin-bottom: 14px; }
+        .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+        .pill.pill-active { background: rgba(61, 220, 151, 0.12); color: var(--positive); }
+        .pill.pill-active::before { box-shadow: 0 0 0 4px rgba(61, 220, 151, 0.18); }
+        .lead { margin-top: 8px; color: var(--muted); }
+        .details { margin-top: 18px; border-top: 1px solid var(--line); }
+        .detail { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
+        .detail:last-child { border-bottom: 0; padding-bottom: 0; }
+        .detail dt { color: var(--muted); }
+        .detail dd { font-weight: 650; text-align: right; }
+        .status { color: var(--warning); }
+        .status.active { color: var(--positive); }
+        .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+        .steps { display: grid; gap: 22px; }
+        .step { display: grid; gap: 12px; }
+        .step-head { display: flex; align-items: center; gap: 12px; }
+        .num { flex: 0 0 auto; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: 14px; font-weight: 750; }
+        .segmented { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; padding: 4px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+        .seg { min-height: 44px; padding: 8px 4px; border: 0; border-radius: 10px; background: transparent; color: var(--muted); font-size: 14px; font-weight: 650; cursor: pointer; transition: background-color .18s ease, color .18s ease; }
+        .seg:hover { color: var(--text); }
+        .seg[aria-checked="true"] { background: var(--surface-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--line-strong); }
+        .hint { font-size: 13px; color: var(--muted); }
+        .apps { display: grid; gap: 10px; }
+        .app { display: flex; align-items: center; gap: 14px; width: 100%; min-height: 64px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text); text-align: left; cursor: pointer; transition: border-color .18s ease, background-color .18s ease; }
+        .app:hover { border-color: var(--line-strong); }
+        .app[aria-checked="true"] { border-color: var(--accent); background: linear-gradient(0deg, var(--accent-soft), var(--accent-soft)), var(--surface-2); }
+        .app-icon { flex: 0 0 auto; display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; background: var(--bg); border: 1px solid var(--line); color: var(--accent); font-weight: 800; font-size: 18px; }
+        .app-text { display: grid; gap: 2px; min-width: 0; flex: 1; }
+        .app-name { font-weight: 650; }
+        .app-desc { color: var(--muted); font-size: 13px; line-height: 1.4; }
+        .check { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--line-strong); }
+        .app[aria-checked="true"] .check { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 4px var(--surface-2); }
+        .panel { display: grid; gap: 22px; }
+        .buttons { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+        .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; padding: 12px 16px; border-radius: var(--radius-sm); border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--text); font-size: 15px; font-weight: 650; text-align: center; text-decoration: none; cursor: pointer; transition: background-color .18s ease, border-color .18s ease, opacity .18s ease; }
+        .btn:hover { border-color: rgba(255, 255, 255, 0.28); }
+        .btn.primary { width: 100%; min-height: 54px; border-color: var(--accent); background: var(--accent); color: var(--accent-ink); font-size: 16px; font-weight: 750; }
+        .btn.primary:hover { background: #5c9eff; }
+        .btn:active { opacity: .85; }
+        .btn svg { width: 18px; height: 18px; flex: 0 0 auto; }
+        .note { padding: 12px 14px; border-radius: 12px; background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+        .import-status { font-size: 14px; color: var(--text); }
+        .import-status:empty { display: none; }
+        .import-status:not(:empty) { padding: 12px 14px; border-radius: 12px; background: var(--accent-soft); }
+        .enable { display: grid; gap: 8px; padding-left: 20px; color: var(--muted); font-size: 15px; }
+        .enable li::marker { color: var(--accent); font-weight: 700; }
+        .qr-wrap { display: grid; place-items: center; padding: 16px; margin: 16px 0 10px; border-radius: var(--radius-sm); background: #ffffff; width: min(100%, 272px); margin-left: auto; margin-right: auto; }
+        .qr { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+        .qr-note { margin-bottom: 20px; color: var(--muted); text-align: center; font-size: 14px; }
+        label { display: block; margin-bottom: 8px; font-size: 14px; font-weight: 650; }
+        .url-row { display: flex; flex-direction: column; gap: 8px; }
+        input { min-width: 0; width: 100%; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); padding: 13px 14px; font: 15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+        #copy-status { min-height: 20px; margin-top: 10px; color: var(--positive); font-size: 14px; }
+        .privacy { display: flex; gap: 10px; margin-top: 12px; padding: 12px 14px; border-radius: 12px; border: 1px solid rgba(245, 184, 74, 0.28); background: rgba(245, 184, 74, 0.08); color: #f3d9a6; font-size: 14px; }
+        .privacy svg { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 2px; color: var(--warning); }
+        .noscript { margin-top: 12px; color: var(--muted); font-size: 14px; }
+        @media (min-width: 560px) { .page { width: min(100% - 48px, 1080px); padding-top: 32px; } .card { padding: 28px; } .url-row { flex-direction: row; } .url-row .btn { flex: 0 0 auto; } }
+        @media (max-width: 370px) { .seg { font-size: 12.5px; } .card { padding: 18px; } .detail { flex-direction: column; gap: 2px; } .detail dd { text-align: left; } }
+        @media (min-width: 960px) {
+            .layout { grid-template-columns: minmax(0, 380px) minmax(0, 1fr); grid-template-areas: "status connect" "fallback connect"; align-items: start; }
+            .area-connect { position: sticky; top: 24px; }
+        }
+        @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
     </style>
 </head>
 <body>
-    <main>
-        <div class="brand"><img src="/static/logo.png" alt=""><span>DictatorVPN</span></div>
-        <section class="panel" aria-labelledby="page-title">
-            <h1 id="page-title">Подключение к подписке</h1>
-            {{if .Active}}<p class="lead">Сканируйте QR-код или скопируйте ссылку подписки в ваше VPN-приложение.</p>
-            {{else}}<p class="lead">Подписка сейчас неактивна. Подключение будет доступно после её возобновления.</p>{{end}}
+    <div class="page">
+        <header class="top">
+            <img src="/static/logo.png" alt="" width="36" height="36">
+            <span class="brand">DictatorVPN</span>
+            <span class="caption">Подключение</span>
+        </header>
+        <main class="layout">
+            <section class="card area-status" aria-labelledby="page-title">
+                <span class="pill{{if .Active}} pill-active{{end}}">{{.StatusLabel}}</span>
+                <h1 id="page-title">Подключение к подписке</h1>
+                {{if .Active}}<p class="lead">Выберите систему и приложение — подписка добавится в него одной кнопкой.</p>
+                {{else}}<p class="lead">Подписка сейчас неактивна. Подключение будет доступно после её возобновления.</p>{{end}}
+                <dl class="details">
+                    <div class="detail"><dt>Статус</dt><dd class="status{{if .Active}} active{{end}}">{{.StatusLabel}}</dd></div>
+                    <div class="detail"><dt>Срок действия</dt><dd>{{.ExpiresAt}}</dd></div>
+                </dl>
+            </section>
 
-            <dl class="details">
-                <div class="detail"><dt>Статус</dt><dd class="status{{if .Active}} active{{end}}">{{.StatusLabel}}</dd></div>
-                <div class="detail"><dt>Срок действия</dt><dd>{{.ExpiresAt}}</dd></div>
-            </dl>
+            {{with .Picker}}
+            <section class="card area-connect" id="connect-picker" aria-labelledby="connect-title">
+                <div class="section-head"><h2 id="connect-title">Подключение</h2></div>
+                <div class="steps">
+                    <div class="step">
+                        <div class="step-head"><span class="num" aria-hidden="true">1</span><h3 id="os-label">Выберите систему</h3></div>
+                        <div class="segmented" role="radiogroup" aria-labelledby="os-label">
+                            {{range .Platforms}}<button type="button" class="seg" role="radio" data-platform="{{.ID}}" aria-checked="{{if .Selected}}true{{else}}false{{end}}" tabindex="{{if .Selected}}0{{else}}-1{{end}}">{{.Label}}</button>{{end}}
+                        </div>
+                        <p class="hint" id="os-hint" hidden>Система определена автоматически — её можно сменить.</p>
+                    </div>
+                    <div class="step">
+                        <div class="step-head"><span class="num" aria-hidden="true">2</span><h3 id="app-label">Выберите приложение</h3></div>
+                        <div class="apps" role="radiogroup" aria-labelledby="app-label">
+                            {{range .Apps}}<button type="button" class="app" role="radio" data-app="{{.ID}}" data-platforms="{{.PlatformList}}" aria-checked="{{if .Selected}}true{{else}}false{{end}}" tabindex="{{if .Selected}}0{{else}}-1{{end}}"{{if not .Visible}} hidden{{end}}><span class="app-icon" aria-hidden="true">{{.Initial}}</span><span class="app-text"><span class="app-name">{{.Name}}</span><span class="app-desc">{{.Description}}</span></span><span class="check" aria-hidden="true"></span></button>{{end}}
+                        </div>
+                    </div>
+                    {{range .Panels}}
+                    <div class="panel" data-panel-app="{{.AppID}}" data-panel-platform="{{.PlatformID}}"{{if not .Visible}} hidden{{end}}>
+                        <div class="step">
+                            <div class="step-head"><span class="num" aria-hidden="true">3</span><h3>Установите {{.AppName}}</h3></div>
+                            <p class="small muted">Пропустите шаг, если {{.AppName}} уже установлен. Ссылки ведут на официальные страницы разработчика.</p>
+                            <div class="buttons">
+                                {{range .Downloads}}<a class="btn" href="{{.URL}}" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>{{.Label}}</a>{{end}}
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-head"><span class="num" aria-hidden="true">4</span><h3>Добавьте подписку</h3></div>
+                            {{if .HasImport}}
+                            <a class="btn primary" href="{{.ImportLink}}" data-import="{{.AppName}}">Добавить подписку в {{.AppName}}</a>
+                            {{if .BestEffort}}<p class="note">На {{.PlatformLabel}} открытие {{.AppName}} по ссылке зависит от версии приложения. Если ничего не произошло, скопируйте ссылку ниже и добавьте её в {{.AppName}} вручную.</p>{{end}}
+                            <p class="import-status" role="status" aria-live="polite"></p>
+                            {{else}}
+                            <p class="note">Прямое добавление в {{.AppName}} недоступно для этой ссылки. Отсканируйте QR-код или скопируйте ссылку ниже.</p>
+                            {{end}}
+                        </div>
+                        <div class="step">
+                            <div class="step-head"><span class="num" aria-hidden="true">5</span><h3>Включите VPN</h3></div>
+                            <ol class="enable">{{range .EnableSteps}}<li>{{.}}</li>{{end}}</ol>
+                        </div>
+                    </div>
+                    {{end}}
+                </div>
+                <noscript><p class="noscript">Для выбора системы и приложения включите JavaScript. Ниже доступны QR-код и ссылка подписки.</p></noscript>
+            </section>
+            {{end}}
 
-            <img class="qr" src="{{.QRCodeDataURL}}" alt="QR-код ссылки подписки">
-            <p class="qr-note">QR-код содержит только публичную ссылку подписки.</p>
+            <section class="card area-fallback" aria-labelledby="fallback-title">
+                <h2 id="fallback-title">{{if .Picker}}Другие способы{{else}}Подключение вручную{{end}}</h2>
+                <p class="small muted">Если приложение не открылось, отсканируйте QR-код в VPN-приложении или скопируйте ссылку подписки.</p>
+                <div class="qr-wrap"><img class="qr" src="{{.QRCodeDataURL}}" alt="QR-код ссылки подписки" width="240" height="240"></div>
+                <p class="qr-note">QR-код содержит только публичную ссылку подписки.</p>
 
-            <label for="subscription-url">Ссылка подписки</label>
-            <div class="url-row">
-                <input id="subscription-url" type="text" value="{{.SubURL}}" readonly spellcheck="false" autocomplete="off" aria-describedby="copy-status link-privacy">
-                <button id="copy-url" type="button">Скопировать ссылку</button>
-            </div>
-            <p id="copy-status" role="status" aria-live="polite"></p>
-            <p id="link-privacy" class="privacy">Не передавайте эту страницу, ссылку и QR-код другим людям: они дают доступ к вашей подписке.</p>
-            <noscript><p class="privacy">Для копирования выделите ссылку и используйте меню браузера.</p></noscript>
-        </section>
-    </main>
+                <label for="subscription-url">Ссылка подписки</label>
+                <div class="url-row">
+                    <input id="subscription-url" type="text" value="{{.SubURL}}" readonly spellcheck="false" autocomplete="off" aria-describedby="copy-status link-privacy">
+                    <button id="copy-url" class="btn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>Скопировать ссылку</button>
+                </div>
+                <p id="copy-status" role="status" aria-live="polite"></p>
+                <p id="link-privacy" class="privacy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="M12 8v5"/><path d="M12 16h.01"/></svg><span>Не передавайте эту страницу, ссылку и QR-код другим людям: они дают доступ к вашей подписке.</span></p>
+                <noscript><p class="noscript">Для копирования выделите ссылку и используйте меню браузера.</p></noscript>
+            </section>
+        </main>
+    </div>
     <script>
         (function () {
             var input = document.getElementById('subscription-url');
@@ -96,6 +223,136 @@
                 }
                 fallbackCopy();
             });
+
+            // Platform/app picker. Every deep link is a server-rendered href;
+            // this script only toggles visibility. The URL fragment may carry
+            // "os" and "app" identifiers (never sent to the server) and is
+            // accepted only when it matches a rendered option.
+            var picker = document.getElementById('connect-picker');
+            if (!picker) {
+                return;
+            }
+            var tabs = Array.prototype.slice.call(picker.querySelectorAll('[data-platform]'));
+            var apps = Array.prototype.slice.call(picker.querySelectorAll('[data-app]'));
+            var panels = Array.prototype.slice.call(picker.querySelectorAll('[data-panel-app]'));
+            var hint = document.getElementById('os-hint');
+            var state = { platform: '', app: '' };
+
+            function attr(node, name) {
+                return node.getAttribute(name) || '';
+            }
+            function hasPlatform(id) {
+                return tabs.some(function (tab) { return attr(tab, 'data-platform') === id; });
+            }
+            function appsFor(platform) {
+                return apps.filter(function (app) {
+                    return (' ' + attr(app, 'data-platforms') + ' ').indexOf(' ' + platform + ' ') !== -1;
+                });
+            }
+            function appAvailable(platform, id) {
+                return appsFor(platform).some(function (app) { return attr(app, 'data-app') === id; });
+            }
+            function detectPlatform() {
+                var nav = window.navigator || {};
+                var ua = String(nav.userAgent || '');
+                var platform = String((nav.userAgentData && nav.userAgentData.platform) || nav.platform || '');
+                var both = platform + ' ' + ua;
+                if (/iPhone|iPad|iPod/i.test(ua) || (/Mac/i.test(both) && nav.maxTouchPoints > 1)) return 'ios';
+                if (/Android/i.test(both)) return 'android';
+                if (/Win/i.test(both)) return 'windows';
+                if (/Mac/i.test(both)) return 'macos';
+                if (/Linux|X11|CrOS/i.test(both)) return 'linux';
+                return '';
+            }
+            function fragment() {
+                var result = { os: '', app: '' };
+                try {
+                    var params = new URLSearchParams(String(window.location.hash || '').replace(/^#/, ''));
+                    result.os = params.get('os') || '';
+                    result.app = params.get('app') || '';
+                } catch (error) {
+                    // Malformed fragments fall back to detection.
+                }
+                return result;
+            }
+            function setRadio(nodes, selected) {
+                nodes.forEach(function (node) {
+                    var on = node === selected;
+                    node.setAttribute('aria-checked', on ? 'true' : 'false');
+                    node.tabIndex = on ? 0 : -1;
+                });
+            }
+            function render() {
+                var tab = tabs.filter(function (node) { return attr(node, 'data-platform') === state.platform; })[0];
+                setRadio(tabs, tab);
+                var visible = appsFor(state.platform);
+                apps.forEach(function (app) { app.hidden = visible.indexOf(app) === -1; });
+                var app = visible.filter(function (node) { return attr(node, 'data-app') === state.app; })[0];
+                setRadio(apps, app);
+                panels.forEach(function (panel) {
+                    panel.hidden = !(attr(panel, 'data-panel-app') === state.app && attr(panel, 'data-panel-platform') === state.platform);
+                    Array.prototype.slice.call(panel.querySelectorAll('.import-status')).forEach(function (node) { node.textContent = ''; });
+                });
+            }
+            function select(platform, app) {
+                if (!hasPlatform(platform)) return;
+                state.platform = platform;
+                if (!appAvailable(platform, app)) {
+                    var first = appsFor(platform)[0];
+                    app = first ? attr(first, 'data-app') : '';
+                }
+                state.app = app;
+                render();
+            }
+            function arrows(nodes, event, activate) {
+                var keys = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+                if (!keys[event.key]) return;
+                var list = nodes.filter(function (node) { return !node.hidden; });
+                var index = list.indexOf(event.currentTarget);
+                var next = list[(index + keys[event.key] + list.length) % list.length];
+                event.preventDefault();
+                activate(next);
+                next.focus();
+            }
+            tabs.forEach(function (tab) {
+                tab.addEventListener('click', function () {
+                    if (hint) hint.hidden = true;
+                    select(attr(tab, 'data-platform'), state.app);
+                });
+                tab.addEventListener('keydown', function (event) {
+                    arrows(tabs, event, function (next) { select(attr(next, 'data-platform'), state.app); });
+                });
+            });
+            apps.forEach(function (app) {
+                app.addEventListener('click', function () { select(state.platform, attr(app, 'data-app')); });
+                app.addEventListener('keydown', function (event) {
+                    arrows(apps, event, function (next) { select(state.platform, attr(next, 'data-app')); });
+                });
+            });
+            Array.prototype.slice.call(picker.querySelectorAll('[data-import]')).forEach(function (link) {
+                // Navigation happens natively from the user's tap on the href.
+                // The browser cannot report whether the app imported anything,
+                // so never claim success here.
+                link.addEventListener('click', function () {
+                    var name = attr(link, 'data-import');
+                    var note = link.parentNode.querySelector('.import-status');
+                    if (note) {
+                        note.textContent = 'Открываем ' + name + '. Подтвердите добавление подписки в приложении. Если ' + name + ' не открылся, установите его (шаг 3) или используйте QR-код и копирование ссылки ниже.';
+                    }
+                });
+            });
+
+            var requested = fragment();
+            var detected = detectPlatform();
+            if (hasPlatform(requested.os)) {
+                select(requested.os, requested.app);
+            } else if (hasPlatform(detected)) {
+                select(detected, requested.app);
+                if (hint) hint.hidden = false;
+            } else {
+                var current = tabs.filter(function (tab) { return attr(tab, 'aria-checked') === 'true'; })[0] || tabs[0];
+                select(attr(current, 'data-platform'), requested.app);
+            }
         }());
     </script>
 </body>

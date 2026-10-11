@@ -124,6 +124,11 @@ func TestConnectionPage_StatesAndDataBoundary(t *testing.T) {
 				}
 				assertConnectionURLAndQR(t, body, cfg.SubURL(subscriptionInfoTokenA))
 				assertNoConnectionInternals(t, body)
+				// Deep links only for active subscriptions and only for this token's URL.
+				assert.Equal(t, tc.active, strings.Contains(body, `href="happ://add/`+cfg.SubURL(subscriptionInfoTokenA)+`"`))
+				if !tc.active {
+					assert.NotContains(t, body, "://add/")
+				}
 			})
 		}
 	}
@@ -252,8 +257,16 @@ func TestConnectionPage_TemplateEscapingAndLocalCopy(t *testing.T) {
 	for _, local := range []string{"input.value", "navigator.clipboard.writeText(value)", "document.execCommand('copy')", "input.setSelectionRange", "status.textContent"} {
 		assert.Contains(t, script, local)
 	}
-	for _, remote := range []string{"fetch(", "XMLHttpRequest", "sendBeacon", "http://", "https://", "happ://", "hiddify://", "incy://", "throne://", "<script src="} {
+	// Deep links are intentionally part of the page now (VPN app picker), but
+	// only as server-rendered href attributes for validated subscription URLs.
+	// The single inline script stays free of URLs, schemes, network and
+	// storage APIs: it only toggles visibility and copies the input value.
+	for _, remote := range []string{"fetch(", "XMLHttpRequest", "sendBeacon", "localStorage", "sessionStorage", "document.cookie", "http://", "https://", "happ://", "hiddify://", "incy://", "v2raytun://", "throne://", "<script src=", "innerHTML", "location.href", "location.assign", "window.open"} {
 		assert.NotContains(t, script, remote)
+	}
+	// This URL carries a query string, so no deep link may be built from it.
+	for _, scheme := range []string{"happ://", "incy://", "v2raytun://"} {
+		assert.NotContains(t, body, scheme)
 	}
 }
 

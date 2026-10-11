@@ -42,7 +42,7 @@ import (
 // allFiles contains the HTML templates and static assets bundled into the binary.
 // Keeping these files embedded makes the web server self-contained in production.
 //
-//go:embed templates/*.html templates/logo.png
+//go:embed templates/*.html templates/logo.png templates/vpn_apps.json
 var allFiles embed.FS
 
 // staticFiles is the filesystem used by template parsing and the logo handler.
@@ -120,6 +120,7 @@ type Server struct {
 	trialTemplate      *template.Template
 	connectionTemplate *template.Template
 	errorTemplate      *template.Template
+	vpnCatalog         *vpnCatalog
 }
 
 // NewServer constructs a web server and parses the embedded templates. It does
@@ -129,7 +130,7 @@ func NewServer(addr string, db interfaces.WebRepository, cfg *config.Config, bot
 	connectionTmpl := template.Must(template.New("connect.html").ParseFS(staticFiles, "templates/connect.html"))
 	errorTmpl := template.Must(template.New("error.html").ParseFS(staticFiles, "templates/error.html"))
 
-	return &Server{addr: addr, db: db, cfg: cfg, botUsername: botUsername, subService: subService, subServer: subServer, checkers: make(map[string]func(context.Context) ComponentHealth), inviteCodeRegex: regexp.MustCompile(`^[a-zA-Z0-9_-]+$`), startTime: time.Now(), trialTemplate: trialTmpl, connectionTemplate: connectionTmpl, errorTemplate: errorTmpl}
+	return &Server{addr: addr, db: db, cfg: cfg, botUsername: botUsername, subService: subService, subServer: subServer, checkers: make(map[string]func(context.Context) ComponentHealth), inviteCodeRegex: regexp.MustCompile(`^[a-zA-Z0-9_-]+$`), startTime: time.Now(), trialTemplate: trialTmpl, connectionTemplate: connectionTmpl, errorTemplate: errorTmpl, vpnCatalog: mustLoadVPNCatalog(staticFiles)}
 }
 
 // SetBot wires Telegram delivery for payment notifications and administrator alerts.
@@ -832,6 +833,9 @@ type connectionPageData struct {
 	ExpiresAt     string
 	SubURL        string
 	QRCodeDataURL template.URL
+	// Picker is rendered only for active subscriptions. Its deep links are
+	// built from SubURL and appear only in href attributes.
+	Picker *connectPickerView
 }
 
 // handleConnectionPage renders the customer connection page for a bearer token.
@@ -895,13 +899,18 @@ func (s *Server) handleConnectionPage(w http.ResponseWriter, r *http.Request) {
 		expiresAt = info.ExpiresAt.UTC().Format("02.01.2006 15:04 UTC")
 	}
 
-	s.renderConnectionPage(w, connectionPageData{
+	data := connectionPageData{
 		Active:        info.Status == string(database.SubscriptionStatusActive),
 		StatusLabel:   connectionStatusLabel(info.Status),
 		ExpiresAt:     expiresAt,
 		SubURL:        info.SubscriptionURL,
 		QRCodeDataURL: template.URL("data:image/png;base64," + base64.StdEncoding.EncodeToString(qrPNG)), // #nosec G203 -- server-generated PNG for the server-generated public URL
-	})
+	}
+	if data.Active && s.vpnCatalog != nil {
+		picker := s.vpnCatalog.pickerView(info.SubscriptionURL)
+		data.Picker = &picker
+	}
+	s.renderConnectionPage(w, data)
 }
 
 func (s *Server) renderConnectionNotFound(w http.ResponseWriter) {

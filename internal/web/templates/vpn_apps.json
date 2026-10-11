@@ -1,0 +1,117 @@
+{
+  "$comment": "Single source of truth for VPN clients on /connect/{token} (Go, embedded) and the Mini App (Vite import). Download URLs come only from official developer pages/stores; import prefixes only from developer docs or the existing project integration. See doc/vpn-apps.md before editing.",
+  "platforms": [
+    { "id": "ios", "label": "iOS" },
+    { "id": "android", "label": "Android" },
+    { "id": "windows", "label": "Windows" },
+    { "id": "linux", "label": "Linux" },
+    { "id": "macos", "label": "macOS" }
+  ],
+  "apps": [
+    {
+      "id": "happ",
+      "name": "Happ",
+      "description": "Рекомендуем. Простой клиент с автоматической маршрутизацией.",
+      "import_prefix": "happ://add/",
+      "enable_steps": [
+        "Подтвердите добавление подписки в Happ.",
+        "Дождитесь загрузки серверов.",
+        "Нажмите большую круглую кнопку включения."
+      ],
+      "platforms": {
+        "ios": {
+          "import": "direct",
+          "downloads": [
+            { "label": "App Store", "url": "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215" },
+            { "label": "Официальный сайт", "url": "https://happ.info/" }
+          ]
+        },
+        "android": {
+          "import": "direct",
+          "downloads": [
+            { "label": "Google Play", "url": "https://play.google.com/store/apps/details?id=com.happproxy" },
+            { "label": "APK (GitHub)", "url": "https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk" }
+          ]
+        },
+        "windows": {
+          "import": "best_effort",
+          "downloads": [
+            { "label": "Установщик x64", "url": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe" },
+            { "label": "Установщик ARM64", "url": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.arm64.exe" }
+          ]
+        },
+        "linux": {
+          "import": "best_effort",
+          "downloads": [
+            { "label": "DEB x64", "url": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.deb" },
+            { "label": "RPM x64", "url": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.rpm" },
+            { "label": "Arch x64", "url": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.pkg.tar.zst" },
+            { "label": "DEB ARM64", "url": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.arm64.deb" },
+            { "label": "RPM ARM64", "url": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.arm64.rpm" }
+          ]
+        },
+        "macos": {
+          "import": "best_effort",
+          "downloads": [
+            { "label": "App Store", "url": "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215" },
+            { "label": "DMG (GitHub)", "url": "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.macOS.universal.dmg" },
+            { "label": "Официальный сайт", "url": "https://happ.info/" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "incy",
+      "name": "Инси (Incy)",
+      "description": "Клиент на Xray с импортом подписки по ссылке.",
+      "import_prefix": "incy://add/",
+      "enable_steps": [
+        "Подтвердите импорт подписки в окне Incy.",
+        "Выберите сервер из списка.",
+        "Нажмите кнопку подключения."
+      ],
+      "platforms": {
+        "ios": {
+          "import": "direct",
+          "downloads": [
+            { "label": "App Store", "url": "https://apps.apple.com/ru/app/incy/id6756943388" },
+            { "label": "Официальный сайт", "url": "https://incy.cc/" }
+          ]
+        },
+        "android": {
+          "import": "direct",
+          "downloads": [
+            { "label": "Google Play", "url": "https://play.google.com/store/apps/details?id=llc.itdev.incy" },
+            { "label": "Официальный сайт", "url": "https://incy.cc/" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "v2raytun",
+      "name": "V2RayTun",
+      "description": "Клиент v2Ray/Xray с импортом подписки по ссылке.",
+      "import_prefix": "v2raytun://import/",
+      "enable_steps": [
+        "Подтвердите импорт подписки в V2RayTun.",
+        "Выберите сервер из списка.",
+        "Нажмите кнопку подключения."
+      ],
+      "platforms": {
+        "ios": {
+          "import": "direct",
+          "downloads": [
+            { "label": "Официальный сайт", "url": "https://v2raytun.com/" }
+          ]
+        },
+        "android": {
+          "import": "direct",
+          "downloads": [
+            { "label": "Google Play", "url": "https://play.google.com/store/apps/details?id=com.v2raytun.android" },
+            { "label": "Официальный сайт", "url": "https://v2raytun.com/" }
+          ]
+        }
+      }
+    }
+  ]
+}
