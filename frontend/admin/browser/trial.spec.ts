@@ -712,7 +712,10 @@ test('issuance node: a trial plan without a node is fixed from the editor', asyn
 
   // The block in «Состав»: name, type and status of every node, the note.
   const group = page.getByRole('region', { name: 'Состав' }).getByRole('group', { name: 'Узел выдачи' });
-  await expect(group).toContainText('Используется только для механизма выдачи trial. VPN-состав берётся из Builder.');
+  // The note separates the issuance node (legacy `nodes`) from the servers of
+  // the subscription (builder sources and rules) and says where nodes come from.
+  await expect(group).toContainText('Это не сервер из каталога источника: состав VPN-подписки определяет построитель (его источники и правила).');
+  await expect(group.locator('.trial-legacy-origin')).toHaveText(/^Новые узлы не появляются после синхронизации источников и в админке не создаются/);
   await expect(group).toContainText('Узел не выбран: пробную подписку не на чем создать.');
   const rows = group.locator('.trial-node');
   await expect(rows).toHaveCount(3);

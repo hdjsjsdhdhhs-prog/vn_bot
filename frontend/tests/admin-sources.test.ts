@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AdminApi, type AdminSource, type BuilderPreview, type SourceCatalogue, type SourceEntry, type SourceSyncResult } from '../admin/src/api';
+import { AdminApi, type AdminSource, type BuilderItem, type BuilderPreview, type SourceCatalogue, type SourceEntry, type SourceSyncResult } from '../admin/src/api';
 import {
-  EMPTY_FILTER, builderSourcesSummary, catalogueSummary, countryCount, countryLabel, filterEntries, flagEmoji,
+  EMPTY_FILTER, builderCardSummary, builderConfigItems, builderSourcesSummary, catalogueSummary, countryCount, countryLabel, filterEntries, flagEmoji,
   formatLabel, matchOriginalName, normalizeFormat, pickableEntries, previewSummary, protocolsOf, resolveNode,
   ruleSummary, syncErrorText, syncResultMessage, syncState,
 } from '../admin/src/sources';
@@ -219,6 +219,92 @@ describe('preview summary', () => {
       ],
     };
     expect(previewSummary(preview)).toEqual({ servers: 3, countries: 2, bySource: [{ sourceId: 1, count: 2 }, { sourceId: 2, count: 1 }] });
+  });
+});
+
+describe('builder list card (service.BuilderView)', () => {
+  let nextItem = 1;
+  const rule = (over: Partial<BuilderItem> = {}): BuilderItem => ({
+    id: nextItem++, kind: 'country', source_id: 1, country_code: 'DE', fingerprint: '', original_name: '',
+    custom_name: null, description: '', position: 0, enabled: true, ...over,
+  });
+  const linked = (...ids: number[]) => ids.map((source_id, position) => ({ source_id, position }));
+
+  it('counts the stored sources and rules with Russian plurals', () => {
+    const s = builderCardSummary({
+      version: 4, sources: linked(1, 2),
+      items: [rule({ position: 0 }), rule({ country_code: 'NL', position: 1 }), rule({ kind: 'node', source_id: 2, fingerprint: 'b2', position: 2 })],
+    });
+    expect(s).toMatchObject({ sources: 2, rules: 3, countries: ['DE', 'NL'], nodes: 1, empty: false });
+    expect(s.meta).toBe('v4 · 2 источника · 3 правила');
+    expect(s.composition).toBe('Страны: 🇩🇪 DE, 🇳🇱 NL · отдельных серверов: 1');
+    expect(builderCardSummary({ version: 1, sources: linked(1), items: [rule()] }).meta).toBe('v1 · 1 источник · 1 правило');
+    expect(builderCardSummary({ version: 1, sources: linked(1, 2, 3, 4, 5), items: [] }).meta).toBe('v1 · 5 источников · 0 правил');
+  });
+
+  it('a builder without rules serves every server of its sources; without sources nothing', () => {
+    expect(builderCardSummary({ version: 2, sources: linked(1), items: [] }))
+      .toMatchObject({ composition: 'Без правил: все серверы подключённых источников.', empty: false });
+    const none = builderCardSummary({ version: 1, sources: [], items: [] });
+    expect(none.meta).toBe('v1 · 0 источников · 0 правил');
+    expect(none).toMatchObject({ composition: 'Источники не подключены: подписка не соберётся.', empty: true });
+    // A partial record (missing arrays) is never shown as configured.
+    expect(builderCardSummary({ version: 1, sources: null, items: null }).empty).toBe(true);
+  });
+
+  it('disabled rules and rules on an unlinked source are reported like /sub skips them', () => {
+    const s = builderCardSummary({
+      version: 3, sources: linked(1),
+      items: [rule({ enabled: false }), rule({ source_id: 9, country_code: 'US' }), rule({ country_code: 'de', position: 2 }), rule({ country_code: '', position: 3 })],
+    });
+    expect(s.meta).toBe('v3 · 1 источник · 4 правила (1 выкл., 1 без источника)');
+    expect(s.countries).toEqual(['DE', '']);
+    expect(s.composition).toBe('Страны: 🇩🇪 DE, без страны');
+    const off = builderCardSummary({ version: 1, sources: linked(1), items: [rule({ enabled: false })] });
+    expect(off).toMatchObject({ composition: 'Ни одно правило не применяется: подписка не соберётся.', empty: true });
+  });
+
+  it('follows the rule order, not the array order', () => {
+    const s = builderCardSummary({ version: 1, sources: linked(1), items: [rule({ country_code: 'NL', position: 1 }), rule({ country_code: 'FI', position: 0 })] });
+    expect(s.countries).toEqual(['FI', 'NL']);
+  });
+});
+
+describe('builder configuration save', () => {
+  const item = (over: Partial<BuilderItem>): BuilderItem => ({
+    id: 0, kind: 'country', source_id: 1, country_code: 'DE', fingerprint: '', original_name: '',
+    custom_name: null, description: '', position: 0, enabled: true, ...over,
+  });
+
+  it('sends rules in display order, placeholders as new, only the fields of the kind', () => {
+    expect(builderConfigItems([
+      item({ id: 12, country_code: 'NL', fingerprint: 'stale', enabled: false }),
+      item({ id: -3, kind: 'node', fingerprint: 'b2', original_name: 'Dallas', country_code: 'US', custom_name: 'Даллас' }),
+    ])).toEqual([
+      { id: 12, kind: 'country', source_id: 1, country_code: 'NL', fingerprint: '', original_name: '', custom_name: null, description: '', enabled: false },
+      { id: 0, kind: 'node', source_id: 1, country_code: '', fingerprint: 'b2', original_name: 'Dallas', custom_name: 'Даллас', description: '', enabled: true },
+    ]);
+  });
+
+  it('PUTs the whole configuration and reports a version conflict', async () => {
+    const transport = vi.fn<typeof fetch>();
+    const api = new AdminApi(transport);
+    const input = {
+      request_key: 'ui-k', version: 3, name: 'FINLAN', description: '', enabled: true, profile_title: '', support_url: '', announce: '',
+      source_ids: [1, 2], items: builderConfigItems([item({ id: 5 })]),
+    };
+    transport.mockResolvedValueOnce(json({ builder: { id: 7, version: 4, sources: [], items: [] }, audit: {} }));
+    await expect(api.saveBuilderConfiguration(7, input)).resolves.toMatchObject({ builder: { version: 4 } });
+    const [path, init] = transport.mock.calls[0];
+    expect(path).toBe('/admin/api/builders/7/configuration');
+    expect(init?.method).toBe('PUT');
+    expect(JSON.parse(String(init?.body))).toEqual(input);
+
+    transport.mockResolvedValueOnce(json({ error: 'version_conflict' }, 409));
+    await expect(api.saveBuilderConfiguration(7, input)).rejects.toMatchObject({ status: 409, code: 'version_conflict' });
+    // A builder without its sources/items is not accepted as saved.
+    transport.mockResolvedValueOnce(json({ builder: { id: 7, version: 4 }, audit: {} }));
+    await expect(api.saveBuilderConfiguration(7, input)).rejects.toMatchObject({ code: 'invalid_response' });
   });
 });
 

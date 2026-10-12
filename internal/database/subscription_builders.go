@@ -34,11 +34,22 @@ func (s *Service) GetBuilder(ctx context.Context, id uint) (*SubscriptionBuilder
 	return &b, nil
 }
 
-// ListBuilders returns all builders ordered by name. Sources and Items are NOT
-// preloaded — use GetBuilder for the full record.
+// ListBuilders returns all builders ordered by name, with their Sources and
+// Items ordered by position exactly like GetBuilder. The admin list shows the
+// linked sources and rules of every builder; without the preload it reported
+// "0 sources · 0 rules" for configured builders.
 func (s *Service) ListBuilders(ctx context.Context) ([]SubscriptionBuilder, error) {
 	var builders []SubscriptionBuilder
-	if err := s.db.WithContext(ctx).Order("name ASC").Find(&builders).Error; err != nil {
+	err := s.db.WithContext(ctx).
+		Preload("Sources", func(db *gorm.DB) *gorm.DB {
+			return db.Order("position ASC")
+		}).
+		Preload("Items", func(db *gorm.DB) *gorm.DB {
+			return db.Order("position ASC")
+		}).
+		Order("name ASC").
+		Find(&builders).Error
+	if err != nil {
 		return nil, fmt.Errorf("list subscription builders: %w", err)
 	}
 	return builders, nil
@@ -120,6 +131,14 @@ func (s *Service) CreateBuilder(ctx context.Context, meta AdminConfigMeta, in Bu
 				}
 				return configChange{}, fmt.Errorf("create subscription builder: %w", err)
 			}
+			if !in.Enabled {
+				// GORM leaves a false bool with a column default out of the
+				// INSERT, which would store the default (TRUE).
+				if err := tx.Model(&SubscriptionBuilder{}).Where("id = ?", b.ID).UpdateColumn("enabled", false).Error; err != nil {
+					return configChange{}, fmt.Errorf("store builder switch: %w", err)
+				}
+				b.Enabled = false
+			}
 			return configChange{
 				targetID: b.ID,
 				oldValue: nil,
@@ -183,13 +202,67 @@ func (s *Service) UpdateBuilder(ctx context.Context, meta AdminConfigMeta, in Bu
 }
 
 // ---------------------------------------------------------------------------
-// Builder source/item management (not audited — structural, low-risk)
+// Builder source/item management (single-step, not audited)
+//
+// These are the original fine-grained endpoints. Every rule operation is
+// scoped to the builder of the request: a rule of another builder (or a
+// missing one) is ErrBuilderItemNotFound and nothing is written. Every change
+// bumps the builder version, so an editor holding an older version is refused
+// by SaveBuilderConfiguration instead of overwriting it. The admin editor
+// saves through SaveBuilderConfiguration (one transaction).
 // ---------------------------------------------------------------------------
+
+// ErrBuilderItemNotFound is returned when a rule does not exist in the builder
+// of the request (missing, or owned by another builder: the two cases are not
+// distinguished, so nothing is revealed about other builders).
+var ErrBuilderItemNotFound = errors.New("subscription builder item not found")
+
+// bumpBuilderVersion increments the version of an existing builder inside tx.
+func bumpBuilderVersion(tx *gorm.DB, builderID uint, now time.Time) error {
+	res := tx.Model(&SubscriptionBuilder{}).Where("id = ?", builderID).
+		Updates(map[string]any{"version": gorm.Expr("version + 1"), "updated_at": now})
+	if res.Error != nil {
+		return fmt.Errorf("bump builder version: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrBuilderNotFound
+	}
+	return nil
+}
+
+// createBuilderItem inserts item. GORM omits zero values of columns with a
+// default from INSERT, so enabled=false would be stored as the column default
+// (TRUE); it is written explicitly afterwards.
+func createBuilderItem(tx *gorm.DB, item *SubscriptionBuilderItem) error {
+	enabled := item.Enabled
+	if err := tx.Create(item).Error; err != nil {
+		return fmt.Errorf("create builder item: %w", err)
+	}
+	if !enabled {
+		if err := tx.Model(&SubscriptionBuilderItem{}).Where("id = ?", item.ID).UpdateColumn("enabled", false).Error; err != nil {
+			return fmt.Errorf("store builder item switch: %w", err)
+		}
+		item.Enabled = false
+	}
+	return nil
+}
+
+// builderItemColumns are the columns a rule update writes (builder_id never).
+func builderItemColumns(item SubscriptionBuilderItem) map[string]any {
+	return map[string]any{
+		"kind": item.Kind, "source_id": item.SourceID, "country_code": item.CountryCode,
+		"fingerprint": item.Fingerprint, "original_name": item.OriginalName, "custom_name": item.CustomName,
+		"description": item.Description, "position": item.Position, "enabled": item.Enabled,
+	}
+}
 
 // SetBuilderSources replaces the full source list for a builder in one
 // transaction. positions are assigned by the slice order (0-based).
 func (s *Service) SetBuilderSources(ctx context.Context, builderID uint, sourceIDs []uint) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := bumpBuilderVersion(tx, builderID, time.Now().UTC()); err != nil {
+			return err
+		}
 		if err := tx.Where("builder_id = ?", builderID).Delete(&SubscriptionBuilderSource{}).Error; err != nil {
 			return fmt.Errorf("clear builder sources: %w", err)
 		}
@@ -203,40 +276,80 @@ func (s *Service) SetBuilderSources(ctx context.Context, builderID uint, sourceI
 	})
 }
 
-// UpsertBuilderItem creates or updates a single item rule inside a builder.
-// If item.ID == 0 a new row is inserted; otherwise the existing row is updated.
+// UpsertBuilderItem creates or updates a single item rule inside the builder
+// item.BuilderID. item.ID == 0 inserts a new row; otherwise the row must
+// belong to that builder (ErrBuilderItemNotFound) and is updated in place —
+// it is never moved to another builder nor created under a caller-chosen id.
 func (s *Service) UpsertBuilderItem(ctx context.Context, item SubscriptionBuilderItem) (*SubscriptionBuilderItem, error) {
 	if item.Kind != BuilderItemKindCountry && item.Kind != BuilderItemKindNode {
 		return nil, fmt.Errorf("invalid builder item kind %q: %w", item.Kind, ErrProviderSourceInvalid)
 	}
-	if item.ID == 0 {
-		if err := s.db.WithContext(ctx).Create(&item).Error; err != nil {
-			return nil, fmt.Errorf("create builder item: %w", err)
+	item.Builder, item.Source = nil, nil
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := bumpBuilderVersion(tx, item.BuilderID, time.Now().UTC()); err != nil {
+			return err
 		}
-	} else {
-		if err := s.db.WithContext(ctx).Save(&item).Error; err != nil {
-			return nil, fmt.Errorf("update builder item: %w", err)
+		if item.ID == 0 {
+			return createBuilderItem(tx, &item)
 		}
+		res := tx.Model(&SubscriptionBuilderItem{}).
+			Where("id = ? AND builder_id = ?", item.ID, item.BuilderID).
+			Updates(builderItemColumns(item))
+		if res.Error != nil {
+			return fmt.Errorf("update builder item: %w", res.Error)
+		}
+		if res.RowsAffected == 0 {
+			return ErrBuilderItemNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return &item, nil
 }
 
-// DeleteBuilderItem removes a single item rule by ID.
-func (s *Service) DeleteBuilderItem(ctx context.Context, itemID uint) error {
-	result := s.db.WithContext(ctx).Delete(&SubscriptionBuilderItem{}, itemID)
-	if result.Error != nil {
-		return fmt.Errorf("delete builder item: %w", result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("builder item %d not found: %w", itemID, ErrBuilderNotFound)
-	}
-	return nil
+// DeleteBuilderItem removes one rule of the builder. A rule of another
+// builder (or a missing one) is ErrBuilderItemNotFound and nothing is deleted.
+func (s *Service) DeleteBuilderItem(ctx context.Context, builderID, itemID uint) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("id = ? AND builder_id = ?", itemID, builderID).Delete(&SubscriptionBuilderItem{})
+		if result.Error != nil {
+			return fmt.Errorf("delete builder item: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return ErrBuilderItemNotFound
+		}
+		return bumpBuilderVersion(tx, builderID, time.Now().UTC())
+	})
 }
 
 // ReorderBuilderItems updates the position of every item in the provided slice.
-// The caller supplies the full ordered list; positions are assigned 0-based.
+// The caller supplies the ordered list; positions are assigned 0-based. Every
+// id must be a distinct rule of this builder, otherwise nothing is changed
+// (ErrBuilderItemNotFound for a foreign/missing id, ErrAdminInvalidRequest for
+// a repeated one).
 func (s *Service) ReorderBuilderItems(ctx context.Context, builderID uint, itemIDs []uint) error {
+	seen := make(map[uint]bool, len(itemIDs))
+	for _, id := range itemIDs {
+		if seen[id] {
+			return fmt.Errorf("%w: duplicate item id", ErrAdminInvalidRequest)
+		}
+		seen[id] = true
+	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := bumpBuilderVersion(tx, builderID, time.Now().UTC()); err != nil {
+			return err
+		}
+		if len(itemIDs) > 0 {
+			var owned int64
+			if err := tx.Model(&SubscriptionBuilderItem{}).Where("builder_id = ? AND id IN ?", builderID, itemIDs).Count(&owned).Error; err != nil {
+				return fmt.Errorf("check builder items: %w", err)
+			}
+			if int(owned) != len(itemIDs) {
+				return ErrBuilderItemNotFound
+			}
+		}
 		for i, id := range itemIDs {
 			res := tx.Model(&SubscriptionBuilderItem{}).
 				Where("id = ? AND builder_id = ?", id, builderID).

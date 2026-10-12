@@ -55,6 +55,8 @@ const CATALOGUE_B = [e('b1', '🇺🇸 New York', 'US'), e('b2', '🇺🇸 Dalla
 const CREATE_FIELDS = ['name', 'description', 'type', 'subscription_url', 'hwid', 'user_agent', 'headers', 'enabled'];
 const ITEM_FIELDS = ['id', 'kind', 'source_id', 'country_code', 'fingerprint', 'original_name', 'custom_name', 'description', 'position', 'enabled'];
 const BUILDER_FIELDS = ['request_key', 'version', 'name', 'description', 'enabled', 'profile_title', 'support_url', 'announce'];
+const CONFIG_FIELDS = [...BUILDER_FIELDS, 'source_ids', 'items'];
+const CONFIG_ITEM_FIELDS = ['id', 'kind', 'source_id', 'country_code', 'fingerprint', 'original_name', 'custom_name', 'description', 'enabled'];
 
 async function backend(page: Page, options: { outcomes?: Record<number, Outcome[]>; builderSources?: number[] } = {}) {
   let clock = Date.parse(T0);
@@ -111,6 +113,14 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
     id: 7, name: 'Основной', description: '', enabled: true, profile_title: '', support_url: '', announce: '', version: 1,
     sources: (options.builderSources ?? [1]).map((source_id, position) => ({ source_id, position })), items: [],
   }];
+  const reads: string[] = [];
+  const failures = { list: false, get: false };
+  /** service.BuilderView: a snapshot of the stored row, sources and items by position. */
+  const stored = (b: Builder): Builder => structuredClone({
+    ...b,
+    sources: [...b.sources].sort((x, y) => x.position - y.position),
+    items: [...b.items].sort((x, y) => x.position - y.position),
+  });
 
   /** service.SourceView: metadata and catalogue statistics, never the URL or credentials. */
   const view = (src: Source) => {
@@ -210,7 +220,20 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
           : presentOf(id).filter(x => country === '*' || x.country_code === country);
         return json(route, 200, { source_id: id, entries: out });
       }
-      if (pathname === '/admin/api/builders') return json(route, 200, { builders });
+      // service.ListBuilders / GetBuilder: both carry the stored sources and
+      // items ([] when empty), ordered by position.
+      if (pathname === '/admin/api/builders') {
+        reads.push(pathname);
+        if (failures.list) return json(route, 500, { error: 'internal' });
+        return json(route, 200, { builders: builders.map(stored) });
+      }
+      const oneBuilder = /^\/admin\/api\/builders\/(\d+)$/.exec(pathname);
+      if (oneBuilder) {
+        reads.push(pathname);
+        if (failures.get) return json(route, 500, { error: 'internal' });
+        const found = builders.find(x => x.id === Number(oneBuilder[1]));
+        return found ? json(route, 200, stored(found)) : json(route, 404, { error: 'not_found' });
+      }
       problems.push(`unexpected GET ${pathname}`);
       return json(route, 404, { error: 'not_found' });
     }
@@ -251,9 +274,36 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
       return json(route, 200, view(src));
     }
 
-    const bm = /^\/admin\/api\/builders\/(\d+)(?:\/(sources|items|reorder|preview))?(?:\/(\d+))?$/.exec(pathname);
+    const bm = /^\/admin\/api\/builders\/(\d+)(?:\/(sources|items|reorder|preview|enable|disable|configuration))?(?:\/(\d+))?$/.exec(pathname);
     const b = bm ? builders.find(x => x.id === Number(bm[1])) : undefined;
     if (bm && !b) return json(route, 404, { error: 'not_found' });
+    // database.SaveBuilderConfiguration: one transaction, expected version,
+    // rule ids must be rules of this builder, position = index.
+    if (b && method === 'PUT' && bm![2] === 'configuration') {
+      if (unknown(CONFIG_FIELDS).length || !KEY_PATTERN.test(String(body.request_key)) || !Array.isArray(body.source_ids) || !Array.isArray(body.items)) {
+        problems.push(`configuration body ${unknown(CONFIG_FIELDS)}`);
+        return json(route, 400, { error: 'invalid_request' });
+      }
+      if (body.version !== b.version) return json(route, 409, { error: 'version_conflict' });
+      const rules = body.items as Record<string, unknown>[];
+      for (const it of rules) {
+        if (Object.keys(it).some(k => !CONFIG_ITEM_FIELDS.includes(k))) { problems.push('configuration item fields'); return json(route, 400, { error: 'invalid_request' }); }
+        if (it.id && !b.items.some(x => x.id === it.id)) return json(route, 404, { error: 'not_found' });
+      }
+      b.items = rules.map((it, position) => ({
+        id: Number(it.id) || nextItemId++, kind: it.kind as Item['kind'], source_id: Number(it.source_id),
+        country_code: String(it.country_code), fingerprint: String(it.fingerprint), original_name: String(it.original_name),
+        custom_name: (it.custom_name as string | null) ?? null, description: String(it.description), position, enabled: Boolean(it.enabled),
+      }));
+      b.sources = (body.source_ids as number[]).map((source_id, position) => ({ source_id, position }));
+      Object.assign(b, { name: body.name, description: body.description, enabled: body.enabled, profile_title: body.profile_title,
+        support_url: body.support_url, announce: body.announce, version: b.version + 1 });
+      return json(route, 200, { builder: stored(b), audit: {} });
+    }
+    if (b && method === 'POST' && (bm![2] === 'enable' || bm![2] === 'disable')) {
+      Object.assign(b, { enabled: bm![2] === 'enable', version: b.version + 1 });
+      return json(route, 200, stored(b));
+    }
     if (b && method === 'PATCH' && !bm![2]) {
       if (unknown(BUILDER_FIELDS).length || !KEY_PATTERN.test(String(body.request_key))) { problems.push('builder body'); return json(route, 400, { error: 'invalid_request' }); }
       if (body.version !== b.version) return json(route, 409, { error: 'version_conflict' });
@@ -300,6 +350,11 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
       (!path || (typeof path === 'string' ? c.path === path : path.test(c.path))) && (!method || c.method === method)),
     problems: () => problems,
     builder: () => builders[0],
+    /** GET requests of the builder list and of single builders, in order. */
+    reads: () => reads,
+    failures,
+    /** Another admin tab changed the stored builder. */
+    changeBuilder: (change: (b: Builder) => void) => change(builders[0]),
     source: (id: number) => sources.find(s => s.id === id)!,
     /** Queues the next upstream answers of a source. */
     queue: (id: number, ...next: Outcome[]) => outcomes.set(id, [...(outcomes.get(id) ?? []), ...next]),
@@ -531,6 +586,175 @@ test.describe('sources', () => {
   });
 });
 
+test.describe('builder list shows the stored configuration', () => {
+  const card = (page: Page) => page.locator('.builder-item', { hasText: 'Основной' });
+  const addCountry = async (page: Page, dialog: ReturnType<Page['getByRole']>, code: string) => {
+    await dialog.getByRole('button', { name: 'Добавить правило' }).click();
+    const rule = page.getByRole('dialog', { name: 'Новое правило' });
+    await rule.getByLabel('Страна', { exact: true }).selectOption(code);
+    await rule.getByRole('button', { name: 'Применить' }).click();
+    await expect(rule).toBeHidden();
+  };
+
+  test('card counts linked sources and rules and names the countries', async ({ page }) => {
+    const api = await backend(page, { builderSources: [1, 2] });
+    api.changeBuilder(b => {
+      b.items = [
+        { id: 51, kind: 'country', source_id: 1, country_code: 'DE', fingerprint: '', original_name: '', custom_name: null, description: '', position: 0, enabled: true },
+        { id: 52, kind: 'node', source_id: 2, country_code: '', fingerprint: 'b2', original_name: '🇺🇸 Dallas', custom_name: null, description: '', position: 1, enabled: true },
+        { id: 53, kind: 'country', source_id: 2, country_code: 'US', fingerprint: '', original_name: '', custom_name: null, description: '', position: 2, enabled: false },
+      ];
+    });
+    await page.goto('/#/builders');
+    await expect(card(page).locator('.builder-meta')).toHaveText('v1 · 2 источника · 3 правила (1 выкл.)');
+    await expect(card(page).locator('.builder-composition')).toHaveText('Страны: 🇩🇪 DE · отдельных серверов: 1');
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('saved countries survive closing, reopening, a full reload and another save', async ({ page }) => {
+    const api = await backend(page);
+    await page.goto('/#/builders');
+    await expect(card(page).locator('.builder-meta')).toHaveText('v1 · 1 источник · 0 правил');
+    await expect(card(page).locator('.builder-composition')).toHaveText('Без правил: все серверы подключённых источников.');
+
+    await card(page).getByRole('button', { name: 'Редактировать' }).click();
+    let dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
+    await expect(dialog.locator('.source-pick-selected')).toHaveCount(1);
+    await addCountry(page, dialog, 'DE');
+    await addCountry(page, dialog, 'NL');
+    await dialog.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
+    // The card follows the stored record right after the save.
+    await expect(card(page).locator('.builder-meta')).toHaveText('v2 · 1 источник · 2 правила');
+    await expect(card(page).locator('.builder-composition')).toHaveText('Страны: 🇩🇪 DE, 🇳🇱 NL');
+    await dialog.getByRole('button', { name: 'Закрыть' }).click();
+    await expect(dialog).toBeHidden();
+
+    // Reopen: the editor reads GET /builders/7, rules and sources are there.
+    await card(page).getByRole('button', { name: 'Редактировать' }).click();
+    dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
+    await expect(dialog.getByRole('listitem', { name: '🇩🇪 DE' })).toBeVisible();
+    await expect(dialog.getByRole('listitem', { name: '🇳🇱 NL' })).toBeVisible();
+    await expect(dialog.locator('.source-pick-selected')).toHaveText(/Provider A/);
+    await dialog.getByRole('button', { name: 'Закрыть' }).click();
+
+    await page.reload();
+    await expect(card(page).locator('.builder-meta')).toHaveText('v2 · 1 источник · 2 правила');
+    await card(page).getByRole('button', { name: 'Редактировать' }).click();
+    dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
+    await expect(dialog.getByRole('listitem', { name: '🇩🇪 DE' })).toBeVisible();
+    await expect(dialog.locator('.source-pick-selected')).toHaveCount(1);
+
+    // Saving the reopened builder keeps its sources and rules (no empty overwrite).
+    await dialog.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
+    // One configuration request per save, each with the loaded version and the
+    // full source list; no single-step source/rule requests any more.
+    const saves = api.calls('/admin/api/builders/7/configuration', 'PUT');
+    expect(saves.map(c => [c.body.version, c.body.source_ids])).toEqual([[1, [1]], [2, [1]]]);
+    expect((saves[1].body.items as { id: number }[]).map(i => i.id)).toEqual(api.builder().items.map(i => i.id));
+    expect(api.calls(/^\/admin\/api\/builders\/7\/(sources|items|reorder)/)).toHaveLength(0);
+    expect(api.builder().sources.map(s => s.source_id)).toEqual([1]);
+    expect(api.builder().items.map(i => i.country_code)).toEqual(['DE', 'NL']);
+    await expect(card(page).locator('.builder-meta')).toHaveText('v3 · 1 источник · 2 правила');
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('the editor opens with the server state, not a stale list copy', async ({ page }) => {
+    const api = await backend(page);
+    await page.goto('/#/builders');
+    await expect(card(page).locator('.builder-meta')).toHaveText('v1 · 1 источник · 0 правил');
+    // Another tab linked a second source and added a rule meanwhile.
+    api.changeBuilder(b => {
+      b.version = 5;
+      b.sources = [{ source_id: 1, position: 0 }, { source_id: 2, position: 1 }];
+      b.items = [{ id: 60, kind: 'country', source_id: 2, country_code: 'US', fingerprint: '', original_name: '', custom_name: null, description: '', position: 0, enabled: true }];
+    });
+    await card(page).getByRole('button', { name: 'Редактировать' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
+    await expect(dialog.locator('.source-pick-selected')).toHaveCount(2);
+    await expect(dialog.getByRole('listitem', { name: '🇺🇸 US' })).toBeVisible();
+    await expect(card(page).locator('.builder-meta')).toHaveText('v5 · 2 источника · 1 правило');
+    await dialog.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
+    const [save] = api.calls('/admin/api/builders/7/configuration', 'PUT');
+    expect(save.body.version).toBe(5);
+    expect(save.body.source_ids).toEqual([1, 2]);
+    expect(api.builder().sources.map(s => s.source_id)).toEqual([1, 2]);
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('a failed load does not open the editor with stale data', async ({ page }) => {
+    const api = await backend(page);
+    await page.goto('/#/builders');
+    await expect(card(page)).toBeVisible();
+    api.failures.get = true;
+    await card(page).getByRole('button', { name: 'Редактировать' }).click();
+    await expect(page.locator('.toast-region')).toContainText('Не удалось загрузить построитель.');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(card(page).getByRole('button', { name: 'Редактировать' })).toBeEnabled();
+    expect(api.calls(/^\/admin\/api\/builders/)).toHaveLength(0);
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('a stale second tab cannot overwrite: 409 is explained and the current version can be loaded', async ({ page }) => {
+    const api = await backend(page);
+    await page.goto('/#/builders');
+    await card(page).getByRole('button', { name: 'Редактировать' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
+    await expect(dialog.locator('.source-pick-selected')).toHaveCount(1);
+    await addCountry(page, dialog, 'NL');
+
+    // Meanwhile another tab saved a different configuration.
+    api.changeBuilder(b => {
+      b.version = 4;
+      b.sources = [{ source_id: 1, position: 0 }, { source_id: 2, position: 1 }];
+      b.items = [{ id: 70, kind: 'country', source_id: 2, country_code: 'US', fingerprint: '', original_name: '', custom_name: null, description: '', position: 0, enabled: true }];
+    });
+    await dialog.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(dialog.locator('.modal-status')).toContainText('Построитель изменён в другой вкладке или другим администратором. Ваши изменения не сохранены');
+    const [stale] = api.calls('/admin/api/builders/7/configuration', 'PUT');
+    expect(stale.body.version).toBe(1);
+    // Nothing of the stale tab reached the stored builder.
+    expect(api.builder().version).toBe(4);
+    expect(api.builder().items.map(i => i.country_code)).toEqual(['US']);
+    // The unsaved rule is still on screen until the admin decides.
+    await expect(dialog.getByRole('listitem', { name: '🇳🇱 NL' })).toBeVisible();
+    await expect(card(page).locator('.builder-meta')).toHaveText('v4 · 2 источника · 1 правило');
+
+    page.on('dialog', d => void d.accept());
+    await dialog.getByRole('button', { name: 'Загрузить актуальную версию' }).click();
+    const fresh = page.getByRole('dialog', { name: 'Построитель: Основной' });
+    await expect(fresh.getByRole('listitem', { name: '🇺🇸 US' })).toBeVisible();
+    await expect(fresh.getByRole('listitem', { name: '🇳🇱 NL' })).toHaveCount(0);
+    await expect(fresh.locator('.source-pick-selected')).toHaveCount(2);
+    await fresh.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(fresh.getByText('Изменения сохранены.')).toBeVisible();
+    expect(api.calls('/admin/api/builders/7/configuration', 'PUT').at(-1)!.body.version).toBe(4);
+    expect(api.builder().version).toBe(5);
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('toggling keeps the counts; returning to the section reloads the list', async ({ page }) => {
+    const api = await backend(page, { builderSources: [1, 2] });
+    await page.goto('/#/builders');
+    await expect(card(page).locator('.builder-meta')).toHaveText('v1 · 2 источника · 0 правил');
+    await card(page).getByRole('button', { name: 'Отключить' }).click();
+    await expect(card(page)).toContainText('Отключён');
+    await expect(card(page).locator('.builder-meta')).toHaveText('v2 · 2 источника · 0 правил');
+
+    const listReads = () => api.reads().filter(p => p === '/admin/api/builders').length;
+    const before = listReads();
+    api.changeBuilder(b => { b.sources = [{ source_id: 2, position: 0 }]; });
+    await page.goto('/#/sources');
+    await expect(heading(page, 'Источники')).toBeVisible();
+    await page.goto('/#/builders');
+    await expect(card(page).locator('.builder-meta')).toHaveText('v2 · 1 источник · 0 правил');
+    expect(listReads()).toBeGreaterThan(before);
+    expect(api.problems()).toEqual([]);
+  });
+});
+
 test.describe('builder uses the source catalogue', () => {
   test('selected sources show their servers, countries and sync status; totals merge them', async ({ page }) => {
     const api = await backend(page);
@@ -587,8 +811,10 @@ test.describe('builder uses the source catalogue', () => {
 
     await dialog.getByRole('button', { name: 'Сохранить' }).click();
     await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    const [upsert] = api.calls('/admin/api/builders/7/items', 'POST');
-    expect(upsert.body).toEqual({ kind: 'country', source_id: 1, country_code: 'DE', custom_name: null, description: '', position: 0, enabled: true });
+    const [save] = api.calls('/admin/api/builders/7/configuration', 'PUT');
+    expect(save.body.items).toEqual([
+      { id: 0, kind: 'country', source_id: 1, country_code: 'DE', fingerprint: '', original_name: '', custom_name: null, description: '', enabled: true },
+    ]);
     await expect(dialog.locator('.preview-note')).toBeEmpty();
 
     // Preview consistency: the same servers the catalogue counts for DE.
@@ -640,10 +866,10 @@ test.describe('builder uses the source catalogue', () => {
 
     await dialog.getByRole('button', { name: 'Сохранить' }).click();
     await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    const upserts = api.calls('/admin/api/builders/7/items', 'POST');
-    expect(upserts.map(c => c.body)).toEqual([
-      { kind: 'country', source_id: 1, country_code: 'NL', custom_name: null, description: '', position: 0, enabled: true },
-      { kind: 'node', source_id: 2, fingerprint: 'b2', original_name: '🇺🇸 Dallas', custom_name: 'США — Даллас', description: '', position: 1, enabled: true },
+    const [first] = api.calls('/admin/api/builders/7/configuration', 'PUT');
+    expect(first.body.items).toEqual([
+      { id: 0, kind: 'country', source_id: 1, country_code: 'NL', fingerprint: '', original_name: '', custom_name: null, description: '', enabled: true },
+      { id: 0, kind: 'node', source_id: 2, country_code: '', fingerprint: 'b2', original_name: '🇺🇸 Dallas', custom_name: 'США — Даллас', description: '', enabled: true },
     ]);
     expect(api.builder().items).toHaveLength(2);
 
@@ -658,10 +884,13 @@ test.describe('builder uses the source catalogue', () => {
     await dialog.getByRole('button', { name: 'Удалить правило «🇳🇱 NL»' }).click();
     await dialog.getByRole('button', { name: 'Сохранить' }).click();
     await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    expect(api.calls(/^\/admin\/api\/builders\/7\/items\/\d+$/, 'DELETE')).toHaveLength(1);
+    // The removed rule is simply absent from the saved list (deleted in the
+    // same transaction); the kept node rule is sent with its server id.
     expect(api.builder().items.map(i => i.fingerprint)).toEqual(['b2']);
-    const last = api.calls('/admin/api/builders/7/items', 'POST').at(-1)!;
-    expect(last.body).toMatchObject({ id: api.builder().items[0].id, kind: 'node', position: 0 });
+    const last = api.calls('/admin/api/builders/7/configuration', 'PUT').at(-1)!;
+    expect(last.body.items).toEqual([expect.objectContaining({ id: api.builder().items[0].id, kind: 'node' })]);
+    expect(api.builder().items[0].position).toBe(0);
+    expect(api.calls(/^\/admin\/api\/builders\/7\/(sources|items|reorder)/)).toHaveLength(0);
 
     await dialog.getByRole('button', { name: 'Запустить предпросмотр' }).click();
     await expect(dialog.locator('.preview-body .preview-stats')).toHaveText('В подписке: 1 сервер · 1 страна');

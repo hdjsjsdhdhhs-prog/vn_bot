@@ -296,26 +296,34 @@ func (a *adminAPI) builderUpsertItem(w http.ResponseWriter, r *http.Request, bui
 		Enabled:      body.Enabled,
 	})
 	if err != nil {
-		if errors.Is(err, database.ErrProviderSourceInvalid) {
-			writeAdminError(w, http.StatusBadRequest, "invalid_kind")
-			return
-		}
-		a.internal(w, "builder/item/upsert", err)
+		a.writeBuilderItemError(w, "builder/item/upsert", err)
 		return
 	}
 	writeAdminJSON(w, http.StatusOK, item)
 }
 
-func (a *adminAPI) builderDeleteItem(w http.ResponseWriter, r *http.Request, itemID uint) {
+// writeBuilderItemError maps rule mutation failures. A missing builder, and a
+// rule that is missing or belongs to another builder, are the same 404
+// not_found: the response never tells whether another builder has that rule.
+func (a *adminAPI) writeBuilderItemError(w http.ResponseWriter, route string, err error) {
+	switch {
+	case errors.Is(err, database.ErrBuilderNotFound), errors.Is(err, database.ErrBuilderItemNotFound):
+		writeAdminError(w, http.StatusNotFound, "not_found")
+	case errors.Is(err, database.ErrProviderSourceInvalid):
+		writeAdminError(w, http.StatusBadRequest, "invalid_kind")
+	case errors.Is(err, database.ErrAdminInvalidRequest):
+		writeAdminError(w, http.StatusBadRequest, "invalid_request")
+	default:
+		a.internal(w, route, err)
+	}
+}
+
+func (a *adminAPI) builderDeleteItem(w http.ResponseWriter, r *http.Request, builderID, itemID uint) {
 	if !a.builderSvcOK(w) {
 		return
 	}
-	if err := a.builderSvc.DeleteBuilderItem(r.Context(), itemID); err != nil {
-		if errors.Is(err, database.ErrBuilderNotFound) {
-			writeAdminError(w, http.StatusNotFound, "not_found")
-			return
-		}
-		a.internal(w, "builder/item/delete", err)
+	if err := a.builderSvc.DeleteBuilderItem(r.Context(), builderID, itemID); err != nil {
+		a.writeBuilderItemError(w, "builder/item/delete", err)
 		return
 	}
 	writeAdminJSON(w, http.StatusOK, struct {
@@ -336,12 +344,113 @@ func (a *adminAPI) builderReorderItems(w http.ResponseWriter, r *http.Request, b
 		return
 	}
 	if err := a.builderSvc.ReorderBuilderItems(r.Context(), builderID, body.ItemIDs); err != nil {
-		a.internal(w, "builder/item/reorder", err)
+		a.writeBuilderItemError(w, "builder/item/reorder", err)
 		return
 	}
 	writeAdminJSON(w, http.StatusOK, struct {
 		OK bool `json:"ok"`
 	}{true})
+}
+
+// ---------------------------------------------------------------------------
+// Builder configuration (atomic save of metadata, sources and rules)
+// ---------------------------------------------------------------------------
+
+// adminBuilderConfigMaxBody bounds PUT /builders/{id}/configuration
+// (database.BuilderMaxItems rules with names and descriptions).
+const adminBuilderConfigMaxBody = 512 << 10
+
+type builderConfigItemRequest struct {
+	ID           uint    `json:"id"`
+	Kind         string  `json:"kind"`
+	SourceID     uint    `json:"source_id"`
+	CountryCode  string  `json:"country_code"`
+	Fingerprint  string  `json:"fingerprint"`
+	OriginalName string  `json:"original_name"`
+	CustomName   *string `json:"custom_name"`
+	Description  string  `json:"description"`
+	Enabled      bool    `json:"enabled"`
+}
+
+type builderConfigRequest struct {
+	RequestKey   string                     `json:"request_key"`
+	Version      int                        `json:"version"`
+	Name         string                     `json:"name"`
+	Description  string                     `json:"description"`
+	Enabled      bool                       `json:"enabled"`
+	ProfileTitle string                     `json:"profile_title"`
+	SupportURL   string                     `json:"support_url"`
+	Announce     string                     `json:"announce"`
+	SourceIDs    []uint                     `json:"source_ids"`
+	Items        []builderConfigItemRequest `json:"items"`
+}
+
+// builderSaveConfiguration is PUT /admin/api/builders/{id}/configuration: the
+// whole editor state in one transaction with the expected version. Errors:
+// 404 not_found (builder, or a rule id that is not a rule of this builder),
+// 409 version_conflict | name_taken | request_key_conflict,
+// 400 invalid_request (+field).
+func (a *adminAPI) builderSaveConfiguration(w http.ResponseWriter, r *http.Request, id uint) {
+	if !a.builderSvcOK(w) {
+		return
+	}
+	var body builderConfigRequest
+	if !decodeAdminJSONLimit(w, r, &body, adminBuilderConfigMaxBody) {
+		return
+	}
+	// Both lists are required ([] = none): a client that omits one must not
+	// silently clear the stored sources or rules.
+	if body.SourceIDs == nil || body.Items == nil {
+		field := "items"
+		if body.SourceIDs == nil {
+			field = "source_ids"
+		}
+		writeAdminJSON(w, http.StatusBadRequest, struct {
+			Error  string `json:"error"`
+			Field  string `json:"field"`
+			Reason string `json:"reason"`
+		}{"invalid_request", field, "required"})
+		return
+	}
+	in := database.BuilderConfigurationInput{
+		ID: id, Version: body.Version, Name: body.Name, Description: body.Description, Enabled: body.Enabled,
+		ProfileTitle: body.ProfileTitle, SupportURL: body.SupportURL, Announce: body.Announce,
+		SourceIDs: body.SourceIDs, Items: make([]database.BuilderConfigItem, 0, len(body.Items)),
+	}
+	for _, it := range body.Items {
+		in.Items = append(in.Items, database.BuilderConfigItem(it))
+	}
+	view, audit, err := a.builderSvc.SaveBuilderConfiguration(r.Context(), service.SaveBuilderConfigurationInput{
+		Actor: a.actor, RequestKey: body.RequestKey, BuilderConfigurationInput: in,
+	})
+	if err != nil {
+		var fieldErr *database.BuilderFieldError
+		switch {
+		case errors.As(err, &fieldErr):
+			writeAdminJSON(w, http.StatusBadRequest, struct {
+				Error  string `json:"error"`
+				Field  string `json:"field"`
+				Reason string `json:"reason"`
+			}{"invalid_request", fieldErr.Field, fieldErr.Reason})
+		case errors.Is(err, database.ErrBuilderNotFound), errors.Is(err, database.ErrBuilderItemNotFound):
+			writeAdminError(w, http.StatusNotFound, "not_found")
+		case errors.Is(err, database.ErrBuilderVersionConflict):
+			writeAdminError(w, http.StatusConflict, "version_conflict")
+		case errors.Is(err, database.ErrBuilderNameTaken):
+			writeAdminError(w, http.StatusConflict, "name_taken")
+		case errors.Is(err, database.ErrAdminRequestKeyConflict):
+			writeAdminError(w, http.StatusConflict, "request_key_conflict")
+		case errors.Is(err, database.ErrAdminInvalidRequest):
+			writeAdminError(w, http.StatusBadRequest, "invalid_request")
+		default:
+			a.internal(w, "builder/configuration", err)
+		}
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, struct {
+		Builder *service.BuilderView    `json:"builder"`
+		Audit   *database.AdminAuditLog `json:"audit"`
+	}{view, audit})
 }
 
 // ---------------------------------------------------------------------------

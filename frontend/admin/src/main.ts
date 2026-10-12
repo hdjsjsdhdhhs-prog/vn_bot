@@ -5,7 +5,7 @@ import {
   type MutationOutcome, type SubscriptionStatus, type UserDetail, type UsersPage, type UsersQuery,
   type AdminSource, type AdminBuilder, type BuilderItem, type SourceEntry, type SourceSyncResult,
   type CreateSourceInput, type UpdateSourceInput,
-  type CreateBuilderInput, type UpdateBuilderInput, type UpsertBuilderItemInput, type SetBuilderInput,
+  type CreateBuilderInput, type SetBuilderInput,
   TARIFF_LIMITS, type AdminTariff, type TariffPlan, type TariffOutcome,
   type TrialBuilderSummary, type TrialPreview, type TrialView,
   JOURNAL_EVENT_TYPES, PLAN_KINDS, type JournalEvent, type JournalEventType, type JournalPage, type JournalQuery,
@@ -25,7 +25,7 @@ import {
   termsChanged, validateTariffForm, type FieldErrors, type TariffField, type TariffForm,
 } from './tariffs';
 import {
-  COUNTRY_CODE, EMPTY_FILTER, RESOLUTION_LABELS, SOURCE_FORMATS, SYNC_STATE_LABELS, builderSourcesSummary,
+  COUNTRY_CODE, EMPTY_FILTER, RESOLUTION_LABELS, SOURCE_FORMATS, SYNC_STATE_LABELS, builderCardSummary, builderConfigItems, builderSourcesSummary,
   catalogueSummary, countriesLabel, countryCount, countryLabel, detectedFormatLabel, filterEntries, flagEmoji,
   formatLabel, normalizeFormat, pickableEntries, previewSummary, protocolsOf, resolveNode, ruleSummary,
   serversLabel, shortFingerprint, syncErrorText, syncResultMessage, syncState, type EntryFilter, type SyncState,
@@ -4739,20 +4739,17 @@ class AdminApp {
     const badge = el('span', b.enabled ? 'badge badge-active' : 'badge badge-disabled',
       b.enabled ? 'Активен' : 'Отключён');
     nameRow.append(name, badge);
-    const meta = el('p', 'builder-meta');
-    const srcCount = b.sources?.length ?? 0;
-    const itemCount = b.items?.length ?? 0;
-    meta.textContent = [
-      `v${b.version}`,
-      `${srcCount} ${srcCount === 1 ? 'источник' : srcCount < 5 ? 'источника' : 'источников'}`,
-      `${itemCount} ${itemCount === 1 ? 'правило' : itemCount < 5 ? 'правила' : 'правил'}`,
-    ].join(' · ');
-    info.append(nameRow, meta);
+    // Counts and composition of the SAVED configuration (service.BuilderView).
+    const summary = builderCardSummary(b);
+    const meta = el('p', 'builder-meta', summary.meta);
+    const composition = el('p', summary.empty ? 'builder-composition is-danger' : 'builder-composition', summary.composition);
+    info.append(nameRow, meta, composition);
     if (b.description) info.append(el('p', 'builder-desc', b.description));
 
     const acts = el('div', 'builder-actions');
     const editBtn = button('Редактировать', 'btn btn-primary btn-xs', 'edit');
-    editBtn.addEventListener('click', () => this.openBuilderEditor(b));
+    editBtn.setAttribute('aria-label', `Редактировать «${b.name}»`);
+    editBtn.addEventListener('click', () => void this.openSavedBuilder(b.id, editBtn));
     const toggleBtn = button(b.enabled ? 'Отключить' : 'Включить', 'btn btn-secondary btn-xs');
     toggleBtn.addEventListener('click', () => void this.toggleBuilder(b, toggleBtn));
     acts.append(editBtn, toggleBtn);
@@ -4807,9 +4804,47 @@ class AdminApp {
     }
   }
 
+  /** Replaces one builder in the list cache and repaints the list when shown. */
+  private cacheBuilder(saved: AdminBuilder) {
+    const known = this.buildersCache?.some(x => x.id === saved.id) ?? false;
+    if (this.buildersCache) {
+      this.buildersCache = known ? this.buildersCache.map(x => x.id === saved.id ? saved : x) : [...this.buildersCache, saved];
+    }
+    const view = this.buildersView;
+    if (view && this.buildersCache) this.paintBuilders(view.body, this.buildersCache, el('p', 'updated'));
+  }
+
   // ===========================================================================
   // Builder editor (full-screen dialog)
   // ===========================================================================
+
+  /**
+   * Opens the editor of a saved builder with its CURRENT configuration read
+   * from GET /builders/{id}, never with the list copy: a stale or partial copy
+   * would show missing sources/rules and, once saved, overwrite the stored
+   * sources with that partial state.
+   */
+  private async openSavedBuilder(id: number, trigger: HTMLButtonElement) {
+    if (this.dialog || this.view !== 'app' || trigger.disabled) return;
+    trigger.disabled = true;
+    trigger.setAttribute('aria-busy', 'true');
+    try {
+      const fresh = await this.api.getBuilder(id);
+      if (this.view !== 'app') return;
+      this.cacheBuilder(fresh);
+      this.openBuilderEditor(fresh);
+    } catch (error) {
+      if (await this.endIfSignedOut(error, () => this.view === 'app')) return;
+      const status = error instanceof ApiError ? error.status : 0;
+      this.toast(status === 404
+        ? 'Построитель не найден: возможно, он был удалён. Список обновлён.'
+        : `Не удалось загрузить построитель. ${errorText(error)}`);
+      if (status === 404) void this.loadBuilders();
+    } finally {
+      trigger.disabled = false;
+      trigger.removeAttribute('aria-busy');
+    }
+  }
 
   private openBuilderEditor(b: AdminBuilder | null) {
     if (this.dialog || this.view !== 'app') return;
@@ -4823,8 +4858,6 @@ class AdminApp {
     let selectedSourceIds: number[] = b?.sources?.slice().sort((a, x) => a.position - x.position).map(s => s.source_id) ?? [];
     // Items (rules) — local copy for drag-reorder
     let localItems: BuilderItem[] = b?.items?.slice().sort((a, x) => a.position - x.position) ?? [];
-    // Rules stored on the server: those removed locally are deleted on save.
-    let serverItemIds = new Set(localItems.map(it => it.id).filter(id => id > 0));
     // Assigned below; the source picker repaints the rules (their warnings
     // depend on which sources are linked).
     let renderItems: () => void = () => {};
@@ -5073,92 +5106,53 @@ class AdminApp {
       showStatus(null);
 
       try {
-        let saved: AdminBuilder;
+        const meta = {
+          name, description: descF.inp.value.trim(),
+          enabled: enabledChk.checked,
+          profile_title: profileTitleF.inp.value.trim(),
+          support_url: supportUrlF.inp.value.trim(),
+          announce: announceF.inp.value.trim(),
+        };
         // A new builder is created once; later saves in the same editor update it.
         const creating = currentBuilder === null;
         if (creating) {
-          const input: CreateBuilderInput = {
-            request_key: newRequestKey(),
-            name, description: descF.inp.value.trim(),
-            enabled: enabledChk.checked,
-            profile_title: profileTitleF.inp.value.trim(),
-            support_url: supportUrlF.inp.value.trim(),
-            announce: announceF.inp.value.trim(),
-          };
+          const input: CreateBuilderInput = { request_key: newRequestKey(), ...meta };
           const res = await this.api.createBuilder(input);
-          saved = res.builder;
-        } else {
-          const input: UpdateBuilderInput = {
-            request_key: newRequestKey(),
-            version: currentBuilder!.version,
-            name, description: descF.inp.value.trim(),
-            enabled: enabledChk.checked,
-            profile_title: profileTitleF.inp.value.trim(),
-            support_url: supportUrlF.inp.value.trim(),
-            announce: announceF.inp.value.trim(),
-          };
-          const res = await this.api.updateBuilder(currentBuilder!.id, input);
-          saved = res.builder;
+          if (!isOpen()) return;
+          // The row exists from here on: if the configuration save below
+          // fails, the next save updates it instead of creating it again.
+          currentBuilder = res.builder;
         }
-        if (!isOpen()) return;
-
-        // Save sources order
-        if (selectedSourceIds.length > 0 || !creating) {
-          await this.api.setBuilderSources(saved.id, selectedSourceIds);
-        }
-
-        // Rules removed in the editor are deleted, so Preview and /sub match
-        // what the editor shows.
-        const keptIds = new Set(localItems.map(it => it.id));
-        for (const id of serverItemIds) {
-          if (!keptIds.has(id)) await this.api.deleteBuilderItem(saved.id, id);
-        }
-        serverItemIds = new Set([...serverItemIds].filter(id => keptIds.has(id)));
-
-        // Save items (upsert all, then reorder)
-        const upserted: BuilderItem[] = [];
-        if (localItems.length > 0) {
-          for (const item of localItems) {
-            const inp: UpsertBuilderItemInput = {
-              id: item.id > 0 ? item.id : undefined,
-              kind: item.kind,
-              source_id: item.source_id,
-              country_code: item.kind === 'country' ? item.country_code : undefined,
-              fingerprint: item.kind === 'node' ? item.fingerprint : undefined,
-              original_name: item.kind === 'node' ? item.original_name : undefined,
-              custom_name: item.custom_name,
-              description: item.description,
-              position: item.position,
-              enabled: item.enabled,
-            };
-            const upsertedItem = await this.api.upsertBuilderItem(saved.id, inp);
-            upserted.push(upsertedItem);
-          }
-          if (upserted.length > 1) {
-            await this.api.reorderBuilderItems(saved.id, upserted.map(it => it.id));
-          }
-        }
+        // Metadata, sources and rules (order, on/off state, removed rules) in
+        // ONE transaction with the version this editor loaded: a builder
+        // changed in another tab is refused with 409, never overwritten, and a
+        // failure leaves the stored configuration untouched.
+        const res = await this.api.saveBuilderConfiguration(currentBuilder!.id, {
+          request_key: newRequestKey(),
+          version: currentBuilder!.version,
+          ...meta,
+          source_ids: selectedSourceIds,
+          items: builderConfigItems(localItems),
+        });
+        const saved = res.builder;
+        this.cacheBuilder(saved);
         // The server ids replace the local placeholders: a second save updates
         // these rules instead of creating copies.
-        localItems = upserted.map((it, pos) => ({ ...it, position: pos }));
-        serverItemIds = new Set(localItems.map(it => it.id));
+        localItems = (saved.items ?? []).slice().sort((a, x) => a.position - x.position || a.id - x.id);
+        selectedSourceIds = (saved.sources ?? []).slice().sort((a, x) => a.position - x.position).map(s => s.source_id);
 
         if (!isOpen()) return;
         currentBuilder = saved;
         previewNote.textContent = '';
-        renderItems();
+        renderSourcesPicker();
         unsaved = false;
         unsavedBadge.hidden = true;
         titleEl.textContent = `Построитель: ${saved.name}`;
         previewBtn.disabled = false;
         previewBtn.title = '';
 
-        // Update cache
-        if (creating) {
-          this.buildersCache = this.buildersCache ? [...this.buildersCache, saved] : [saved];
-        } else {
-          this.buildersCache = this.buildersCache?.map(x => x.id === saved.id ? saved : x) ?? null;
-        }
+        // The list card was updated from the stored record above; reload the
+        // whole list so other builders are current too.
         void this.loadBuilders();
         this.toast(creating ? 'Построитель создан.' : 'Построитель сохранён.');
         submitting = false;
@@ -5173,8 +5167,20 @@ class AdminApp {
         if (await this.endIfSignedOut(error, isOpen)) return;
         const code = error instanceof ApiError ? error.code : '';
         const status = error instanceof ApiError ? error.status : 0;
-        if (status === 409 && code === 'version_conflict') {
-          showStatus({ tone: 'error', text: 'Конфликт версий: построитель был изменён в другой вкладке. Закройте редактор и откройте снова.' });
+        if (status === 409 && code === 'version_conflict' && currentBuilder) {
+          // Nothing was written. The edits here stay on screen; loading the
+          // current version discards them (the confirmation says so).
+          const id = currentBuilder.id;
+          const reload = button('Загрузить актуальную версию', 'btn btn-secondary btn-sm', 'refresh');
+          reload.addEventListener('click', () => {
+            if (!window.confirm('Ваши несохранённые изменения будут потеряны. Загрузить актуальную версию?')) return;
+            close(true);
+            void this.openSavedBuilder(id, reload);
+          });
+          statusEl.replaceChildren(notice({ tone: 'error', text: 'Построитель изменён в другой вкладке или другим администратором. Ваши изменения не сохранены, сохранённая конфигурация не затронута.' }), reload);
+          void this.loadBuilders();
+        } else if (status === 404 && code === 'not_found') {
+          showStatus({ tone: 'error', text: 'Построитель или одно из его правил больше не существует. Изменения не сохранены. Закройте редактор и откройте его снова.' });
         } else if (status === 409 && code === 'name_taken') {
           nameF.setError('Построитель с таким названием уже существует.');
           nameF.inp.focus();
@@ -7125,8 +7131,9 @@ class AdminApp {
       const title = el('p', 'preview-caption', 'Узел выдачи');
       title.id = 'tr-legacy-title';
       nodes.push(title, notice({ tone: 'info', text: TRIAL_LEGACY_NOTE }));
+      nodes.push(el('p', 'field-hint trial-legacy-origin', TRIAL_LEGACY_ORIGIN));
       if (!base.legacy_nodes.length) {
-        nodes.push(el('p', 'field-hint', 'Узлов нет: их список (таблица nodes) в админке не редактируется.'));
+        nodes.push(el('p', 'field-hint', 'Узлов выдачи нет: пробную подписку не на чем создать.'));
       } else {
         const list = el('ul', 'trial-node-list');
         list.setAttribute('aria-label', 'Узлы выдачи');
@@ -7670,7 +7677,15 @@ class AdminApp {
 const TRIAL_DESC = 'Как выдаётся пробная подписка по реферальной ссылке: срок, состав, страны и серверы, ограничения и карточка на странице приглашения.';
 const TRIAL_FIELD_ORDER: readonly TrialField[] = ['duration', 'title', 'description', 'features', 'badge', 'builderId', 'composition', 'legacyNodes', 'rateLimit'];
 const TRIAL_SAMPLE = 8;
-const TRIAL_LEGACY_NOTE = 'Используется только для механизма выдачи trial. VPN-состав берётся из Builder.';
+// database.TrialLegacyNode: a row of the legacy `nodes` table linked to the
+// trial plan through plan_nodes. CreateTrial provisions the anonymous client on
+// the first one; the servers of the subscription come from the builder.
+const TRIAL_LEGACY_NOTE = 'Узел выдачи — служебная запись таблицы nodes (панель 3x-ui, proxman или fetch), на которой бот регистрирует клиента пробной подписки. '
+  + 'Это не сервер из каталога источника: состав VPN-подписки определяет построитель (его источники и правила). '
+  + 'Без построителя или при отключённом построителе подписка собирается из узлов тарифа «trial».';
+const TRIAL_LEGACY_ORIGIN = 'Новые узлы не появляются после синхронизации источников и в админке не создаются: '
+  + 'узел содержит адрес и токен панели, его добавляет администратор сервера, бот подключает его при перезапуске. '
+  + 'Чтобы изменить серверы подписки, добавьте источник в разделе «Источники» и выберите его в построителе.';
 const TRIAL_PREVIEW_DEBOUNCE_MS = 350;
 
 /** The rules the trial already follows (internal/web handleInvite, BindTrial, cleanup). */

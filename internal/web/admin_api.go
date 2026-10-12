@@ -93,7 +93,9 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.get(w, r, func(w http.ResponseWriter, r *http.Request) { a.subscription(w, r, id) })
-	case len(segments) == 3 && segments[0] == "subscriptions":
+	// "builder" is the per-subscription builder override (handled below); this
+	// lifecycle case used to swallow it and answer 404.
+	case len(segments) == 3 && segments[0] == "subscriptions" && segments[2] != "builder":
 		id, ok := parseAdminID(segments[1])
 		action, known := adminActionRoutes[segments[2]]
 		if !ok || !known {
@@ -216,8 +218,20 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 			return
 		}
-		_ = builderID // builderID validated for path consistency
-		a.builderDeleteItem(w, r, itemID)
+		// The rule must belong to the builder of the path.
+		a.builderDeleteItem(w, r, builderID, itemID)
+	case len(segments) == 3 && segments[0] == "builders" && segments[2] == "configuration":
+		id, ok := parseAdminID(segments[1])
+		if !ok {
+			writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		if r.Method != http.MethodPut {
+			w.Header().Set("Allow", "PUT")
+			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		a.builderSaveConfiguration(w, r, id)
 	case len(segments) == 3 && segments[0] == "builders" && segments[2] == "reorder":
 		id, ok := parseAdminID(segments[1])
 		if !ok {

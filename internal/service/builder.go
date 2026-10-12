@@ -30,8 +30,9 @@ type BuilderRepository interface {
 	UpdateBuilder(ctx context.Context, meta database.AdminConfigMeta, in database.BuilderUpdateInput) (*database.AdminConfigResult, error)
 	SetBuilderSources(ctx context.Context, builderID uint, sourceIDs []uint) error
 	UpsertBuilderItem(ctx context.Context, item database.SubscriptionBuilderItem) (*database.SubscriptionBuilderItem, error)
-	DeleteBuilderItem(ctx context.Context, itemID uint) error
+	DeleteBuilderItem(ctx context.Context, builderID, itemID uint) error
 	ReorderBuilderItems(ctx context.Context, builderID uint, itemIDs []uint) error
+	SaveBuilderConfiguration(ctx context.Context, meta database.AdminConfigMeta, in database.BuilderConfigurationInput) (*database.AdminConfigResult, error)
 
 	// Assignments
 	SetPlanBuilder(ctx context.Context, meta database.AdminConfigMeta, planID uint, builderID *uint) (*database.AdminConfigResult, error)
@@ -159,8 +160,11 @@ type BuilderView struct {
 	SupportURL   string              `json:"support_url"`
 	Announce     string              `json:"announce"`
 	Version      int                 `json:"version"`
-	Sources      []BuilderSourceView `json:"sources,omitempty"`
-	Items        []BuilderItemView   `json:"items,omitempty"`
+	// Sources and Items are always present ([] when empty): the admin list and
+	// the editor read the configuration from them, so a missing field must
+	// never be mistaken for "no sources / no rules".
+	Sources []BuilderSourceView `json:"sources"`
+	Items   []BuilderItemView   `json:"items"`
 	CreatedAt    time.Time           `json:"created_at"`
 	UpdatedAt    time.Time           `json:"updated_at"`
 }
@@ -195,6 +199,8 @@ func builderViewOf(b *database.SubscriptionBuilder) BuilderView {
 		SupportURL:   b.SupportURL,
 		Announce:     b.Announce,
 		Version:      b.Version,
+		Sources:      make([]BuilderSourceView, 0, len(b.Sources)),
+		Items:        make([]BuilderItemView, 0, len(b.Items)),
 		CreatedAt:    b.CreatedAt,
 		UpdatedAt:    b.UpdatedAt,
 	}
@@ -315,7 +321,7 @@ func (s *BuilderService) ListSourceEntries(ctx context.Context, sourceID uint, c
 // Builder operations
 // ---------------------------------------------------------------------------
 
-// ListBuilders returns all builders (without Sources/Items preloaded).
+// ListBuilders returns all builders with their Sources and Items.
 func (s *BuilderService) ListBuilders(ctx context.Context) ([]BuilderView, error) {
 	builders, err := s.repo.ListBuilders(ctx)
 	if err != nil {
@@ -472,9 +478,34 @@ func (s *BuilderService) UpsertBuilderItem(ctx context.Context, in UpsertBuilder
 	return &v, nil
 }
 
-// DeleteBuilderItem removes a builder item rule.
-func (s *BuilderService) DeleteBuilderItem(ctx context.Context, itemID uint) error {
-	return s.repo.DeleteBuilderItem(ctx, itemID)
+// DeleteBuilderItem removes a rule of builderID. A rule of another builder is
+// database.ErrBuilderItemNotFound and stays untouched.
+func (s *BuilderService) DeleteBuilderItem(ctx context.Context, builderID, itemID uint) error {
+	return s.repo.DeleteBuilderItem(ctx, builderID, itemID)
+}
+
+// SaveBuilderConfigurationInput is the full editor state of one builder.
+type SaveBuilderConfigurationInput struct {
+	Actor      string
+	RequestKey string
+	database.BuilderConfigurationInput
+}
+
+// SaveBuilderConfiguration atomically saves metadata, sources and rules of a
+// builder with the expected version (database.SaveBuilderConfiguration) and
+// returns the stored builder.
+func (s *BuilderService) SaveBuilderConfiguration(ctx context.Context, in SaveBuilderConfigurationInput) (*BuilderView, *database.AdminAuditLog, error) {
+	result, err := s.repo.SaveBuilderConfiguration(ctx,
+		database.AdminConfigMeta{Actor: in.Actor, RequestKey: in.RequestKey}, in.BuilderConfigurationInput)
+	if err != nil {
+		return nil, nil, err
+	}
+	b, err := s.repo.GetBuilder(ctx, result.TargetID)
+	if err != nil {
+		return nil, &result.Audit, fmt.Errorf("reload builder after configuration save: %w", err)
+	}
+	v := builderViewOf(b)
+	return &v, &result.Audit, nil
 }
 
 // ReorderBuilderItems updates item positions.
@@ -767,19 +798,23 @@ func (s *BuilderService) endSync(id uint) {
 
 // EnableBuilder enables a builder (non-audited structural toggle).
 func (s *BuilderService) EnableBuilder(ctx context.Context, id uint) (*BuilderView, error) {
-	b, err := s.repo.SetBuilderEnabled(ctx, id, true)
-	if err != nil {
-		return nil, err
-	}
-	v := builderViewOf(b)
-	return &v, nil
+	return s.setBuilderEnabled(ctx, id, true)
 }
 
 // DisableBuilder disables a builder (non-audited structural toggle).
 func (s *BuilderService) DisableBuilder(ctx context.Context, id uint) (*BuilderView, error) {
-	b, err := s.repo.SetBuilderEnabled(ctx, id, false)
-	if err != nil {
+	return s.setBuilderEnabled(ctx, id, false)
+}
+
+// setBuilderEnabled toggles the builder and returns the full record (Sources
+// and Items included), so the admin list keeps showing the configuration.
+func (s *BuilderService) setBuilderEnabled(ctx context.Context, id uint, enabled bool) (*BuilderView, error) {
+	if _, err := s.repo.SetBuilderEnabled(ctx, id, enabled); err != nil {
 		return nil, err
+	}
+	b, err := s.repo.GetBuilder(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("reload builder after toggle: %w", err)
 	}
 	v := builderViewOf(b)
 	return &v, nil

@@ -675,6 +675,20 @@ export class AdminApi {
     await this.#send('POST', `/admin/api/builders/${id}/reorder`, JSON.stringify({ item_ids: itemIds }));
   }
 
+  /**
+   * PUT /admin/api/builders/{id}/configuration: metadata, sources and rules in
+   * one transaction with the loaded version. 409 version_conflict when the
+   * builder changed meanwhile (nothing is written); 404 not_found when a rule
+   * id is not a rule of this builder.
+   */
+  async saveBuilderConfiguration(id: number, input: BuilderConfigurationInput): Promise<{ builder: AdminBuilder; audit: unknown }> {
+    const data = await this.#send('PUT', `/admin/api/builders/${id}/configuration`, JSON.stringify(input));
+    if (!isRecord(data) || !isRecord(data.builder) || !Array.isArray(data.builder.sources) || !Array.isArray(data.builder.items)) {
+      throw new ApiError('invalid_response');
+    }
+    return data as unknown as { builder: AdminBuilder; audit: unknown };
+  }
+
   async previewBuilder(id: number): Promise<BuilderPreview> {
     const data = await this.#send('POST', `/admin/api/builders/${id}/preview`);
     if (!isRecord(data)) throw new ApiError('invalid_response');
@@ -1168,6 +1182,34 @@ export interface UpdateBuilderInput {
   readonly profile_title: string;
   readonly support_url: string;
   readonly announce: string;
+}
+
+/** One rule of a configuration save; its position is the index in `items`. */
+export interface BuilderConfigItemInput {
+  /** An existing rule of this builder, 0 for a new rule. */
+  readonly id: number;
+  readonly kind: 'country' | 'node';
+  readonly source_id: number;
+  readonly country_code: string;
+  readonly fingerprint: string;
+  readonly original_name: string;
+  readonly custom_name: string | null;
+  readonly description: string;
+  readonly enabled: boolean;
+}
+
+/** web.builderConfigRequest. */
+export interface BuilderConfigurationInput {
+  readonly request_key: string;
+  readonly version: number;
+  readonly name: string;
+  readonly description: string;
+  readonly enabled: boolean;
+  readonly profile_title: string;
+  readonly support_url: string;
+  readonly announce: string;
+  readonly source_ids: readonly number[];
+  readonly items: readonly BuilderConfigItemInput[];
 }
 
 export interface UpsertBuilderItemInput {

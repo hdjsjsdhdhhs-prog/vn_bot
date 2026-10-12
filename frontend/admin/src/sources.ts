@@ -1,7 +1,7 @@
 // Pure logic of the source catalogue screens: format labels, sync state and
 // error texts, count labels, entry filters and the per-source summary shown
 // in the Builder. No DOM here; covered by tests/admin-sources.test.ts.
-import type { AdminSource, BuilderItem, BuilderPreview, FingerprintStatus, SourceCatalogue, SourceEntry, SourceSyncResult } from './api';
+import type { AdminBuilder, AdminSource, BuilderConfigItemInput, BuilderItem, BuilderPreview, FingerprintStatus, SourceCatalogue, SourceEntry, SourceSyncResult } from './api';
 import { pluralRu } from './tariffs';
 
 /** ProviderSource.type: the expected response format (database.SourceFormats). */
@@ -164,6 +164,100 @@ export function builderSourcesSummary(sources: readonly AdminSource[]): BuilderS
     return { id: s.id, name: s.name, summary: catalogueSummary(s.catalogue), state: syncState(s), enabled: s.enabled };
   });
   return { rows, entries, countries: codes.size, disabled };
+}
+
+// ---------------------------------------------------------------------------
+// Builder list card. Counts come from the saved configuration the backend
+// returns (service.BuilderView.sources / items) and follow the /sub resolver
+// (subserver.builderSourcesToFetch + selectBuilderEntries):
+//   source  = a linked provider source (subscription_builder_sources row);
+//   rule    = a subscription_builder_items row: a country rule (every server
+//             of one country, resolved on each build) or a node rule (one
+//             concrete server of the catalogue);
+//   no rules         → every server of every linked source is served;
+//   no linked source → nothing is served;
+//   rules present but none enabled on a linked source → nothing is served.
+
+export interface BuilderCardSummary {
+  sources: number;
+  rules: number;
+  /** Rules switched off: /sub skips them. */
+  disabledRules: number;
+  /** Enabled rules whose source is not linked: /sub ignores them. */
+  unlinkedRules: number;
+  /** Country codes of the applied country rules, rule order, unique ('' = without a country). */
+  countries: string[];
+  /** Applied node rules (one concrete server each). */
+  nodes: number;
+  /** "v3 · 2 источника · 4 правила (1 выкл.)" */
+  meta: string;
+  /** What /sub serves with this configuration. */
+  composition: string;
+  /** The configuration serves nothing. */
+  empty: boolean;
+}
+
+type CardBuilder = Pick<AdminBuilder, 'version' | 'sources' | 'items'>;
+
+/**
+ * Rules of the editor as the configuration save expects them: in display
+ * order (the index is the position), local placeholders (id <= 0) as new rules
+ * (id 0), only the fields of the rule kind.
+ */
+export function builderConfigItems(items: readonly BuilderItem[]): BuilderConfigItemInput[] {
+  return items.map(it => ({
+    id: it.id > 0 ? it.id : 0,
+    kind: it.kind,
+    source_id: it.source_id,
+    country_code: it.kind === 'country' ? (it.country_code ?? '') : '',
+    fingerprint: it.kind === 'node' ? (it.fingerprint ?? '') : '',
+    original_name: it.kind === 'node' ? (it.original_name ?? '') : '',
+    custom_name: it.custom_name ?? null,
+    description: it.description ?? '',
+    enabled: it.enabled,
+  }));
+}
+
+export function builderCardSummary(b: CardBuilder): BuilderCardSummary {
+  const sources = b.sources ?? [];
+  const items = b.items ?? [];
+  const linked = new Set(sources.map(s => s.source_id));
+  const countries: string[] = [];
+  let disabledRules = 0, unlinkedRules = 0, nodes = 0;
+  for (const it of [...items].sort((x, y) => x.position - y.position || x.id - y.id)) {
+    if (!it.enabled) { disabledRules++; continue; }
+    if (!linked.has(it.source_id)) { unlinkedRules++; continue; }
+    if (it.kind === 'node') { nodes++; continue; }
+    const code = (it.country_code ?? '').toUpperCase();
+    if (!countries.includes(code)) countries.push(code);
+  }
+  const off = [
+    disabledRules ? `${countFormat.format(disabledRules)} выкл.` : '',
+    unlinkedRules ? `${countFormat.format(unlinkedRules)} без источника` : '',
+  ].filter(Boolean).join(', ');
+  const meta = [
+    `v${b.version}`,
+    `${countFormat.format(sources.length)} ${pluralRu(sources.length, 'источник', 'источника', 'источников')}`,
+    `${countFormat.format(items.length)} ${pluralRu(items.length, 'правило', 'правила', 'правил')}${off ? ` (${off})` : ''}`,
+  ].join(' · ');
+
+  let composition: string;
+  let empty = false;
+  if (sources.length === 0) {
+    composition = 'Источники не подключены: подписка не соберётся.';
+    empty = true;
+  } else if (items.length === 0) {
+    composition = 'Без правил: все серверы подключённых источников.';
+  } else if (countries.length === 0 && nodes === 0) {
+    composition = 'Ни одно правило не применяется: подписка не соберётся.';
+    empty = true;
+  } else {
+    const parts: string[] = [];
+    if (countries.length) parts.push(`Страны: ${countries.map(c => c ? countryLabel(c) : 'без страны').join(', ')}`);
+    if (nodes) parts.push(`отдельных серверов: ${countFormat.format(nodes)}`);
+    composition = parts.join(' · ');
+  }
+  return { sources: sources.length, rules: items.length, disabledRules, unlinkedRules, countries, nodes, meta, composition, empty };
 }
 
 // ---------------------------------------------------------------------------

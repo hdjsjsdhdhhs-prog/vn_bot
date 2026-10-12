@@ -42,6 +42,9 @@ func newTrialAPIFixture(t *testing.T, withTrial bool) *trialAPIFixture {
 	builder := &database.SubscriptionBuilder{Name: "trial-api-builder", Enabled: true, Version: 1}
 	require.NoError(t, base.db.GetDB().Create(builder).Error)
 	require.NoError(t, base.db.SetBuilderSources(ctx, builder.ID, []uint{src.ID}))
+	// Linking sources bumps the builder version: keep the stored record.
+	builder, err = base.db.GetBuilder(ctx, builder.ID)
+	require.NoError(t, err)
 	node := database.Node{Name: "trial-node", IsActive: true, Host: "trial.example", APIToken: "token", Type: database.NodeType3xUI, InboundIDs: "[1]"}
 	require.NoError(t, base.db.CreateNode(ctx, &node))
 	require.NoError(t, base.db.LinkNodeToPlan(ctx, database.TrialPlanName, node.ID))
