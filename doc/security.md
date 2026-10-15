@@ -36,14 +36,13 @@ Instead, contact us privately:
 | Component | Protection |
 |-----------|------------|
 | Telegram bot | User identification via `chat_id`; admin commands check `TELEGRAM_ADMIN_ID` |
-| VPN panels (3x-ui / proxman) | API token per node (`nodes.api_token`) via Bearer header; HTTPS is recommended for production |
-| Fetch nodes | No API token; `subscription_url` fetched via HTTP GET (no client management) |
+| Provider sources | URL and headers stored server-side in `provider_sources`; fetch errors never expose URLs or credentials; HTTPS is recommended for production |
 | Trial Telegram IDs | Positive = bound users, Negative = unbound trial subscriptions, 0 = unused |
 
 ### 2. Input Validation
 
 - **URLs (S3):** `validateURL()` restricts schemes to `http` and `https` only — prevents `file://`, `gopher://`, and other schemes that could enable SSRF
-- **Node transport:** `nodes.host` accepts HTTP or HTTPS; use HTTPS for production panel traffic and keep HTTP limited to trusted private networks
+- **Provider source transport:** ProviderSource URLs accept HTTP or HTTPS; use HTTPS for production and keep HTTP limited to trusted private networks
 - **Invite codes:** Alphanumeric regex validation
 - **Telegram IDs:** Integer parsing with overflow protection
 - **Type-safe env vars:** `internal/flag/` typed registry validates and parses all env vars at config load time
@@ -66,7 +65,7 @@ Instead, contact us privately:
 - **Backups:** Daily rotation (30 files by default), same directory (consider off-site)
 - **Logging:** Sensitive data masked in `Config.String()`; no secrets in logs
 - **Secrets:** Stored in `.env` (not in code), file permissions recommended `600`
-- **Node API tokens:** Stored and managed only via `nodes.api_token` in the database (no env-var dependency)
+- **Provider source credentials:** stored only in the database (`provider_sources` URL/headers); fetch failures are reduced to stable error codes that never contain upstream URLs, headers or response content
 
 ### 5. Error Handling
 
@@ -74,7 +73,6 @@ Instead, contact us privately:
 - **Graceful shutdown** — in-flight requests allowed to complete
 - **RetryWithBackoff** retries VPN panel calls on transient errors (exponential backoff + jitter, up to 3 retries)
 - **Fail-closed cache revalidation** for the Subscription server: cached access is not served when subscription status cannot be checked
-- **Circuit breaker:** implemented and tested, but not wired into the live XUI client path; production resilience currently relies on timeout and retry/backoff
 
 ### 6. Code Quality
 
@@ -83,40 +81,23 @@ Instead, contact us privately:
 - **Fuzzing:** Markdown sanitization fuzz tests
 - **Leak detection:** Goroutine leak tests in `tests/leak/`
 - **Test coverage:** 66.2% aggregate in the latest documented run; regenerate with `go test -coverprofile=coverage.out ./...`
-- **Prometheus metrics** (`internal/metrics/`): HTTP requests, bot updates, live XUI requests, DB queries, cache hits/misses, active subscriptions, reminder delivery, payment events, and orphaned subscriptions revoked during reconciliation
+- **Prometheus metrics** (`internal/metrics/`): HTTP requests, bot updates, DB queries, cache hits/misses, active subscriptions, reminder delivery, and payment events
 
 ### 7. Architecture Security
 
 - **Decoupled web layer (A1):** The `web` package no longer imports the `bot` package. `NewServer` accepts a `botUsername string` instead of `*bot.BotConfig`, reducing coupling and attack surface — a compromise of the web/subscription server cannot reach into bot internals.
-- **VPN abstraction layer:** `internal/vpn/` defines a `Client` interface (`CreateSubscription`, `UpdateSubscription`, `DeleteSubscription`) with a factory (`NewClient()`) that routes by `NodeType` (3x-ui, proxman, fetch). Panel-specific logic is isolated; adding a new panel type does not touch service code. Fetch nodes use a no-op client (all methods return `nil`) and serve proxy data via direct HTTP GET to `subscription_url`.
+- **Builder pipeline:** `/sub` content is assembled from ProviderSource catalogues by Subscription Builders. The bot manages no clients on external panels, so there are no panel credentials to protect.
 - **Error classification:** Typed errors (`ErrSubscriptionAlreadyExists`, `ErrSubscriptionNotFound`) prevent information leakage through generic error messages.
 
-### 8. VPN Panel API Token Management
+### 8. Provider Source Credentials
 
-#### Token Lifecycle
+ProviderSource URLs and request headers (which may carry upstream credentials) are stored server-side in `provider_sources` and are used only by the subserver and the admin catalogue sync.
 
-1. **Creation:** Generate token in panel (3x-ui: Security settings → API Token; proxman: equivalent). Copy immediately — token is shown only once.
-2. **Storage:** Stored in `nodes.api_token` in DB. `.env` file permissions must be `600` if used for other secrets.
-3. **Usage:** Sent as `Authorization: Bearer $token` header on every API call.
-4. **Rotation:** Rotate every 90 days. Generate new token in panel, update `nodes.api_token` in DB, restart bot.
-5. **Revocation:** Generate a new token in panel — the old token is immediately invalidated.
-
-#### Audit & Monitoring
-
-- Enable panel access logs to record all API actions
-- `SUBSERVER_ACCESS_LOG` env var enables subscription server access logging
-- Monitor bot logs for `XUI API error` or `401 Unauthorized` responses
-- If a token is suspected compromised:
-  1. Generate new token in panel immediately (old one stops working)
-  2. Update DB / `.env` and restart bot
-  3. Check panel access logs for unauthorized activity
-  4. Review the time window between compromise and revocation
-
-#### Least Privilege
-
-- Panel API tokens grant full panel API access — no scope/restriction mechanism exists in 3x-ui or proxman
-- Mitigation: restrict network access to panel (firewall, private VLAN) so token can only be used from bot host
-- Future: if panels add scoped tokens, use the most restrictive scope needed
+- **Storage:** database only. `.env` file permissions must be `600` if used for other secrets.
+- **Exposure:** fetch failures collapse to stable error codes (`ErrProviderSourceUnavailable` and the catalogue-sync failure codes) that never contain upstream URLs, headers or response content.
+- **Transport:** use HTTPS provider URLs and restrict outbound network access of the bot host to the providers you use. A ProviderSource URL can point to any reachable address, so only trusted admins may create sources (SSRF).
+- **Rotation / compromise:** rotate the credential at the provider, update the ProviderSource in the admin UI, then check the provider's access logs for the window between compromise and rotation.
+- **Monitoring:** watch `subserver_source_fetch_total{result="error"}`; `SUBSERVER_ACCESS_LOG` enables subscription server access logging.
 
 ### 9. Payment Webhook Security (Platega)
 
@@ -134,7 +115,7 @@ Instead, contact us privately:
 
 ### Before Deployment
 
-- [ ] **Use HTTPS** for all node hosts (`nodes.host`, no HTTP in prod)
+- [ ] **Use HTTPS** for all ProviderSource URLs (no HTTP in prod)
 - [ ] Set `GLOBAL_SUB_URL` to your subscription server's public HTTPS URL
 - [ ] Set `TELEGRAM_ADMIN_ID` to real admin user ID
 - [ ] `.env` file permissions: `chmod 600 .env`
@@ -148,9 +129,9 @@ Instead, contact us privately:
 
 - [ ] **Rotate secrets** every 90 days (panel API tokens)
 - [ ] Monitor `/healthz` with external service (UptimeRobot, healthchecks.io)
-- [ ] Monitor Prometheus metrics for anomalies (XUI errors, payment issues, error-rate spikes; circuit-breaker trips if the breaker is enabled in the live path)
+- [ ] Monitor Prometheus metrics for anomalies (provider source fetch errors, payment issues, error-rate spikes)
 - [ ] Review logs daily for `error`/`warn` level
-- [ ] Watch for `401` / `XUI API error` patterns indicating token issues
+- [ ] Watch for repeated provider fetch errors (`subserver_source_fetch_total{result="error"}`) that may indicate a rotated or revoked provider credential
 - [ ] Backup verification: monthly restore test
 - [ ] OS security updates: at least monthly
 - [ ] Enable audit logging on all VPN panels
@@ -182,7 +163,7 @@ Instead, contact us privately:
 | No built-in DDoS protection | Layer 7 | Use nginx rate limiting or cloud WAF |
 | No request signing for API | Bearer token only | Use HTTPS + rotate token regularly |
 | Trial rate limit per IP (not per user) | IPs can be changed via VPN | Acceptable for free tier; paid users get unique links |
-| Fetch node SSRF | `subscription_url` can point to arbitrary internal addresses | Restrict via firewall; do not use fetch nodes with untrusted URLs; validate `subscription_url` points to expected hosts |
+| ProviderSource SSRF | A ProviderSource URL can point to arbitrary internal addresses | Only trusted admins create sources; restrict outbound traffic with a firewall; use only expected provider hosts |
 
 ---
 
@@ -195,18 +176,17 @@ Instead, contact us privately:
 3. **Analyze:** Check logs for unauthorized access, unusual API calls, new admin users in Telegram
 4. **Rotate secrets:**
    - New Telegram bot token (via @BotFather)
-   - New VPN panel credentials (all nodes)
+   - ProviderSource credentials (URLs/headers; rotate at the provider)
 5. **Restore from clean backup:** If DB tampered, restore from known-good backup
 6. **Update:** Deploy latest version with security fixes
 7. **Notify:** Inform users if personal data potentially exposed
 
-### If VPN Panel Compromised
+### If a Provider Source Credential is Compromised
 
-1. Panel is separate system — follow its security procedures
-2. **Revoke the panel API token** immediately in panel Security settings → generate a new one
-3. Update `nodes.api_token` in DB and restart the bot
-4. Check panel logs for unauthorized client modifications
-5. Audit all recent changes made via the compromised token (panel access logs)
+1. Rotate the credential at the provider (the old one must stop working).
+2. Update the ProviderSource URL/headers in the admin UI.
+3. Check the provider's access logs for unauthorized use.
+4. Review the time window between compromise and rotation.
 
 ### Data Breach Notification
 
@@ -226,8 +206,7 @@ If subscriber data (Telegram IDs, usernames, subscription links) is exposed:
 TELEGRAM_BOT_TOKEN=1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi
 TELEGRAM_ADMIN_ID=123456789
 
-# VPN Panel configuration is managed via the `nodes` table in the database.
-# Add nodes via SQL or admin commands after first startup.
+# ProviderSources and Builders are managed in the admin UI (stored in the database).
 
 # Subscription server (required)
 GLOBAL_SUB_URL=https://sub.example.com  # Public HTTPS URL for subscription links
@@ -251,7 +230,7 @@ TRIAL_DURATION_HOURS=3
 TRIAL_RATE_LIMIT=3
 ```
 
-> **Note:** Node configuration lives in the `nodes` table (`host`, `api_token`, `inbound_ids` JSON array, `type`, `subscription_url`), managed via the database. `GLOBAL_SUB_URL` is required and provides the subscription URL prefix.
+> **Note:** ProviderSources and Builders live in the database. `GLOBAL_SUB_URL` is required and provides the subscription URL prefix.
 
 **Docker run:**
 ```bash

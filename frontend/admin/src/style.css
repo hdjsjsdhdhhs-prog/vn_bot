@@ -750,15 +750,12 @@ input[type='datetime-local'].input { min-width: 0; }
   .table-cards td.cell-wrap { grid-column: 1 / -1; }
   .users-table .col-md { display: block; }
   .users-table td.col-user,
-  .users-table td.col-status,
-  .nodes-table td:first-child { align-self: center; }
+  .users-table td.col-status { align-self: center; }
   .users-table td.col-user::before,
-  .users-table td.col-status::before,
-  .nodes-table td:first-child::before { content: none; }
+  .users-table td.col-status::before { content: none; }
   .users-table td.col-user { font-size: 15px; }
   .users-table td.col-status { grid-row: 1; grid-column: 2; justify-self: end; text-align: right; }
   .user-link { max-width: 100%; }
-  .nodes-table td:first-child { grid-column: 1 / -1; font-weight: 600; }
 }
 
 /* Journal ---------------------------------------------------------------- */
@@ -1523,9 +1520,6 @@ input[type='datetime-local'].input { min-width: 0; }
 .trial-node-list { padding: 0 var(--sp-3) var(--sp-2) calc(var(--sp-3) + 24px); }
 .trial-node { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); padding: var(--sp-1) 0; font-size: 13px; }
 .trial-node-name { min-width: 0; overflow-wrap: anywhere; cursor: pointer; }
-/* Issuance node (plan_nodes of the trial plan) under the builder in «Состав». */
-.trial-legacy { display: grid; gap: var(--sp-2); min-width: 0; padding-top: var(--sp-3); border-top: 1px solid var(--line); }
-.trial-legacy .trial-node-list { padding: 0; }
 .trial-order { display: grid; gap: var(--sp-2); }
 .trial-order .rule-list { border: 1px solid var(--line); border-radius: var(--r-md); }
 .trial-rule { grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; }

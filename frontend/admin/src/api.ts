@@ -104,27 +104,16 @@ export interface UsersQuery {
   readonly offset: number;
 }
 
-/** service.AdminPlanView. traffic_limit is in bytes, 0 means unlimited. */
+/**
+ * service.AdminPlanView. A plan carries no device or traffic limits: access is
+ * local state and the content of /sub comes from the plan builder.
+ */
 export interface AdminPlan {
   readonly id: number;
   readonly name: string;
   readonly is_active: boolean;
-  readonly devices_limit: number;
-  readonly traffic_limit: number;
   /** Default builder for this plan; null means no builder assigned. */
   readonly subscription_builder_id: number | null;
-}
-
-/** database.AdminSubscriptionNode: sync state of the subscription on one VPN node. */
-export interface AdminNode {
-  readonly node_id: number;
-  readonly node_name: string;
-  /** database.SyncStatus: active, pending_add, pending_remove or pending_update. */
-  readonly status: string;
-  readonly retry_count: number;
-  readonly retry_at: string | null;
-  readonly last_error: string;
-  readonly updated_at: string;
 }
 
 /**
@@ -135,7 +124,6 @@ export interface AdminNode {
 export interface UserDetail {
   readonly subscription: AdminSubscription;
   readonly plan: AdminPlan | null;
-  readonly nodes: readonly AdminNode[];
 }
 
 /**
@@ -293,34 +281,20 @@ function parseUsersPage(value: unknown): UsersPage | null {
 
 function parsePlan(value: unknown): AdminPlan | undefined {
   if (!isRecord(value)) return undefined;
-  const { id, name, is_active, devices_limit, traffic_limit, subscription_builder_id = null } = value;
-  if (!isPositive(id) || !isText(name) || typeof is_active !== 'boolean' || !isCount(devices_limit) ||
-    !isCount(traffic_limit) || !isNullable(subscription_builder_id, isPositive)) return undefined;
-  return { id, name, is_active, devices_limit, traffic_limit, subscription_builder_id };
-}
-
-function parseNode(value: unknown): AdminNode | null {
-  if (!isRecord(value)) return null;
-  const { node_id, node_name, status, retry_count, retry_at, last_error, updated_at } = value;
-  if (!isPositive(node_id) || !isText(node_name) || !isText(status) || status === '' || !isCount(retry_count) ||
-    !isNullable(retry_at, isTime) || !isText(last_error) || !isTime(updated_at)) return null;
-  return { node_id, node_name, status, retry_count, retry_at, last_error, updated_at };
+  const { id, name, is_active, subscription_builder_id = null } = value;
+  if (!isPositive(id) || !isText(name) || typeof is_active !== 'boolean' ||
+    !isNullable(subscription_builder_id, isPositive)) return undefined;
+  return { id, name, is_active, subscription_builder_id };
 }
 
 function parseUserDetail(value: unknown, telegramId: number): UserDetail | null {
-  if (!isRecord(value) || !Array.isArray(value.nodes) || !Array.isArray(value.audit)) return null;
+  if (!isRecord(value) || !Array.isArray(value.audit)) return null;
   const subscription = parseSubscription(value.subscription);
   // The route resolves by Telegram ID; any other row is not this user.
   if (!subscription || subscription.telegram_id !== telegramId) return null;
   const plan = value.plan === null ? null : parsePlan(value.plan);
   if (plan === undefined) return null;
-  const nodes: AdminNode[] = [];
-  for (const item of value.nodes) {
-    const node = parseNode(item);
-    if (!node) return null;
-    nodes.push(node);
-  }
-  return { subscription, plan, nodes };
+  return { subscription, plan };
 }
 
 function parseOutcome(value: unknown, id: number): MutationOutcome | null {
@@ -493,8 +467,8 @@ export class AdminApi {
    * One audited lifecycle mutation. Rejections surface as ApiError with the
    * backend code: 409 invalid_state, subscription_expired,
    * perpetual_subscription, invalid_expiry (recorded, nothing changed) or
-   * request_key_conflict; 500 sync_failed means the change IS committed but
-   * node sync setup failed — retry with the same key. Never retried here.
+   * request_key_conflict. Never retried here; a retry with the same key
+   * replays the recorded outcome.
    */
   async mutate(id: number, mutation: Mutation, requestKey: string): Promise<MutationOutcome> {
     if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
@@ -903,14 +877,11 @@ export interface TrialPreview {
   readonly issuable: boolean;
   readonly enabled: boolean;
   readonly problems: readonly TrialProblem[];
-  /** builder | legacy (trial plan nodes, no builder). */
-  readonly serve: string;
   readonly duration_hours: number;
   readonly expires_at: string;
   readonly builder: TrialBuilderRef | null;
   readonly mode: string;
   readonly sources: readonly { readonly id: number; readonly name: string; readonly enabled: boolean; readonly usable: boolean }[];
-  readonly legacy_nodes: number;
   readonly total: number;
   readonly countries: readonly { readonly code: string; readonly count: number }[];
   readonly items: readonly TrialPreviewItem[];
@@ -926,19 +897,6 @@ export interface TrialHistoryEntry {
   readonly created_at: string;
 }
 
-/**
- * database.TrialLegacyNode: a node of the nodes table offered as the trial
- * issuance node (plan_nodes of the trial plan). No host, token or URL.
- */
-export interface TrialLegacyNode {
-  readonly id: number;
-  readonly name: string;
-  readonly type: string;
-  readonly is_active: boolean;
-  /** Currently linked to the trial plan. */
-  readonly linked: boolean;
-}
-
 export interface TrialView {
   readonly settings: TrialSettings;
   readonly defaults: { readonly duration_hours: number; readonly rate_limit_per_hour: number };
@@ -946,7 +904,6 @@ export interface TrialView {
   readonly builder_id: number | null;
   readonly composition: TrialComposition | null;
   readonly builders: readonly TrialBuilderSummary[];
-  readonly legacy_nodes: readonly TrialLegacyNode[];
   readonly preview: TrialPreview;
   readonly active_trials: number;
   readonly history: readonly TrialHistoryEntry[];
@@ -963,8 +920,6 @@ export interface TrialDraft {
   badge: string;
   builder_id: number | null;
   composition: { builder_version: number; mode: TrialMode; source_ids: number[]; rules: TrialRule[] } | null;
-  /** Issuance nodes of the trial plan; null keeps the stored links. */
-  legacy_node_ids: number[] | null;
 }
 
 export interface TrialOutcome {
@@ -994,21 +949,15 @@ function isTrialComposition(v: unknown): v is TrialComposition {
 function isTrialPreview(v: unknown): v is TrialPreview {
   return isRecord(v) && typeof v.issuable === 'boolean' && Array.isArray(v.problems) &&
     v.problems.every(p => isRecord(p) && typeof p.field === 'string' && typeof p.code === 'string' && typeof p.severity === 'string') &&
-    typeof v.serve === 'string' && isCount(v.duration_hours) && isCount(v.total) && isCount(v.legacy_nodes) &&
+    isCount(v.duration_hours) && isCount(v.total) &&
     Array.isArray(v.countries) && Array.isArray(v.items) && Array.isArray(v.warnings) && Array.isArray(v.sources) &&
     (v.builder === null || isRecord(v.builder));
-}
-
-function isTrialLegacyNode(v: unknown): v is TrialLegacyNode {
-  return isRecord(v) && isCount(v.id) && typeof v.name === 'string' && typeof v.type === 'string' &&
-    typeof v.is_active === 'boolean' && typeof v.linked === 'boolean';
 }
 
 function parseTrialView(v: unknown): TrialView {
   if (!isRecord(v) || !isTrialSettings(v.settings) || !isRecord(v.defaults) || !isCount(v.plan_id) ||
     !(v.builder_id === null || isCount(v.builder_id)) || !(v.composition === null || isTrialComposition(v.composition)) ||
     !Array.isArray(v.builders) || !v.builders.every(b => isRecord(b) && isCount(b.id) && typeof b.name === 'string' && isRecord(b.usage)) ||
-    !Array.isArray(v.legacy_nodes) || !v.legacy_nodes.every(isTrialLegacyNode) ||
     !isTrialPreview(v.preview) || !isCount(v.active_trials) || !Array.isArray(v.history)) {
     throw new ApiError('invalid_response');
   }
@@ -1315,8 +1264,6 @@ export interface TariffPlan {
   readonly id: number;
   readonly name: string;
   readonly is_active: boolean;
-  readonly devices_limit: number;
-  readonly traffic_limit: number;
   readonly subscription_builder_id: number | null;
   readonly builder_name: string;
   /** Tariffs (all versions) and subscriptions on this plan. */
@@ -1399,13 +1346,13 @@ function parseTariffList(value: unknown): AdminTariff[] | null {
 function parseTariffPlan(value: unknown): TariffPlan | undefined {
   if (!isRecord(value)) return undefined;
   const {
-    id, name, is_active, devices_limit, traffic_limit, subscription_builder_id = null, builder_name = '',
+    id, name, is_active, subscription_builder_id = null, builder_name = '',
     tariffs, subscriptions, selectable,
   } = value;
-  if (!isPositive(id) || !isText(name) || typeof is_active !== 'boolean' || !isCount(devices_limit) ||
-    !isCount(traffic_limit) || !isNullable(subscription_builder_id, isPositive) || !isText(builder_name) ||
+  if (!isPositive(id) || !isText(name) || typeof is_active !== 'boolean' ||
+    !isNullable(subscription_builder_id, isPositive) || !isText(builder_name) ||
     !isCount(tariffs) || !isCount(subscriptions) || typeof selectable !== 'boolean') return undefined;
-  return { id, name, is_active, devices_limit, traffic_limit, subscription_builder_id, builder_name, tariffs, subscriptions, selectable };
+  return { id, name, is_active, subscription_builder_id, builder_name, tariffs, subscriptions, selectable };
 }
 
 // =============================================================================

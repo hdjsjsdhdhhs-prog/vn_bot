@@ -3,7 +3,6 @@ package subserver
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,44 +15,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestHandleSubscription_ProviderSource_LegacyPathUnchanged(t *testing.T) {
-	t.Parallel()
-
-	legacyUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("vless://legacy@legacy.example:443#Legacy"))
-	}))
-	defer legacyUpstream.Close()
-
-	db := testutil.NewDatabaseService()
-	db.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
-		return activeRuntimeSubscription("legacy-runtime", nil), nil
-	}
-
-	var legacyLoads atomic.Int32
-	db.GetWithPlanAndNodesFunc = func(context.Context, string) (*database.SubscriptionFull, error) {
-		legacyLoads.Add(1)
-
-		return &database.SubscriptionFull{
-			Subscription: *activeRuntimeSubscription("legacy-runtime", nil),
-			Plan:         database.Plan{TrafficLimit: 1 << 30},
-			Nodes: []database.Node{{
-				ID:              1,
-				Name:            "legacy",
-				SubscriptionURL: legacyUpstream.URL + "/",
-			}},
-		}, nil
-	}
-
-	result, success, total, err := HandleSubscription(context.Background(), db, newTestSubSvc(t), "legacy-runtime", "", nil)
-	require.NoError(t, err)
-	assert.Equal(t, int32(1), legacyLoads.Load())
-	assert.Equal(t, 1, success)
-	assert.Equal(t, 1, total)
-	decoded, err := base64.StdEncoding.DecodeString(string(result.Body))
-	require.NoError(t, err)
-	assert.Contains(t, string(decoded), "vless://legacy@legacy.example")
-}
 
 func TestHandleSubscription_ProviderSource_UsesConfiguredRequestAndHidesCredentials(t *testing.T) {
 	t.Parallel()
@@ -92,10 +53,6 @@ func TestHandleSubscription_ProviderSource_UsesConfiguredRequestAndHidesCredenti
 	db := testutil.NewDatabaseService()
 	db.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
 		return activeRuntimeSubscription("provider-runtime", source), nil
-	}
-	db.GetWithPlanAndNodesFunc = func(context.Context, string) (*database.SubscriptionFull, error) {
-		t.Fatal("ProviderSource path must not load legacy plan nodes")
-		return nil, errors.New("unexpected legacy path")
 	}
 
 	result, success, total, err := HandleSubscription(context.Background(), db, newTestSubSvc(t), "provider-runtime", "", nil)
@@ -221,16 +178,10 @@ func TestHandleSubscription_ProviderSource_MissingDoesNotFallBack(t *testing.T) 
 		return sub, nil
 	}
 
-	var legacyLoads atomic.Int32
-	db.GetWithPlanAndNodesFunc = func(context.Context, string) (*database.SubscriptionFull, error) {
-		legacyLoads.Add(1)
-		return nil, errors.New("unexpected legacy path")
-	}
-
 	result, _, _, err := HandleSubscription(context.Background(), db, newTestSubSvc(t), sub.SubscriptionID, "", nil)
 	assert.Nil(t, result)
 	assert.ErrorIs(t, err, ErrProviderSourceUnavailable)
-	assert.Equal(t, int32(0), legacyLoads.Load())
+	assert.NotErrorIs(t, err, ErrBuilderUnavailable, "a dangling source link is reported as the source, not as a missing builder")
 }
 
 func TestHandleSubscription_ProviderSource_DisabledDoesNotFetchOrFallBack(t *testing.T) {
@@ -250,10 +201,6 @@ func TestHandleSubscription_ProviderSource_DisabledDoesNotFetchOrFallBack(t *tes
 		Enabled:         false,
 	}
 	db := providerRuntimeDatabase("disabled-provider", source)
-	db.GetWithPlanAndNodesFunc = func(context.Context, string) (*database.SubscriptionFull, error) {
-		t.Fatal("disabled ProviderSource must not fall back to legacy nodes")
-		return nil, errors.New("unexpected legacy path")
-	}
 
 	result, _, _, err := HandleSubscription(context.Background(), db, newTestSubSvc(t), "disabled-provider", "", nil)
 	assert.Nil(t, result)

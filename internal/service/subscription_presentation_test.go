@@ -27,7 +27,7 @@ func TestGetPublicSubscriptionInfo(t *testing.T) {
 		}, nil
 	}
 	cfg := &config.Config{GlobalSubURL: "https://customer.example/sub/"}
-	svc := NewSubscriptionService(db, nil, nil, nil, cfg)
+	svc := NewSubscriptionService(db, cfg)
 
 	info, err := svc.GetPublicSubscriptionInfo(context.Background(), token)
 	require.NoError(t, err)
@@ -59,7 +59,7 @@ func TestGetPublicSubscriptionInfo_EffectiveStatus(t *testing.T) {
 			db := testutil.NewDatabaseService()
 			sub := &database.Subscription{Token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: tc.status, ExpiresAt: tc.expiresAt}
 			db.GetByTokenFunc = func(context.Context, string) (*database.Subscription, error) { return sub, nil }
-			svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{GlobalSubURL: "https://customer.example/sub/"})
+			svc := NewSubscriptionService(db, &config.Config{GlobalSubURL: "https://customer.example/sub/"})
 			info, err := svc.GetPublicSubscriptionInfo(context.Background(), sub.Token)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, info.Status)
@@ -69,36 +69,29 @@ func TestGetPublicSubscriptionInfo_EffectiveStatus(t *testing.T) {
 }
 
 func TestFormatSubscriptionMessage_UsesCanonicalFields(t *testing.T) {
-	traffic := &TrafficInfo{
+	details := &SubscriptionDetails{
 		PlanName:           "Premium",
-		LimitGB:            100,
-		UsedGB:             12.5,
-		Percentage:         12.5,
-		ProgressBar:        "████",
 		CreatedAtFormatted: "01.01.2026 12:00",
 		ExpiresAtFormatted: "31.01.2026 12:00",
-		ResetInfo:          "через 5 дн.",
 	}
 
-	got := FormatSubscriptionMessage("📋 *Ваша подписка*", "активна", traffic, "https://example.test/sub/abc")
+	got := FormatSubscriptionMessage("📋 *Ваша подписка*", "активна", details, "https://example.test/sub/abc")
 
 	assert.Contains(t, got, "Статус: *активна*")
 	assert.Contains(t, got, "Тариф: *Premium*")
-	assert.Contains(t, got, "12.50 из 100 Гб (12%)")
-	assert.Contains(t, got, "████")
 	assert.Contains(t, got, "01.01.2026 12:00")
 	assert.Contains(t, got, "31.01.2026 12:00")
-	assert.Contains(t, got, "через 5 дн.")
+	assert.NotContains(t, got, "Трафик", "the bot does not meter traffic")
 	assert.Contains(t, got, "`https://example.test/sub/abc`")
 }
 
-func TestFormatSubscriptionMessage_DefaultsUnlimitedAndStatus(t *testing.T) {
-	got := FormatSubscriptionMessage("Heading", "", &TrafficInfo{PlanName: "Free"}, "")
+func TestFormatSubscriptionMessage_DefaultsStatusAndHasNoTraffic(t *testing.T) {
+	got := FormatSubscriptionMessage("Heading", "", &SubscriptionDetails{PlanName: "Free"}, "")
 
 	assert.Contains(t, got, "Статус: *активна*")
 	assert.Contains(t, got, "Тариф: *Free*")
-	assert.Contains(t, got, "Трафик: неограничен")
-	assert.Contains(t, got, "Сброс: нет")
+	assert.NotContains(t, got, "Трафик")
+	assert.NotContains(t, got, "Сброс")
 }
 
 func TestFormatSubscriptionMessage_EscapesMarkdownInPlanName(t *testing.T) {
@@ -146,13 +139,13 @@ func TestFormatSubscriptionMessage_EscapesMarkdownInPlanName(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			traffic := &TrafficInfo{
+			details := &SubscriptionDetails{
 				PlanName:           tc.planName,
 				CreatedAtFormatted: "01.01.2026",
 				ExpiresAtFormatted: "31.01.2026",
 			}
 
-			got := FormatSubscriptionMessage("Test", "активна", traffic, "https://example.com/sub/test")
+			got := FormatSubscriptionMessage("Test", "активна", details, "https://example.com/sub/test")
 
 			assert.Contains(t, got, tc.expectedInOutput,
 				"Plan name should be properly escaped in the output message")

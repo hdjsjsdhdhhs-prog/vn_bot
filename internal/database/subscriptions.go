@@ -90,14 +90,15 @@ func (s *Service) GetByToken(ctx context.Context, token string) (*Subscription, 
 
 // GetSubscriptionWithProviderSource retrieves a currently servable subscription
 // by its public subscription ID and explicitly preloads its optional provider
-// source. A nil ProviderSourceID keeps the legacy plan-and-nodes routing path.
+// source. Serving is resolved by the builder chain first (see
+// ResolveSubscriptionBuilder); the linked source is used only without a builder.
 func (s *Service) GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*Subscription, error) {
 	var sub Subscription
 
 	result := s.db.WithContext(ctx).
 		Preload("ProviderSource").
 		Where("subscription_id = ? AND status = ? AND (expires_at IS NULL OR expires_at > ?)",
-			subscriptionID, string(SubscriptionStatusActive), time.Now()).
+			subscriptionID, string(SubscriptionStatusActive), time.Now().UTC()).
 		First(&sub)
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -127,8 +128,8 @@ func (s *Service) BindProviderSource(ctx context.Context, id, providerSourceID u
 	return nil
 }
 
-// UnbindProviderSource removes the optional provider source link and restores
-// legacy plan-and-nodes routing for the subscription.
+// UnbindProviderSource removes the optional provider source link; the
+// subscription is then served only through its builder chain.
 func (s *Service) UnbindProviderSource(ctx context.Context, id uint) error {
 	result := s.db.WithContext(ctx).
 		Model(&Subscription{}).
@@ -417,9 +418,8 @@ func (s *Service) CountTrialSubscriptions(ctx context.Context) (int64, error) {
 }
 
 // GetSubscriptionStatus returns subscription status and expiry time for the
-// subscription server (since v2.3.0) — it avoids the full JOIN with plans and
-// sources required by GetSubscriptionWithPlanAndNodes. Returns
-// ErrSubscriptionNotFound if no row matches.
+// subscription server (since v2.3.0) without loading the plan or sources.
+// Returns ErrSubscriptionNotFound if no row matches.
 //
 // For Free (unlimited) subscriptions, ExpiresAt is time.Time{} (zero value),
 // since the database stores NULL. Callers should check !expiryTime.IsZero()
@@ -444,50 +444,6 @@ func (s *Service) GetSubscriptionStatus(ctx context.Context, subscriptionID stri
 	}
 
 	return row.Status, row.ExpiresAt, nil
-}
-
-// GetWithPlanAndNodes returns a currently servable subscription (active and
-// not expired) by subscription ID together with its plan and active nodes.
-func (s *Service) GetWithPlanAndNodes(ctx context.Context, subscriptionID string) (*SubscriptionFull, error) {
-	var result SubscriptionFull
-
-	subQuery := s.db.WithContext(ctx).
-		Where("subscription_id = ? AND status = ? AND (expires_at IS NULL OR expires_at > ?)",
-			subscriptionID, string(SubscriptionStatusActive), time.Now())
-
-	err := subQuery.First(&result.Subscription).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrSubscriptionNotFound
-		}
-
-		return nil, fmt.Errorf("failed to get subscription: %w", err)
-	}
-
-	var plan Plan
-
-	err = s.db.WithContext(ctx).First(&plan, result.Subscription.PlanID).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrPlanNotFound
-		}
-
-		return nil, fmt.Errorf("failed to get plan: %w", err)
-	}
-
-	result.Plan = plan
-
-	err = s.db.WithContext(ctx).
-		Table("nodes").
-		Select("nodes.*").
-		Joins("JOIN plan_nodes ON plan_nodes.node_id = nodes.id").
-		Where("plan_nodes.plan_id = ? AND nodes.is_active = ?", result.Plan.ID, true).
-		Find(&result.Nodes).Error
-	if err != nil {
-		return nil, fmt.Errorf("failed to get nodes: %w", err)
-	}
-
-	return &result, nil
 }
 
 // UpdateDevices updates only the devices JSON column for a subscription.
@@ -539,13 +495,11 @@ func (s *Service) UpdateLastRequest(ctx context.Context, subscriptionID string) 
 	return nil
 }
 
-// ExpireSubscriptionPlanInTxFn materializes DB-side VPN sync prerequisites while
-// the expiry transaction is open. It must not perform external network calls.
-type ExpireSubscriptionPlanInTxFn func(ctx context.Context, tx *gorm.DB, subscriptionID uint, freePlanID uint) error
-
-// ExpireSubscriptionWithPlanCAS atomically downgrades an expired subscription and
-// creates the pending node-sync state needed to deprovision its previous plan.
-func (s *Service) ExpireSubscriptionWithPlanCAS(ctx context.Context, id uint, freePlanID uint, applyPlan ExpireSubscriptionPlanInTxFn) error {
+// ExpireSubscriptionWithPlanCAS atomically downgrades an expired subscription
+// to the free plan. The compare-and-swap on the current expiry guarantees that
+// a queued expiry scan never undoes a renewal committed meanwhile. The free
+// plan's builder serves the subscription from the next /sub request on.
+func (s *Service) ExpireSubscriptionWithPlanCAS(ctx context.Context, id uint, freePlanID uint) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Snapshot for the journal; the CAS below stays the authority. Take the
 		// SQLite writer reservation first (as renewSubscription does) so the
@@ -588,13 +542,6 @@ func (s *Service) ExpireSubscriptionWithPlanCAS(ctx context.Context, id uint, fr
 			}
 
 			return fmt.Errorf("expire subscription %d: state changed concurrently", id)
-		}
-
-		if applyPlan != nil {
-			err := applyPlan(ctx, tx, id, freePlanID)
-			if err != nil {
-				return fmt.Errorf("apply free plan after expiry: %w", err)
-			}
 		}
 
 		recordJournal(ctx, tx, expiredToFreeJournal(prior, freePlanID))

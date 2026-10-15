@@ -19,7 +19,7 @@ func TestSubscriptionRenewal_OnlyLifecycleFieldsChange(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				db := newTestService(t)
 				ctx := context.Background()
-				plan := &Plan{Name: "renewal", IsActive: true, TrafficLimit: 1024}
+				plan := &Plan{Name: "renewal", IsActive: true}
 				require.NoError(t, db.db.Create(plan).Error)
 				product := &Product{PlanID: plan.ID, Name: "original purchase", DurationDays: 30, PriceCents: 100, Currency: "RUB", IsActive: true}
 				require.NoError(t, db.db.Create(product).Error)
@@ -29,7 +29,7 @@ func TestSubscriptionRenewal_OnlyLifecycleFieldsChange(t *testing.T) {
 				currency := "RUB"
 				sub.Currency = &currency
 				sub.StartedAt = ptrTime(time.Now().UTC().Add(-24 * time.Hour))
-				sub.RemindersSent, sub.TrafficRemindersSent = 7, 3
+				sub.RemindersSent = 7
 				if status == "expired" {
 					sub.ExpiresAt = ptrTime(time.Now().UTC().Add(-time.Hour))
 				}

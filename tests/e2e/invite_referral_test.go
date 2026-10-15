@@ -10,11 +10,8 @@ import (
 	"testing"
 
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/service"
-	"github.com/kereal/rs8kvn_bot/internal/testutil"
 	"github.com/kereal/rs8kvn_bot/internal/web"
-	"github.com/kereal/rs8kvn_bot/internal/xui"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/stretchr/testify/assert"
@@ -85,18 +82,12 @@ func TestE2E_ShareLink_InvalidCode(t *testing.T) {
 	assert.Contains(t, env.botAPI.LastSentText, "Привет", "Should show normal menu for invalid code")
 }
 
-func setupInviteServer(t *testing.T, env *e2eTestEnv, inviteCode string, xuiSetup func(*testutil.XUIClient)) (*web.Server, *service.SubscriptionService) {
+func setupInviteServer(t *testing.T, env *e2eTestEnv) (*web.Server, *service.SubscriptionService) {
 	t.Helper()
 
 	env.cfg.TrialRateLimit = 100
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	if xuiSetup != nil {
-		xuiSetup(env.xui)
-	}
-
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true, ID: 1}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	return srv, subService
@@ -109,7 +100,6 @@ func TestE2E_InviteLink_Parameterized(t *testing.T) {
 		name         string
 		inviteCode   string
 		referrerID   int64
-		setupXUI     func(*testutil.XUIClient)
 		createInvite bool
 		wantStatus   int
 		wantContains string
@@ -119,7 +109,6 @@ func TestE2E_InviteLink_Parameterized(t *testing.T) {
 			name:         "creates_trial",
 			inviteCode:   "invite_test_abc",
 			referrerID:   200001,
-			setupXUI:     nil,
 			createInvite: true,
 			wantStatus:   http.StatusOK,
 			wantContains: "trial_",
@@ -139,31 +128,15 @@ func TestE2E_InviteLink_Parameterized(t *testing.T) {
 				}
 
 				assert.Equal(t, 1, trialCount, "Trial subscription should be created in DB")
-				assert.True(t, env.xui.AddClientWithIDCalled, "XUI AddClientWithID should be called")
 			},
 		},
 		{
 			name:         "invalid_code",
 			inviteCode:   "nonexistent_code",
 			referrerID:   0,
-			setupXUI:     nil,
 			createInvite: false,
 			wantStatus:   http.StatusNotFound,
 			wantContains: "Приглашение не найдено",
-			check:        nil,
-		},
-		{
-			name:       "xui_error",
-			inviteCode: "invite_xui_fail",
-			referrerID: 200003,
-			setupXUI: func(xuiClient *testutil.XUIClient) {
-				xuiClient.AddClientWithIDFunc = func(ctx context.Context, req xui.ClientRequest) (*xui.ClientConfig, error) {
-					return nil, fmt.Errorf("authentication failed")
-				}
-			},
-			createInvite: true,
-			wantStatus:   http.StatusInternalServerError,
-			wantContains: "Ошибка сервера",
 			check:        nil,
 		},
 	}
@@ -179,7 +152,7 @@ func TestE2E_InviteLink_Parameterized(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			srv, _ := setupInviteServer(t, env, tt.inviteCode, tt.setupXUI)
+			srv, _ := setupInviteServer(t, env)
 
 			req := httptest.NewRequest("GET", "/i/"+tt.inviteCode, nil)
 			req.Header.Set("X-Forwarded-For", "10.1.1.1")
@@ -198,47 +171,6 @@ func TestE2E_InviteLink_Parameterized(t *testing.T) {
 	}
 }
 
-func TestE2E_AutoRelogin_On401(t *testing.T) {
-	env := setupE2EEnv(t)
-	defer env.db.Close()
-
-	ctx := context.Background()
-
-	inviteCode := "invite_relogin"
-	_, err := env.db.GetOrCreateInvite(ctx, 300001, inviteCode)
-	require.NoError(t, err)
-
-	env.cfg.TrialRateLimit = 100
-
-	addClientCallCount := 0
-	env.xui.AddClientWithIDFunc = func(ctx context.Context, req xui.ClientRequest) (*xui.ClientConfig, error) {
-		addClientCallCount++
-		if addClientCallCount == 1 {
-			return nil, fmt.Errorf("authentication failed")
-		}
-
-		return &xui.ClientConfig{
-			ID:    req.ClientID,
-			Email: req.Email,
-			SubID: req.SubID,
-		}, nil
-	}
-
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true, ID: 1}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
-	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
-
-	req := httptest.NewRequest("GET", "/i/"+inviteCode, nil)
-	req.Header.Set("X-Forwarded-For", "10.2.1.1")
-
-	rec := httptest.NewRecorder()
-
-	srv.HandleInvite(rec, req)
-
-	assert.GreaterOrEqual(t, addClientCallCount, 1, "AddClientWithID should have been called at least once")
-}
-
 func TestE2E_InviteLink_RateLimitExceeded(t *testing.T) {
 	env := setupE2EEnv(t)
 	defer env.db.Close()
@@ -251,9 +183,7 @@ func TestE2E_InviteLink_RateLimitExceeded(t *testing.T) {
 
 	env.cfg.TrialRateLimit = 1
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true, ID: 1}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	req1 := httptest.NewRequest("GET", "/i/"+inviteCode, nil)
@@ -285,9 +215,7 @@ func TestE2E_InviteLink_FullFlow_BindTrial(t *testing.T) {
 
 	env.cfg.TrialRateLimit = 100
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true, ID: 1}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	req := httptest.NewRequest("GET", "/i/"+inviteCode, nil)
@@ -308,7 +236,6 @@ func TestE2E_InviteLink_FullFlow_BindTrial(t *testing.T) {
 	trialSubID := html[subIDStart+6 : subIDStart+subIDEnd]
 
 	resetBotAPI(env.botAPI)
-	env.xui.AddClientWithIDCalled = false
 
 	env.handler.HandleStart(ctx, tgbotapi.Update{
 		Message: newCommandMessage(env.chatID, env.chatID, env.username, "/start trial_"+trialSubID, 6),
@@ -338,9 +265,7 @@ func TestE2E_FullCycle_InviteToQR(t *testing.T) {
 
 	env.cfg.TrialRateLimit = 100
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true, ID: 1}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	req := httptest.NewRequest("GET", "/i/"+inviteCode, nil)
@@ -361,8 +286,6 @@ func TestE2E_FullCycle_InviteToQR(t *testing.T) {
 	trialSubID := html[subIDStart+6 : subIDStart+subIDEnd]
 
 	resetBotAPI(env.botAPI)
-	env.xui.AddClientWithIDCalled = false
-	env.xui.UpdateClientCalled = false
 
 	env.handler.HandleStart(ctx, tgbotapi.Update{
 		Message: newCommandMessage(env.chatID, env.chatID, env.username, "/start trial_"+trialSubID, 6),
@@ -422,7 +345,6 @@ func TestE2E_FullCycle_ShareToSubscription(t *testing.T) {
 	assert.Contains(t, env.botAPI.LastSentText, "пригласил", "Should mention invitation")
 
 	resetBotAPI(env.botAPI)
-	env.xui.AddClientWithIDCalled = false
 
 	env.handler.HandleCallback(ctx, tgbotapi.Update{
 		CallbackQuery: &tgbotapi.CallbackQuery{
@@ -462,9 +384,7 @@ func TestE2E_FullCycle_MultipleUsersViaInvite(t *testing.T) {
 
 	env.cfg.TrialRateLimit = 100
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true, ID: 1}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	user1ChatID := int64(400001)
@@ -487,8 +407,6 @@ func TestE2E_FullCycle_MultipleUsersViaInvite(t *testing.T) {
 		trialSubID := html[subIDStart+6 : subIDStart+subIDEnd]
 
 		resetBotAPI(env.botAPI)
-		env.xui.AddClientWithIDCalled = false
-		env.xui.UpdateClientCalled = false
 
 		username := fmt.Sprintf("user_%d", chatID)
 		env.handler.HandleStart(ctx, tgbotapi.Update{
@@ -524,9 +442,7 @@ func TestE2E_FullCycle_InviteThenShare(t *testing.T) {
 
 	env.cfg.TrialRateLimit = 100
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true, ID: 1}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	req := httptest.NewRequest("GET", "/i/"+webInviteCode, nil)
@@ -545,8 +461,6 @@ func TestE2E_FullCycle_InviteThenShare(t *testing.T) {
 	trialSubID := html[subIDStart+6 : subIDStart+subIDEnd]
 
 	resetBotAPI(env.botAPI)
-	env.xui.AddClientWithIDCalled = false
-	env.xui.UpdateClientCalled = false
 
 	env.handler.HandleStart(ctx, tgbotapi.Update{
 		Message: newCommandMessage(env.chatID, env.chatID, env.username, "/start trial_"+trialSubID, 6),
@@ -575,9 +489,7 @@ func TestE2E_FullCycle_ConcurrentInviteAccess(t *testing.T) {
 
 	env.cfg.TrialRateLimit = 1000
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true, ID: 1}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	var wg sync.WaitGroup

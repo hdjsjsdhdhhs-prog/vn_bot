@@ -12,7 +12,6 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 func customerLifecycleFixture(t *testing.T) (*database.Service, *SubscriptionService, CustomerSubscriptionTerms) {
@@ -20,11 +19,11 @@ func customerLifecycleFixture(t *testing.T) (*database.Service, *SubscriptionSer
 	db, err := database.NewService(filepath.Join(t.TempDir(), "lifecycle.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	plan := &database.Plan{Name: "customer", TrafficLimit: 1 << 30, IsActive: true}
+	plan := &database.Plan{Name: "customer", IsActive: true}
 	require.NoError(t, db.GetDB().Create(plan).Error)
 	source := &database.ProviderSource{Name: "configured", Type: "external", Enabled: true, SubscriptionURL: "https://upstream.example/private-feed", HWID: "private-hwid", UserAgent: "private-agent"}
 	require.NoError(t, db.CreateProviderSource(context.Background(), source))
-	svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{GlobalSubURL: "https://customer.example/sub/"})
+	svc := NewSubscriptionService(db, &config.Config{GlobalSubURL: "https://customer.example/sub/"})
 	terms := CustomerSubscriptionTerms{ProviderSourceID: source.ID, PlanID: plan.ID, ExpiresAt: time.Now().AddDate(0, 0, 30).In(time.FixedZone("customer-zone", -7*3600))}
 	return db, svc, terms
 }
@@ -33,15 +32,11 @@ func TestCustomerLifecycle_CreateAndLegacyIsolation(t *testing.T) {
 	db, svc, terms := customerLifecycleFixture(t)
 	ctx := context.Background()
 	// Multiple sources must not change explicit assignment, even if an earlier
-	// source is usable. Neither a provider type nor plan_nodes selects it.
+	// source is usable. A provider type does not select it.
 	other := &database.ProviderSource{Name: "selected", Type: "another-provider", Enabled: true, SubscriptionURL: "https://other.example/feed"}
 	require.NoError(t, db.CreateProviderSource(ctx, other))
 	terms.ProviderSourceID = other.ID
-	node := &database.Node{Name: "legacy", Type: database.NodeTypeFetch, IsActive: true, SubscriptionURL: "https://legacy.example/sub"}
-	require.NoError(t, db.GetDB().Create(node).Error)
-	require.NoError(t, db.GetDB().Create(&database.PlanNode{PlanID: terms.PlanID, NodeID: node.ID}).Error)
-	syncSvc := NewSyncService(db, nil, nil)
-	svc.SetSyncService(syncSvc)
+
 	_, err := db.GetOrCreateInvite(ctx, 9876, "lifecycle-invite")
 	require.NoError(t, err)
 	before := time.Now().UTC()
@@ -72,24 +67,6 @@ func TestCustomerLifecycle_CreateAndLegacyIsolation(t *testing.T) {
 	assert.Equal(t, sub.ID, stored.ID)
 	assert.True(t, stored.ExpiresAt.Equal(terms.ExpiresAt))
 
-	require.NoError(t, syncSvc.ReconcilePlanNodes(ctx, sub.ID))
-	require.NoError(t, syncSvc.ApplyPlanToSubscription(ctx, sub.ID))
-	require.NoError(t, db.Transaction(ctx, func(tx *gorm.DB) error {
-		return syncSvc.ApplyPlanToSubscriptionInTx(ctx, tx, sub.ID, sub.PlanID)
-	}))
-	revoked, err := svc.ReconcileOrphanedClients(ctx)
-	require.NoError(t, err)
-	assert.Zero(t, revoked)
-	nodes, err := db.GetBySubscriptionID(ctx, sub.ID)
-	require.NoError(t, err)
-	assert.Empty(t, nodes, "provider creation/reconciliation must never enqueue legacy provisioning")
-	targets, err := db.GetActiveSubscriptionsWithTrafficLimit(ctx)
-	require.NoError(t, err)
-	assert.Empty(t, targets, "local quotas must not be enforced against provider customers")
-	_, traffic, err := svc.GetWithTraffic(ctx, sub.TelegramID)
-	require.NoError(t, err)
-	assert.Zero(t, traffic.LimitGB, "provider access must not inherit the local plan quota")
-	assert.Zero(t, traffic.UsedGB)
 	// The reminder worker queries in UTC, matching the persisted expiry.
 	reminders, err := db.GetSubscriptionsExpiringInRange(ctx, terms.ExpiresAt.UTC().Add(-time.Minute), terms.ExpiresAt.UTC().Add(time.Minute))
 	require.NoError(t, err)
@@ -121,12 +98,8 @@ func TestCustomerLifecycle_CreateAndLegacyIsolation(t *testing.T) {
 func TestCustomerLifecycle_LegacyGetOrCreateAndExpiry(t *testing.T) {
 	db, svc, terms := customerLifecycleFixture(t)
 	ctx := context.Background()
-	svc.SetSyncService(NewSyncService(db, nil, nil))
 	free, err := db.GetPlanByName(ctx, database.FreePlanName)
 	require.NoError(t, err)
-	node := &database.Node{Name: "legacy-free", Type: database.NodeTypeFetch, IsActive: true, SubscriptionURL: "https://legacy.example/sub"}
-	require.NoError(t, db.GetDB().Create(node).Error)
-	require.NoError(t, db.GetDB().Create(&database.PlanNode{PlanID: free.ID, NodeID: node.ID}).Error)
 
 	sub, err := svc.GetOrCreateSubscription(ctx, 555, "legacy", "")
 	require.NoError(t, err)
@@ -134,12 +107,8 @@ func TestCustomerLifecycle_LegacyGetOrCreateAndExpiry(t *testing.T) {
 	assert.Nil(t, sub.ProviderSourceID)
 	assert.Nil(t, sub.ExpiresAt)
 	assert.True(t, utils.IsValidSubscriptionToken(sub.Token))
-	nodes, err := db.GetBySubscriptionID(ctx, sub.ID)
-	require.NoError(t, err)
-	require.Len(t, nodes, 1, "legacy creation must still provision free-plan nodes")
 
-	// Expiry through the service must retain the legacy Free downgrade, also
-	// when the transaction-scoped sync path is wired.
+	// Expiry through the service must retain the legacy Free downgrade.
 	past := time.Now().UTC().Add(-time.Hour)
 	sub.PlanID = terms.PlanID
 	sub.ExpiresAt = &past
@@ -163,9 +132,6 @@ func TestCustomerLifecycle_LegacyGetOrCreateAndExpiry(t *testing.T) {
 	assert.Equal(t, "active", revived.Status)
 	assert.Nil(t, revived.ExpiresAt)
 	assert.Nil(t, revived.ProviderSourceID)
-	nodes, err = db.GetBySubscriptionID(ctx, sub.ID)
-	require.NoError(t, err)
-	require.Len(t, nodes, 1, "legacy reanimation must restore free-plan provisioning")
 	count, err := db.CountAllSubscriptions(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), count)

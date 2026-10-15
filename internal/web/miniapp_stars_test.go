@@ -27,8 +27,7 @@ func TestMiniAppStars_AuthenticatedPurchaseToTelegramSettlement(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	cfg := &config.Config{TelegramBotToken: miniAppTestToken, GlobalSubURL: "https://customer.example/sub/"} // legacy payments disabled
-	plan := &database.Plan{Name: "stars-paid", IsActive: true}
-	require.NoError(t, db.GetDB().Create(plan).Error)
+	plan := createSellablePlan(t, db, "stars-paid")
 	product := &database.Product{PlanID: plan.ID, Name: "Monthly Stars", DurationDays: 30, PriceCents: 123, Currency: "XTR", IsActive: true}
 	require.NoError(t, db.GetDB().Create(product).Error)
 	free, err := db.GetPlanByName(ctx, database.FreePlanName)
@@ -71,8 +70,8 @@ func TestMiniAppStars_AuthenticatedPurchaseToTelegramSettlement(t *testing.T) {
 	defer telegram.Close()
 	api, err := tgbotapi.NewBotAPIWithClient("test-token", telegram.URL+"/bot%s/%s", telegram.Client())
 	require.NoError(t, err)
-	subscriptions := service.NewSubscriptionService(db, nil, nil, nil, cfg)
-	stars := service.NewStarsPaymentService(service.NewOrderService(db, subscriptions, service.NewSyncService(db, nil, nil), nil, "", cfg), telegramstars.New(api))
+	subscriptions := service.NewSubscriptionService(db, cfg)
+	stars := service.NewStarsPaymentService(service.NewOrderService(db, subscriptions, nil, "", cfg), telegramstars.New(api))
 	handler := newMiniAppHandler(cfg, subscriptions, func() *service.StarsPaymentService { return stars })
 	request := func(method, path, body string, id int64, want int) *httptest.ResponseRecorder {
 		t.Helper()

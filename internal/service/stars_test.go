@@ -50,8 +50,8 @@ func newStarsFixture(t *testing.T) *starsFixture {
 	require.NoError(t, db.GetDB().Model(product).Updates(map[string]any{"currency": "XTR", "price_cents": 75}).Error)
 	product.Currency, product.PriceCents = "XTR", 75
 	client := &starsTestClient{}
-	subscriptions := NewSubscriptionService(db, nil, nil, nil, nil)
-	orders := NewOrderService(db, subscriptions, NewSyncService(db, nil, nil), nil, "", nil)
+	subscriptions := NewSubscriptionService(db, nil)
+	orders := NewOrderService(db, subscriptions, nil, "", nil)
 	return &starsFixture{purchases: p, db: db, sub: sub, product: product, stars: NewStarsPaymentService(orders, client), client: client}
 }
 func (f *starsFixture) invoice(t *testing.T) {
@@ -244,8 +244,6 @@ func TestStarsSettlement_ProviderSourceAndConcurrentReplay(t *testing.T) {
 	assert.Equal(t, int64(1), count)
 	require.NoError(t, f.db.GetDB().Model(&database.TelegramPaymentReceipt{}).Count(&count).Error)
 	assert.Equal(t, int64(1), count)
-	require.NoError(t, f.db.GetDB().Model(&database.SubscriptionNode{}).Count(&count).Error)
-	assert.Zero(t, count, "provider-backed subscription must not get legacy nodes")
 	require.Error(t, f.stars.PreCheckout(ctx, f.query()))
 	_, err := f.stars.Invoice(ctx, f.purchases, f.ref)
 	require.Error(t, err)
@@ -262,14 +260,11 @@ func TestStarsSettlement_RollbackAndDurableRecovery(t *testing.T) {
 	free, err := f.db.GetPlanByName(ctx, database.FreePlanName)
 	require.NoError(t, err)
 	require.NoError(t, f.db.GetDB().Model(f.sub).Update("plan_id", free.ID).Error)
-	node := &database.Node{Name: "stars-node", Type: database.NodeType3xUI, Host: "https://unused.example", IsActive: true}
-	require.NoError(t, f.db.GetDB().Create(node).Error)
-	require.NoError(t, f.db.GetDB().Create(&database.PlanNode{PlanID: f.product.PlanID, NodeID: node.ID}).Error)
 	f.invoice(t)
 	require.NoError(t, f.stars.PreCheckout(ctx, f.query()))
 	before := f.subscription(t)
 	// Fail a real DB prerequisite, not a mocked settlement/CAS.
-	require.NoError(t, f.db.GetDB().Exec(`CREATE TRIGGER stars_test_fail BEFORE INSERT ON subscription_nodes BEGIN SELECT RAISE(ABORT, 'injected DB setup failure'); END`).Error)
+	require.NoError(t, f.db.GetDB().Exec(`CREATE TRIGGER stars_test_fail BEFORE UPDATE ON subscriptions BEGIN SELECT RAISE(ABORT, 'injected DB setup failure'); END`).Error)
 	_, err = f.stars.SuccessfulPayment(ctx, f.paid())
 	require.ErrorContains(t, err, "injected DB setup failure")
 	assert.Equal(t, before, f.subscription(t))
@@ -283,16 +278,12 @@ func TestStarsSettlement_RollbackAndDurableRecovery(t *testing.T) {
 	require.Len(t, receipts, 1)
 	require.NoError(t, f.db.GetDB().Exec(`DROP TRIGGER stars_test_fail`).Error)
 	// A new service instance represents process restart. No Telegram redelivery needed.
-	recovered := NewStarsPaymentService(NewOrderService(f.db, nil, NewSyncService(f.db, nil, nil), nil, "", nil), f.client)
+	recovered := NewStarsPaymentService(NewOrderService(f.db, nil, nil, "", nil), f.client)
 	require.NoError(t, recovered.RetryPayments(ctx))
 	after := f.subscription(t)
 	assert.Equal(t, f.product.PlanID, after.PlanID)
 	assert.Equal(t, "active", after.Status)
 	require.NotNil(t, after.ExpiresAt)
-	nodes, err := f.db.GetBySubscriptionID(ctx, after.ID)
-	require.NoError(t, err)
-	require.Len(t, nodes, 1)
-	assert.Equal(t, database.SyncStatusPendingAdd, nodes[0].Status, "external sync failure retains durable node prerequisites")
 	require.NoError(t, recovered.RetryPayments(ctx))
 	assert.Equal(t, after, f.subscription(t))
 	receipts, err = f.db.PendingTelegramPayments(ctx, 0, 50)
@@ -331,11 +322,11 @@ func TestStarsInvoice_FailureRetryAndLegacyIsolation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, f.client.invoices)
 	// Legacy request must not send XTR to its provider.
-	orders := NewOrderService(f.db, nil, NewSyncService(f.db, nil, nil), fakePaymentProvider{}, "", nil)
+	orders := NewOrderService(f.db, nil, fakePaymentProvider{}, "", nil)
 	_, _, err = orders.RequestPayment(ctx, f.sub.TelegramID, "", f.product)
 	require.ErrorIs(t, err, ErrPaymentDisabled)
 	p, db, sub, product := purchaseServiceFixture(t)
-	legacyStars := NewStarsPaymentService(NewOrderService(db, nil, NewSyncService(db, nil, nil), nil, "", nil), &starsTestClient{})
+	legacyStars := NewStarsPaymentService(NewOrderService(db, nil, nil, "", nil), &starsTestClient{})
 	legacy, _, err := p.Create(ctx, product.OfferID, uuid.NewString())
 	require.NoError(t, err)
 	_, err = legacyStars.Invoice(ctx, p, legacy.OrderID)

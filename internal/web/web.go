@@ -1474,6 +1474,17 @@ func (s *Server) handleSubscription(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if errors.Is(err, subserver.ErrBuilderUnavailable) {
+			// Configuration error: the reason (subscription, plan, builder) is
+			// logged by the subserver; the client only learns it is temporary.
+			logger.Warn("Subscription is not configured for serving",
+				zap.String("sub_id", subID),
+				zap.String("client_ip", clientIP))
+			writeSubscriptionText(response, http.StatusServiceUnavailable, "Subscription is temporarily unavailable")
+
+			return
+		}
+
 		logger.Error("Failed to process subscription",
 			zap.String("sub_id", subID),
 			zap.String("client_ip", clientIP),

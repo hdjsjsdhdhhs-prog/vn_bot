@@ -61,7 +61,7 @@ func runMigrations(sqlDB *sql.DB) error {
 		ma, mb, mc := parse(minSQLiteForDropAndReturning)
 		if va < ma || (va == ma && vb < mb) || (va == ma && vb == mb && vc < mc) {
 			// scan embedded migrations for DROP COLUMN or RETURNING usage
-			migrationNames := []string{"migrations/006_create_sources.up.sql", "migrations/031_add_payment_intent_fields.down.sql", "migrations/035_add_order_payment_amounts.down.sql"}
+			migrationNames := []string{"migrations/006_create_sources.up.sql", "migrations/031_add_payment_intent_fields.down.sql", "migrations/035_add_order_payment_amounts.down.sql", "migrations/051_remove_legacy_nodes.up.sql"}
 			for _, migrationName := range migrationNames {
 				if bytes, _ := migrationFiles.ReadFile(migrationName); bytes != nil {
 					content := string(bytes)

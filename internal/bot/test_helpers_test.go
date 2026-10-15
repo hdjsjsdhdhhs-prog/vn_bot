@@ -6,10 +6,8 @@ import (
 
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/testutil"
-	"github.com/kereal/rs8kvn_bot/internal/vpn"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -17,11 +15,9 @@ import (
 // newTestAdminHandler creates a Handler with admin config and a stub SubscriptionService
 // wired to the provided mock objects. Eliminates repeated NewHandler + subscriptionService
 // assignment across admin tests.
-func newTestAdminHandler(cfg *config.Config, mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient, mockBot *testutil.BotAPI) *Handler {
+func newTestAdminHandler(cfg *config.Config, mockDB *testutil.DatabaseService, mockBot *testutil.BotAPI) *Handler {
 	h := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
-	xuiClients := map[uint]interfaces.XUIClient{1: mockXUI}
-	nodes := []database.Node{{ID: 1, IsActive: true, Host: "http://localhost:2053", APIToken: "test-token", InboundIDs: "[1]", SubscriptionURL: "http://example.com/sub/"}}
-	h.subscriptionService = service.NewSubscriptionService(mockDB, xuiClients, nil, nodes, cfg)
+	h.subscriptionService = service.NewSubscriptionService(mockDB, cfg)
 	h.subscriptionService.SetInvalidateFunc(h.cache.Invalidate)
 
 	return h
@@ -78,8 +74,8 @@ func createCommandUpdate(messageID int64, fromUser *tgbotapi.User, text string) 
 }
 
 // newTestHandlerWithSubService creates a Handler with a stub SubscriptionService
-// wired from the provided mock DB and XUI. Falls back to fresh mocks when nil.
-func newTestHandlerWithSubService(t *testing.T, cfg *config.Config, mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient, mockBot *testutil.BotAPI) *Handler {
+// wired from the provided mock DB. Falls back to fresh mocks when nil.
+func newTestHandlerWithSubService(t *testing.T, cfg *config.Config, mockDB *testutil.DatabaseService, mockBot *testutil.BotAPI) *Handler {
 	t.Helper()
 
 	if cfg == nil {
@@ -88,10 +84,6 @@ func newTestHandlerWithSubService(t *testing.T, cfg *config.Config, mockDB *test
 
 	if mockDB == nil {
 		mockDB = testutil.NewDatabaseService()
-	}
-
-	if mockXUI == nil {
-		mockXUI = testutil.NewXUIClient()
 	}
 
 	if mockBot == nil {
@@ -105,15 +97,7 @@ func newTestHandlerWithSubService(t *testing.T, cfg *config.Config, mockDB *test
 		}
 	}
 
-	dbSources := []database.Node{{
-		ID: 1, Name: "main", Host: "http://example.com",
-		APIToken: "token", InboundIDs: "[1]", IsActive: true}}
-	subService := service.NewSubscriptionService(
-		mockDB,
-		map[uint]interfaces.XUIClient{1: mockXUI},
-		map[uint]vpn.Client{1: vpn.NewThreeXUIClient(mockXUI, []int{1})},
-		dbSources,
-		cfg)
+	subService := service.NewSubscriptionService(mockDB, cfg)
 
 	return NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), subService, "")
 }

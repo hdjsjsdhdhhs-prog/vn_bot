@@ -7,44 +7,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/xui"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"gorm.io/gorm"
 )
 
 var _ DatabaseService = (*database.Service)(nil)
-var _ XUIClient = (*xui.Client)(nil)
 var _ WebRepository = (*database.Service)(nil)
-
-// SubscriptionNodeCRUD provides basic CRUD operations for subscription nodes.
-type SubscriptionNodeCRUD interface {
-	GetBySubscriptionID(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error)
-	CreateSubscriptionNode(ctx context.Context, sn *database.SubscriptionNode) error
-	UpsertSubscriptionNode(ctx context.Context, sn *database.SubscriptionNode) error
-	DeleteSubscriptionNode(ctx context.Context, subID, nodeID uint) error
-	DeleteSubscriptionNodesBySubscriptionID(ctx context.Context, subID uint) error
-	MarkActiveNodesPendingUpdate(ctx context.Context, subID uint, targetNodeIDs []uint) error
-}
-
-// SubscriptionNodeStatus manages sync status and retry logic for subscription nodes.
-type SubscriptionNodeStatus interface {
-	UpdateSubscriptionNodeStatus(ctx context.Context, subID, nodeID uint, status database.SyncStatus) error
-	UpdateRetry(ctx context.Context, subID, nodeID uint, retryCount int, retryAt *time.Time, lastErr *string) error
-}
-
-// SubscriptionNodeQueries retrieves subscription nodes by various criteria.
-type SubscriptionNodeQueries interface {
-	GetPendingSync(ctx context.Context) ([]database.SubscriptionNode, error)
-	GetPendingBySubscriptionID(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error)
-}
-
-// SubscriptionNodeRepository combines all subscription node interfaces.
-type SubscriptionNodeRepository interface {
-	SubscriptionNodeCRUD
-	SubscriptionNodeStatus
-	SubscriptionNodeQueries
-}
 
 // SubscriptionCRUD provides basic CRUD operations for subscriptions.
 // DeleteSubscriptionByID is the only physical deletion (admin /del); all other
@@ -64,16 +33,13 @@ type SubscriptionQueries interface {
 	GetLatestSubscriptions(ctx context.Context, limit int) ([]database.Subscription, error)
 	GetAllSubscriptions(ctx context.Context) ([]database.Subscription, error)
 	GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*database.Subscription, error)
-	GetWithPlanAndNodes(ctx context.Context, subscriptionID string) (*database.SubscriptionFull, error)
-	// ResolveSubscriptionBuilder returns the builder serving the subscription
-	// (subscription override > plan default) or nil to keep the existing pipeline.
+	// ResolveSubscriptionBuilder returns the enabled builder serving the
+	// subscription (subscription override > plan default) or nil when none is
+	// assigned/enabled; /sub then answers 503 (see subserver.ErrBuilderUnavailable).
 	ResolveSubscriptionBuilder(ctx context.Context, sub *database.Subscription) (*database.ResolvedBuilder, error)
 	// GetSourceEntries returns the present catalogue entries of a provider
 	// source ("*" = all countries).
 	GetSourceEntries(ctx context.Context, sourceID uint, countryCode string) ([]database.ProviderSourceEntry, error)
-	// GetActiveSubscriptionsWithTrafficLimit returns active subscriptions whose
-	// plan has a non-zero traffic limit, together with that limit (in bytes).
-	GetActiveSubscriptionsWithTrafficLimit(ctx context.Context) ([]database.SubscriptionTrafficTarget, error)
 }
 
 // SubscriptionCounts retrieves subscription statistics.
@@ -122,28 +88,6 @@ type SubscriptionReminderService interface {
 	SendExpiryReminder(ctx context.Context, sub *database.Subscription, window SubscriptionReminderWindow) error
 }
 
-// TrafficReminderRepository provides the atomic claim/release workflow for
-// traffic-based notifications (90% warning, quota exhausted, reset+reenable).
-// Bits are stored in subscriptions.traffic_reminders_sent.
-type TrafficReminderRepository interface {
-	ClaimTrafficReminder(ctx context.Context, id uint, bit int) (bool, error)
-	ReleaseTrafficReminder(ctx context.Context, id uint, bit int) error
-}
-
-// SubscriptionTrafficRepository supplies the traffic worker with the set of
-// active subscriptions that enforce a traffic quota.
-type SubscriptionTrafficRepository interface {
-	GetActiveSubscriptionsWithTrafficLimit(ctx context.Context) ([]database.SubscriptionTrafficTarget, error)
-}
-
-// SubscriptionTrafficService is the narrow contract the traffic worker needs
-// from the subscription service: it inspects a subscription's live traffic on
-// its active nodes, sends notifications, and re-enables clients whose traffic
-// was exhausted but has since been reset.
-type SubscriptionTrafficService interface {
-	ProcessTrafficNotifications(ctx context.Context, sub *database.Subscription) error
-}
-
 // SubscriptionLastRequest updates the last_request timestamp on subscriptions.
 type SubscriptionLastRequest interface {
 	UpdateLastRequest(ctx context.Context, subscriptionID string) error
@@ -162,7 +106,6 @@ type SubscriptionRepository interface {
 	SubscriptionStatus
 	SubscriptionJSONFields
 	SubscriptionReminderRepository
-	TrafficReminderRepository
 	SubscriptionLastRequest
 	SubscriptionLookup
 }
@@ -177,15 +120,6 @@ type TrialRepository interface {
 	CleanupExpiredTrials(ctx context.Context, hours int) ([]database.Subscription, error)
 	ClaimExpiredTrials(ctx context.Context, hours int) ([]database.Subscription, error)
 	DeleteClaimedTrial(ctx context.Context, id uint) error
-}
-
-// NodeRepository provides node and plan-node lookup operations.
-type NodeRepository interface {
-	ListNodes(ctx context.Context) ([]database.Node, error)
-	GetNodesByPlanName(ctx context.Context, planName string) ([]database.Node, error)
-	GetNodesByPlanID(ctx context.Context, planID uint) ([]database.Node, error)
-	GetNodeByID(ctx context.Context, id uint) (*database.Node, error)
-	ListEnabled(ctx context.Context) ([]database.Node, error)
 }
 
 // InviteRepository provides referral invite and referral-count operations.
@@ -221,9 +155,9 @@ type OrderRepository interface {
 	SaveOrderPaymentAmounts(ctx context.Context, orderID uint, callbackAmountCents int64, providerFeeCents *int64) error
 	GetPaidOrdersWithoutProviderFee(ctx context.Context, limit int) ([]database.Order, error)
 	GetPaidOrdersWithoutProviderFeeAfterID(ctx context.Context, afterID uint, limit int) ([]database.Order, error)
-	ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *database.Subscription, product *database.Product, applyPlan database.ApplyPlanInTxFn, callbackAmountCents int64) (bool, error)
+	ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *database.Subscription, product *database.Product, callbackAmountCents int64) (bool, error)
 	CancelOrderCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, fromStatuses []database.OrderStatus) (bool, error)
-	CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint, applyPlan database.ChargebackPlanInTxFn) (*database.ChargebackResult, error)
+	CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint) (*database.ChargebackResult, error)
 }
 
 // BroadcastRepository provides CRUD for broadcast cards
@@ -247,11 +181,9 @@ type BroadcastRepository interface {
 
 // DatabaseService is the composed persistence contract used by application services.
 type DatabaseService interface {
-	SubscriptionNodeRepository
 	SubscriptionRepository
 	TrialRepository
 	InviteRepository
-	NodeRepository
 	PlanRepository
 	ProductRepository
 	OrderRepository
@@ -262,32 +194,6 @@ type DatabaseService interface {
 	Transaction(ctx context.Context, fn func(*gorm.DB) error) error
 }
 
-// XUIClientReader contains read-only panel operations.
-type XUIClientReader interface {
-	Ping(ctx context.Context) error
-	GetClientTraffic(ctx context.Context, email string) (*xui.ClientTraffic, error)
-	// GetClientByEmail возвращает клиента по email из settings указанного
-	// inbound, включая auto-renew профиль (resetDay/resetMax/trafficReset/
-	// trafficResetDay), который /clients/traffic не отдаёт.
-	GetClientByEmail(ctx context.Context, inboundID int, email string) (*xui.ClientConfig, error)
-}
-
-// XUIClientWriter contains panel mutation and lifecycle operations.
-type XUIClientWriter interface {
-	AddClient(ctx context.Context, inboundIDs []int, email string, trafficBytes int64, expiryTime time.Time) (*xui.ClientConfig, error)
-	AddClientWithID(ctx context.Context, req xui.ClientRequest) (*xui.ClientConfig, error)
-	UpdateClient(ctx context.Context, req xui.ClientRequest) error
-	DeleteClient(ctx context.Context, email string) error
-	ResetTraffic(ctx context.Context, email string) error
-	Close() error
-}
-
-// XUIClient combines panel read and write operations.
-type XUIClient interface {
-	XUIClientReader
-	XUIClientWriter
-}
-
 // BotAPI is the narrow Telegram client contract required by handlers and services.
 type BotAPI interface {
 	Send(c tgbotapi.Chattable) (tgbotapi.Message, error)
@@ -296,12 +202,10 @@ type BotAPI interface {
 
 // WebRepository is the composed DB seam for the web/HTTP server: subscription
 // aggregation handoff (SubscriptionRepository) plus the invite/trial/plan reads
-// its landing pages need. It deliberately drops Node/Order/SubscriptionNode/Product.
+// its landing pages need. It deliberately drops Order/Product.
 type WebRepository interface {
 	SubscriptionRepository
 	InviteRepository
 	TrialRepository
 	PlanRepository
 }
-
-// vpn.Client is defined in internal/vpn/client.go

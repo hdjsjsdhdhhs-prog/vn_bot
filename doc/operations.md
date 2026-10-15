@@ -333,13 +333,12 @@ The bot exposes a `/metrics` endpoint on the same port as health checks (default
 
 - `http_requests_total`, `http_request_duration_seconds` — трафик, ошибки и latency API;
 - `bot_updates_total`, `bot_update_duration_seconds` — основной пользовательский канал;
-- `xui_requests_total`, `xui_request_duration_seconds` — доступность и latency VPN-панелей;
+- `subserver_source_fetch_total`, `subserver_source_fetch_duration_seconds`, `subserver_no_items_total` — доступность и latency upstream-источников (ProviderSource), из которых Builders собирают подписку;
 - `db_queries_total`, `db_query_duration_seconds`, `db_pool_wait` — ошибки/замедление SQLite;
 - `active_subscriptions` — все активные подписки;
 - `premium_subscriptions` — активные оплаченные Premium-подписки;
 - `free_subscriptions` — активные бесплатные подписки;
 - `trial_subscriptions` — активные trial-подписки; отозванные/неактивные отдельно не считаются;
-- `subscription_sync_total`, `subscription_sync_duration_seconds`, `bot_orphaned_clients_revoked_total` — целостность VPN-доступа;
 - `payment_operations_total`, `payment_operation_duration_seconds`, `payment_amount_cents_total`, `payment_issues_total` — платёжная воронка и инциденты;
 
 **Второстепенные:** cache hit/miss, Telegram API latency, subserver fetch детализация, worker run/latency и `db_pool_wait` полезны для расследований, но не требуют обязательных алертов.
@@ -392,9 +391,6 @@ sum(rate(payment_amount_cents_total{operation="confirmed"}[24h]))
 | `bot_updates_total` | Counter | command, result | Bot updates processed (success/error/rate_limited) |
 | `bot_update_duration_seconds` | Histogram | — | Bot update processing time |
 | `cache_hits_total` / `cache_misses_total` | Counter | cache | Cache hit/miss (subscription, referral, subserver) |
-| `xui_requests_total` | Counter | operation, result | Live 3x-ui request count |
-| `xui_request_duration_seconds` | Histogram | operation | Live 3x-ui request duration |
-| `bot_orphaned_clients_revoked_total` | Counter | — | Orphaned subscriptions revoked during reconciliation |
 | `subserver_source_fetch_total` | Counter | result, format | Upstream source fetch results (success/error by format) |
 | `subserver_source_fetch_duration_seconds` | Histogram | result | Upstream source fetch duration |
 | `subserver_cache_invalidations_total` | Counter | reason | Cache invalidations by reason |
@@ -416,7 +412,7 @@ scrape_configs:
 **Grafana dashboard ideas:**
 - HTTP error rate: `rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m])`
 - Bot error rate: `rate(bot_updates_total{result="error"}[5m])`
-- XUI latency p99: `histogram_quantile(0.99, rate(xui_request_duration_seconds_bucket[5m]))`
+- Upstream-источники p99: `histogram_quantile(0.99, rate(subserver_source_fetch_duration_seconds_bucket[5m]))`
 - Active subscriptions: `active_subscriptions`
 
 
@@ -432,7 +428,6 @@ scrape_configs:
 |-------|-------|-----|
 | `Failed to load config: TELEGRAM_BOT_TOKEN is required` | Missing env var | Set in `.env` or export |
 | `Failed to initialize database` | Permission denied or disk full | Check `data/` dir, permissions |
-| `Failed to connect to 3x-ui panel` | Wrong node host, panel down | Verify `nodes.host` in DB, then `curl <panel_host>` |
 | `listen tcp :8880: bind: address already in use` | Port occupied | Change `WEB_SERVER_PORT` or kill process using port |
 
 **Diagnostic:**
@@ -442,9 +437,6 @@ cat .env | grep -v '^#'
 
 # Test DB connection
 sqlite3 ./data/rs8kvn.db "SELECT 1;"
-
-# Test XUI panel
-curl -H "Authorization: Bearer <api_token>" "<panel_host>/panel/api/server/status"
 
 # Check port
 lsof -i :8880
@@ -482,30 +474,22 @@ docker restart rs8kvn_bot
 
 **Symptom:** User clicks "Get subscription" → error message.
 
+Creating a subscription is a local database operation: no VPN panel is called, so failures are database-side.
+
 **Common errors:**
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `failed to create client` | 3x-ui unreachable | Check `nodes.host` and `nodes.api_token` in DB |
-| `context deadline exceeded` | XUI slow response | Increase timeout in `config` |
 | `cannot allocate UUID` | DB full or read-only | Check disk space, DB permissions |
+| `database is locked` | Concurrent writers on SQLite | See 5.7 |
 
 **Debug steps:**
 ```bash
-# Check XUI directly
-curl -H "Authorization: Bearer <api_token>" "<panel_host>/panel/api/inbounds/list"
-
 # Check DB state
 sqlite3 ./data/rs8kvn.db "SELECT * FROM subscriptions WHERE telegram_id = <user_id> ORDER BY created_at DESC LIMIT 5;"
 
 # Watch logs while testing
 docker logs -f rs8kvn_bot 2>&1 | grep -E "error|failed|subscription"
-```
-
-> **Note:** Node configuration is managed via the `nodes` table in the database. Check node state:
-```sql
-SELECT id, name, type, is_active, host, subscription_url FROM nodes;
-SELECT sn.* FROM subscription_nodes sn WHERE sn.subscription_id = (SELECT id FROM subscriptions WHERE subscription_id = 'subID');
 ```
 
 ---
@@ -523,8 +507,7 @@ SELECT sn.* FROM subscription_nodes sn WHERE sn.subscription_id = (SELECT id FRO
    ```sql
    SELECT COUNT(*) FROM trial_requests WHERE ip = 'user_ip' AND created_at > datetime('now','-1 hour');
    ```
-3. **XUI reachable?** (same as above)
-4. **File permission:** `data/` writable for creating trial clients
+3. **File permission:** `data/` writable (SQLite writes)
 
 **Logs to check:**
 ```bash
@@ -538,9 +521,10 @@ grep "trial" ./data/bot.log | tail -50
 **Symptom:** Subscription link doesn't work.
 
 **Possible causes:**
-- XUI panel down
-- `subID` invalid/expired
-- Cache corrupted
+- The subscription is `revoked`, expired or not found (the endpoint answers 404)
+- No linked ProviderSource could be fetched (`ErrProviderSourceUnavailable`, 502): the sources are down, disabled or unreachable from the host
+- The Builder is disabled, has no enabled sources, or its item rules select nothing (`subserver_no_items_total` grows)
+- A cached body is served (the cache key changes with the Builder/source configuration; otherwise the TTL is 240s)
 
 **Fix:**
 ```bash
@@ -550,24 +534,13 @@ sqlite3 ./data/rs8kvn.db "SELECT subscription_id, status, expires_at FROM subscr
 # Invalidate cache (restart bot)
 docker restart rs8kvn_bot
 
-# Check proxy logs
+# Check subserver logs
 docker logs rs8kvn_bot | grep "subserver"
 ```
 
-**Check node state:**
-```sql
--- Check subscription and its nodes
-SELECT s.subscription_id, s.status, n.name, n.type, n.subscription_url, n.is_active
-FROM subscriptions s
-JOIN subscription_nodes sn ON sn.subscription_id = s.id
-JOIN nodes n ON n.id = sn.node_id
-WHERE s.subscription_id = 'your-sub-id';
-
--- Check sync state
-SELECT subscription_id, node_id, status, retry_count, last_error
-FROM subscription_nodes
-WHERE subscription_id = (SELECT id FROM subscriptions WHERE subscription_id = 'your-sub-id');
-```
+**Check upstream state:**
+- Metrics: `subserver_source_fetch_total{result="error"}` and `subserver_source_fetch_duration_seconds` show failing or slow sources.
+- In the admin UI/API check that the ProviderSource is enabled and its catalogue sync succeeded, and that the Builder links at least one enabled source.
 
 ---
 
@@ -619,26 +592,7 @@ sqlite3 ./data/rs8kvn.db "PRAGMA journal_mode=WAL;"
 
 ---
 
-### 5.8 XUI API errors (retry with backoff)
-
-**Symptom:** XUI API calls failing with transient errors.
-
-**Log:** `"XUI API error"`, `"retrying after backoff"`, or similar.
-
-**Note:** The system uses `RetryWithBackoff` with exponential backoff + jitter (up to 3 total attempts (2 retries)). The circuit breaker implementation is tested but is not currently wired into the live XUI client path.
-
-**Fix:**
-1. Check 3x-ui panel is up: `curl -H "Authorization: Bearer <api_token>" "<panel_host>/panel/api/server/status"`
-2. Verify `nodes.host` and `nodes.api_token` in database are correct
-3. Check panel logs for errors
-4. Retries happen automatically — check logs after ~30s for recovery
-5. DNS errors will fast-fail without retries
-
-**For persistent issues:** Restart bot to clear any cached state.
-
----
-
-### 5.9 Logs fill disk
+### 5.8 Logs fill disk
 
 **Symptom:** `data/bot.log` grows beyond 10MB or rotated files are not being created.
 
@@ -657,33 +611,6 @@ sqlite3 ./data/rs8kvn.db "PRAGMA journal_mode=WAL;"
 
 ---
 
-### 5.10 Subscription sync stuck in pending state
-
-**Symptom:** Subscription nodes remain in `pending_add`, `pending_remove`, or `pending_update` status.
-
-**Check:**
-```sql
--- Find stuck subscription nodes
-SELECT subscription_id, node_id, status, retry_count, retry_at, last_error, updated_at
-FROM subscription_nodes
-WHERE status LIKE 'pending_%'
-ORDER BY updated_at DESC;
-```
-
-**Common causes:**
-- VPN node unreachable (check node host and API token in `nodes` table)
-- XUI panel rejecting client creation (inbound ID mismatch)
-- Network timeout to VPN node
-
-**Fix:**
-1. Check node connectivity: verify `nodes` table has correct host/api_token
-2. Review `last_error` column for specific error messages
-3. The background `SyncPendingNodes` worker retries with exponential backoff automatically
-4. For persistent stuck states, restart bot to reset worker state
-5. Check `bot_orphaned_clients_revoked_total` for orphan reconciliation activity
-
----
-
 ## 6. Scaling
 
 ### 6.1 Current Limitations
@@ -698,8 +625,8 @@ ORDER BY updated_at DESC;
 ### 6.2 When to Scale
 
 - **>10k active users:** Consider PostgreSQL
-- **>50k users:** Consider read replica, sharding by inbound
-- **High write load:** Multiple XUI panels (shard by user ID hash)
+- **>50k users:** Consider a read replica (requires moving off SQLite)
+- **High write load:** Move to PostgreSQL (SQLite is single-writer)
 
 ### 6.3 Horizontal Scaling (multiple bot instances)
 
@@ -735,7 +662,7 @@ deploy:
 
 ### 7.1 Checklist
 
-- [ ] Use HTTPS for node panel URLs (`nodes.host`, no HTTP in production)
+- [ ] Use HTTPS for ProviderSource URLs (no HTTP in production)
 - [ ] Set strong `TELEGRAM_BOT_TOKEN` (20+ chars, random)
 - [ ] Restrict `.env` permissions: `chmod 600 .env`
 - [ ] Run Docker with `--read-only` (not possible due to SQLite writes)
@@ -757,7 +684,7 @@ deploy:
 
 **Do:**
 - Use secrets manager (HashiCorp Vault, AWS Secrets Manager)
-- Rotate XUI API token every 90 days
+- Rotate ProviderSource credentials (headers/tokens) according to the provider's policy
 - Rotate Telegram bot token if exposed
 
 ### 7.3 Network Security
@@ -809,7 +736,7 @@ limit_req_zone $binary_remote_addr zone=sub:10m rate=30r/m;
 **Before reporting:**
 1. Check logs in `data/bot.log`
 2. Verify configuration (`.env`)
-3. Test 3x-ui panel connectivity
+3. Check that the ProviderSource URLs used by your Builders are reachable
 4. Include version: `./rs8kvn_bot --version` or logs startup line
 
 ---

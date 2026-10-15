@@ -21,7 +21,7 @@ func TestHandleSetPlan_AdminOnly(t *testing.T) {
 	cfg := &config.Config{TelegramAdminID: 123456}
 	mockDB := testutil.NewDatabaseService()
 	mockBot := testutil.NewBotAPI()
-	handler := newTestAdminHandler(cfg, mockDB, testutil.NewXUIClient(), mockBot)
+	handler := newTestAdminHandler(cfg, mockDB, mockBot)
 
 	user := &tgbotapi.User{ID: 999, UserName: "notadmin"}
 	update := createCommandUpdate(1, user, "/setplan 5 3 30")
@@ -56,7 +56,7 @@ func TestHandleSetPlan_UsageAndValidation(t *testing.T) {
 			cfg := &config.Config{TelegramAdminID: 123456}
 			mockDB := testutil.NewDatabaseService()
 			mockBot := testutil.NewBotAPI()
-			handler := newTestAdminHandler(cfg, mockDB, testutil.NewXUIClient(), mockBot)
+			handler := newTestAdminHandler(cfg, mockDB, mockBot)
 
 			admin := &tgbotapi.User{ID: 123456, UserName: "admin"}
 			update := createCommandUpdate(1, admin, tt.cmd)
@@ -75,7 +75,7 @@ func TestHandleSetPlan_Success(t *testing.T) {
 	cfg := &config.Config{TelegramAdminID: 123456}
 	mockDB := testutil.NewDatabaseService()
 	mockBot := testutil.NewBotAPI()
-	handler := newTestAdminHandler(cfg, mockDB, testutil.NewXUIClient(), mockBot)
+	handler := newTestAdminHandler(cfg, mockDB, mockBot)
 
 	sub := &database.Subscription{
 		ID:             5,
@@ -120,7 +120,7 @@ func TestHandleSetPlan_ServiceError(t *testing.T) {
 	cfg := &config.Config{TelegramAdminID: 123456}
 	mockDB := testutil.NewDatabaseService()
 	mockBot := testutil.NewBotAPI()
-	handler := newTestAdminHandler(cfg, mockDB, testutil.NewXUIClient(), mockBot)
+	handler := newTestAdminHandler(cfg, mockDB, mockBot)
 
 	planErr := errors.New("plan not found")
 	mockDB.GetByIDFunc = func(context.Context, uint) (*database.Subscription, error) {

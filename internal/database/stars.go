@@ -164,11 +164,11 @@ func (s *Service) PendingTelegramPayments(ctx context.Context, after uint, limit
 }
 
 // SettleStarsPayment wraps the existing order CAS, receipt completion, charge
-// binding and all subscription/plan DB prerequisites in ONE writer transaction.
+// binding and the subscription/plan update in ONE writer transaction.
 // Late successful payments may fulfill expired, previously approved checkouts.
 // Canceled/revoked purchases never resurrect access and remain in the inbox for
 // operational reconciliation. No expiry-based retry can grant an order twice.
-func (s *Service) SettleStarsPayment(ctx context.Context, ref, chargeID string, validate PurchaseValidator, applyPlan ApplyPlanInTxFn) (*Order, *Subscription, bool, error) {
+func (s *Service) SettleStarsPayment(ctx context.Context, ref, chargeID string, validate PurchaseValidator) (*Order, *Subscription, bool, error) {
 	var order *Order
 	var sub *Subscription
 	var activated bool
@@ -202,9 +202,6 @@ func (s *Service) SettleStarsPayment(ctx context.Context, ref, chargeID string, 
 			if _, err = validate(c, &r.Product); err != nil {
 				return err
 			}
-			if applyPlan == nil {
-				return ErrStarsPurchaseInvalid
-			}
 			// Existing unique(payment_provider, provider_payment_id) also protects charge binding.
 			if err = tx.Model(&Order{}).Where("id = ?", o.ID).UpdateColumn("provider_payment_id", chargeID).Error; err != nil {
 				return err
@@ -213,7 +210,7 @@ func (s *Service) SettleStarsPayment(ctx context.Context, ref, chargeID string, 
 			// Honour the order price snapshot even if catalog flags changed after approval.
 			product := r.Product
 			product.PriceCents, product.Currency = o.AmountCents, o.Currency
-			activated, err = payments.ConfirmOrderPaidCAS(ctx, o.ID, c.Now, c.Now, sub, &product, applyPlan, receipt.TotalAmount)
+			activated, err = payments.ConfirmOrderPaidCAS(ctx, o.ID, c.Now, c.Now, sub, &product, receipt.TotalAmount)
 			if err != nil {
 				return err
 			}

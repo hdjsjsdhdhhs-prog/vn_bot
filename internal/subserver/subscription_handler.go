@@ -1,6 +1,9 @@
-// Package subserver implements the subscription delivery endpoint (/sub/:id)
-// that aggregates proxy configurations from multiple 3x-ui upstream sources,
-// caches responses, and tracks requesting devices and IPs for analytics.
+// Package subserver implements the subscription delivery endpoint (/sub/:id).
+// A subscription is assembled by its SubscriptionBuilder from the catalogues of
+// the builder's ProviderSources (ready-made upstream subscription URLs); a
+// subscription linked directly to one ProviderSource and without a builder is
+// served from that source. Responses are cached and requesting devices/IPs are
+// tracked for analytics.
 package subserver
 
 import (
@@ -20,11 +23,13 @@ import (
 // cannot be served.
 //
 // The flow is:
-//  1. Resolve and validate the subscription's optional ProviderSource.
+//  1. Resolve the serving route: the enabled builder (subscription override >
+//     plan default), otherwise a directly linked ProviderSource, otherwise
+//     ErrBuilderUnavailable (503, configuration error — no other fallback).
 //  2. Check the route-specific response cache.
 //  3. On a cache miss, track device/IP analytics.
-//  4. Fetch either the single ProviderSource or the unchanged legacy plan nodes.
-//  5. Normalize through the existing aggregation pipeline and cache the result.
+//  4. Fetch and assemble through the builder or the single ProviderSource.
+//  5. Normalize through the shared aggregation pipeline and cache the result.
 func HandleSubscription(ctx context.Context, db interfaces.SubscriptionRepository, subSvc *Service, subID, clientIP string, requestHeaders map[string]string) (*SubscriptionResult, int, int, error) {
 	loaded, err := loadSubscription(ctx, db, subSvc, subID, clientIP, requestHeaders)
 	if err != nil {
@@ -37,7 +42,7 @@ func HandleSubscription(ctx context.Context, db interfaces.SubscriptionRepositor
 	// Paid (premium) subscriptions get
 	// a " Premium" suffix appended to the upstream profile-title header.
 	profileTitleSuffix := ""
-	if loaded.full.Subscription.IsPaid() {
+	if loaded.sub.IsPaid() {
 		profileTitleSuffix = " Premium"
 	}
 
@@ -52,36 +57,30 @@ func HandleSubscription(ctx context.Context, db interfaces.SubscriptionRepositor
 		return res, success, total, respErr
 	}
 
-	if loaded.providerSource != nil {
-		agg, success, total, fetchErr := fetchAndAggregateProviderSource(ctx, subID, *loaded.providerSource)
-		if fetchErr != nil {
-			return nil, success, total, fetchErr
-		}
-
-		upstreamTrafficLimit := ParseUserInfoValue(agg.firstSourceHeaders, "total")
-		res, buildErr := buildResponse(subSvc, loaded.cacheKey, agg, upstreamTrafficLimit, profileTitleSuffix)
-
-		return res, success, total, buildErr
+	// loadSubscription guarantees a provider source when there is no builder.
+	agg, success, total, fetchErr := fetchAndAggregateProviderSource(ctx, subID, *loaded.providerSource)
+	if fetchErr != nil {
+		return nil, success, total, fetchErr
 	}
 
-	// Legacy subscriptions retain the existing plan-node aggregation path.
-	agg, success, total := fetchAndAggregateSources(ctx, subID, loaded.full.Nodes)
-	res, err := buildResponse(subSvc, loaded.cacheKey, agg, loaded.full.Plan.TrafficLimit, profileTitleSuffix)
+	upstreamTrafficLimit := ParseUserInfoValue(agg.firstSourceHeaders, "total")
+	res, buildErr := buildResponse(subSvc, loaded.cacheKey, agg, upstreamTrafficLimit, profileTitleSuffix)
 
-	return res, success, total, err
+	return res, success, total, buildErr
 }
 
 // UpdateDevices records the current request headers as a device entry in the
 // subscription's Devices JSON field. Each entry includes a "timestamp" key
 // (UTC RFC3339) marking when the device was last seen. If an existing entry
 // has the same x-hwid value it is replaced (rotated to the end). The updated
-// list is persisted to DB.
-func UpdateDevices(ctx context.Context, db interfaces.SubscriptionRepository, subFull *database.SubscriptionFull, headers map[string]string) {
-	devices, err := subFull.Subscription.ParseDevices()
+// list is persisted to DB. Devices are analytics only: no device limit is
+// enforced.
+func UpdateDevices(ctx context.Context, db interfaces.SubscriptionRepository, sub *database.Subscription, headers map[string]string) {
+	devices, err := sub.ParseDevices()
 	if err != nil {
 		logger.Error("Failed to parse devices JSON",
-			zap.Uint("sub_pk", subFull.Subscription.ID),
-			zap.String("sub_id", subFull.Subscription.SubscriptionID),
+			zap.Uint("sub_pk", sub.ID),
+			zap.String("sub_id", sub.SubscriptionID),
 			zap.Error(err))
 
 		devices = []map[string]string{}
@@ -109,21 +108,21 @@ func UpdateDevices(ctx context.Context, db interfaces.SubscriptionRepository, su
 		}
 	}
 
-	err = subFull.Subscription.SetDevices(devices)
+	err = sub.SetDevices(devices)
 	if err != nil {
 		logger.Error("Failed to set devices JSON",
-			zap.Uint("sub_pk", subFull.Subscription.ID),
-			zap.String("sub_id", subFull.Subscription.SubscriptionID),
+			zap.Uint("sub_pk", sub.ID),
+			zap.String("sub_id", sub.SubscriptionID),
 			zap.Error(err))
 
 		return
 	}
 
-	err = db.UpdateDevices(ctx, subFull.Subscription.ID, subFull.Subscription.Devices)
+	err = db.UpdateDevices(ctx, sub.ID, sub.Devices)
 	if err != nil {
 		logger.Error("Failed to save devices to database",
-			zap.Uint("sub_pk", subFull.Subscription.ID),
-			zap.String("sub_id", subFull.Subscription.SubscriptionID),
+			zap.Uint("sub_pk", sub.ID),
+			zap.String("sub_id", sub.SubscriptionID),
 			zap.Error(err))
 	}
 }
@@ -131,12 +130,12 @@ func UpdateDevices(ctx context.Context, db interfaces.SubscriptionRepository, su
 // UpdateIPs records the current client IP with a UTC timestamp in the
 // subscription's Ips JSON field. Duplicate IPs are rotated to the end.
 // The list is capped at maxIPEntries (oldest entries are dropped).
-func UpdateIPs(ctx context.Context, db interfaces.SubscriptionRepository, subFull *database.SubscriptionFull, ip string) {
-	ips, err := subFull.Subscription.ParseIPs()
+func UpdateIPs(ctx context.Context, db interfaces.SubscriptionRepository, sub *database.Subscription, ip string) {
+	ips, err := sub.ParseIPs()
 	if err != nil {
 		logger.Error("Failed to parse ips JSON",
-			zap.Uint("sub_pk", subFull.Subscription.ID),
-			zap.String("sub_id", subFull.Subscription.SubscriptionID),
+			zap.Uint("sub_pk", sub.ID),
+			zap.String("sub_id", sub.SubscriptionID),
 			zap.Error(err))
 
 		ips = []map[string]string{}
@@ -160,21 +159,21 @@ func UpdateIPs(ctx context.Context, db interfaces.SubscriptionRepository, subFul
 		}
 	}
 
-	err = subFull.Subscription.SetIPs(ips)
+	err = sub.SetIPs(ips)
 	if err != nil {
 		logger.Error("Failed to set ips JSON",
-			zap.Uint("sub_pk", subFull.Subscription.ID),
-			zap.String("sub_id", subFull.Subscription.SubscriptionID),
+			zap.Uint("sub_pk", sub.ID),
+			zap.String("sub_id", sub.SubscriptionID),
 			zap.Error(err))
 
 		return
 	}
 
-	err = db.UpdateIPs(ctx, subFull.Subscription.ID, subFull.Subscription.Ips)
+	err = db.UpdateIPs(ctx, sub.ID, sub.Ips)
 	if err != nil {
 		logger.Error("Failed to save ips to database",
-			zap.Uint("sub_pk", subFull.Subscription.ID),
-			zap.String("sub_id", subFull.Subscription.SubscriptionID),
+			zap.Uint("sub_pk", sub.ID),
+			zap.String("sub_id", sub.SubscriptionID),
 			zap.Error(err))
 	}
 }

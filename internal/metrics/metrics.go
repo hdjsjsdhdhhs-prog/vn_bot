@@ -1,5 +1,5 @@
 // Package metrics defines Prometheus collectors and HTTP middleware for
-// observability across the bot, web, subserver, xui, and service layers.
+// observability across the bot, web, subserver, and service layers.
 // All collectors are registered at init time via promauto, so they appear
 // on the /metrics endpoint without explicit registration.
 package metrics
@@ -55,26 +55,6 @@ var (
 			Buckets: []float64{0.01, 0.05, 0.1, 0.3, 0.6, 1, 2},
 		},
 		[]string{"command"},
-	)
-
-	// XUIRequestsTotal is a counter of requests to 3x-ui panel with labels: operation, result.
-	// result values: success, error
-	XUIRequestsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "xui_requests_total",
-			Help: "Total number of requests to 3x-ui panel",
-		},
-		[]string{"operation", "result"},
-	)
-
-	// XUIRequestDuration is a histogram of XUI request duration in seconds with label: operation.
-	XUIRequestDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "xui_request_duration_seconds",
-			Help:    "XUI request duration in seconds",
-			Buckets: []float64{0.01, 0.05, 0.1, 0.3, 0.6, 1, 2, 5},
-		},
-		[]string{"operation"},
 	)
 
 	// TelegramAPICallsTotal is a counter of Telegram Bot API calls with labels: method, result.
@@ -191,23 +171,6 @@ var (
 		},
 	)
 
-	// SubscriptionSyncTotal counts subscription sync worker runs.
-	SubscriptionSyncTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "subscription_sync_total",
-			Help: "Total number of subscription sync worker runs",
-		},
-	)
-
-	// SubscriptionSyncDuration is a histogram of subscription sync worker duration.
-	SubscriptionSyncDuration = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "subscription_sync_duration_seconds",
-			Help:    "Subscription sync worker duration in seconds",
-			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60},
-		},
-	)
-
 	// SubscriptionExpireTotal counts subscription expire worker runs.
 	SubscriptionExpireTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
@@ -222,25 +185,6 @@ var (
 			Name:    "subscription_expire_duration_seconds",
 			Help:    "Subscription expire worker duration in seconds",
 			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60},
-		},
-	)
-
-	// ReconcileOrphanedDuration is a histogram of orphaned client reconciliation duration.
-	ReconcileOrphanedDuration = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "reconcile_orphaned_duration_seconds",
-			Help:    "Orphaned client reconciliation duration in seconds",
-			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60},
-		},
-	)
-
-	// OrphanedClientsRevokedTotal counts subscriptions revoked (not deleted —
-	// policy: subscriptions are never removed except via admin /del) during
-	// background reconciliation of orphaned entries.
-	OrphanedClientsRevokedTotal = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "bot_orphaned_clients_revoked_total",
-			Help: "Total number of orphaned subscriptions revoked during reconciliation",
 		},
 	)
 
@@ -339,23 +283,6 @@ var SubscriptionReminderRunsTotal = promauto.NewCounter(
 	prometheus.CounterOpts{Name: "subscription_reminder_runs_total",
 
 		Help: "Total number of subscription reminder worker scans.",
-	},
-)
-
-// TrafficNotificationsTotal counts traffic notification sends by kind and result.
-var TrafficNotificationsTotal = promauto.NewCounterVec(
-	prometheus.CounterOpts{
-		Name: "traffic_notifications_total",
-		Help: "Total number of traffic notification sends by kind and result.",
-	},
-	[]string{"kind", "result"},
-)
-
-// TrafficNotificationRunsTotal counts traffic notification worker scans.
-var TrafficNotificationRunsTotal = promauto.NewCounter(
-	prometheus.CounterOpts{Name: "traffic_notification_runs_total",
-
-		Help: "Total number of traffic notification worker scans.",
 	},
 )
 

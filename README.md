@@ -1,4 +1,4 @@
-# Telegram Bot for 3x-ui VLESS Subscription Distribution
+# Telegram Bot for VLESS Subscription Distribution
 
 [![GitHub release](https://img.shields.io/github/v/release/kereal/rs8kvn_bot?logo=github)](https://github.com/kereal/rs8kvn_bot/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/kereal/rs8kvn_bot/docker.yml?branch=main)](https://github.com/kereal/rs8kvn_bot/actions)
@@ -16,11 +16,11 @@
 - 📥 Get subscription on demand with QR code import
 - 🔗 Invite/trial landing page (`/i/{code}`) with one-click Happ setup
 - 👥 Referral system — users generate invite codes with in-memory cache + periodic sync
-- 📊 Plans & pricing — plan-based traffic/device limits, products, orders, multi-node via `nodes`/`plan_nodes` schema
+- 📊 Plans & pricing — plans, products and orders; the content of a subscription is assembled by Builders from ProviderSource catalogues
 - 💳 **Platega payments** — in-bot purchase flow (💎 Купить Premium), provider payment links, authenticated webhook (`X-MerchantId`/`X-Secret`) with atomic confirmation, renewals, and chargeback auto-downgrade to the free plan
-- 🔗 Subscription server endpoint (`/sub/{subID}`) with multi-source aggregation, devices/IPs tracking, and profile headers, node-state synchronization via subscription_nodes table
-- 🌐 Multi-node VPN abstraction — `internal/vpn/` with `Client` interface, 3x-ui, proxman, and fetch support, per-node client provisioning
-- 📈 Prometheus metrics — `/metrics` endpoint with HTTP, bot, XUI, DB, cache, circuit breaker, subscription metrics
+- 🔗 Subscription server endpoint (`/sub/{subID}`) with multi-source aggregation, devices/IPs tracking, and profile headers
+- 🌐 Subscription Builders — a per-subscription or per-plan Builder assembles the `/sub` content from ProviderSource catalogues (country/node rules, renames, ordering); no client is registered on any VPN panel
+- 📈 Prometheus metrics — `/metrics` endpoint with HTTP, bot, DB, cache, subserver, subscription and payment metrics
 - 🗄️ Daily database backups with rotation, embedded SQLite migrations
 - 🐛 Sentry error tracking (+ performance traces)
 - 🐳 Docker support with health checks, non-root user, UPX compression
@@ -46,7 +46,7 @@ docker run -d \
 See **[Installation Guide](doc/installation.md)** for:
 - All 4 installation methods (Docker, Docker Compose, Build from Source, Air hot reload)
 - Full configuration table (all env vars)
-- 3x-ui panel setup instructions
+- ProviderSource and Builder setup
 - Database migrations and backups
 
 ## Usage
@@ -82,7 +82,7 @@ See **[Installation Guide](doc/installation.md)** for:
 |---------|-------------|
 | `/lastreg` | Show the last 10 registered users |
 | `/del <id>` | Delete a subscription by database ID |
-| `/setplan <subscription_id> <plan_id> [days]` | Change a subscription's plan through the service layer (reconciles VPN nodes, extends expiry; defaults to 30 days when none given) |
+| `/setplan <subscription_id> <plan_id> [days]` | Change a subscription's plan through the service layer (extends expiry; defaults to 30 days when none given) |
 | `/broadcast` | Start an asynchronous broadcast: name → message → filters → preview → confirm |
 | `/broadcasts` | Show recent broadcasts; open details, cancel active campaigns, or retry failed recipients |
 | `/send <id or @username> <message>` | Send a message to a specific user |
@@ -125,17 +125,15 @@ Referral-based trial flow: validates the invite code, applies IP rate limiting, 
 
 ### Subscription Server (`/sub/{subID}`)
 
-Serves merged subscriptions from all active nodes (3x-ui, proxman, fetch) with a 240s singleflight cache. Optional access logging is enabled via `SUBSERVER_ACCESS_LOG`.
+Serves subscriptions assembled by the resolved Subscription Builder (per-subscription override, otherwise the plan default) from its ProviderSource catalogues, with a 240s singleflight cache. If no linked source can be fetched the endpoint fails instead of falling back to a legacy pipeline. Optional access logging is enabled via `SUBSERVER_ACCESS_LOG`.
 
-## Traffic and Expiry
+## Expiry
 
-- Free subscriptions on 3x-ui use the v3.7.0-compatible rolling configuration: `reset=30`, `resetDay=0`, `resetMax=0`, `trafficReset=monthly`, `trafficResetDay=1`.
-- `reset=30` extends the expiry by 30 days; `resetDay=0` deliberately keeps rolling renewal rather than calendar-day renewal.
-- `resetMax=0` means unlimited renewals. `trafficReset=monthly` with `trafficResetDay=1` resets the traffic counter on the first day of each month.
-- Trials explicitly use `reset=0` and do not auto-renew.
-- The bot also repairs an already expired free-client expiry during synchronization; this is a recovery fallback, not a replacement for the panel's scheduled renewal.
-- Existing clients do not need to be recreated. Save the above values once for legacy clients, then let the bot preserve them on subsequent add/update requests.
-- **Source**: [3x-ui inbound_traffic.go - autoRenewClients()](https://github.com/mhsanaei/3x-ui/blob/main/internal/web/service/inbound_traffic.go)
+Access is local state: a subscription row (status, plan, expiry). There is no panel-side traffic accounting or auto-renewal.
+
+- A paid subscription has `expires_at`; the expiry worker downgrades an expired paid subscription to the free plan. The free plan has no expiry.
+- Trials are anonymous, short-lived subscriptions (duration from the admin trial settings, `TRIAL_DURATION_HOURS` is the default). Expired trials are claimed and deleted by the trial cleanup worker.
+- Expiry reminders (3d / 1d / 3h) are sent to active paid subscriptions.
 
 ### Payment Callback (`/payment/callback`)
 
@@ -188,8 +186,8 @@ go build -ldflags="-s -w" -o rs8kvn_bot ./cmd/bot
 
 ### Project Documentation
 
-- **[Installation & Configuration](doc/installation.md)** — All setup methods, env vars, and 3x-ui instructions
-- **[Architecture](doc/architecture.md)** — System architecture, data model, component deep dives, sync pipeline
+- **[Installation & Configuration](doc/installation.md)** — All setup methods, env vars, and ProviderSource/Builder setup
+- **[Architecture](doc/architecture.md)** — System architecture, data model, component deep dives, subscription content assembly
 - **[Handover](doc/handover.md)** — Architecture overview, stack, current state, nuances
 - **[Security Policy](doc/security.md)** — Security measures, hardening checklist, incident response
 - **[API Reference](doc/api.md)** — HTTP endpoints, error codes, rate limits

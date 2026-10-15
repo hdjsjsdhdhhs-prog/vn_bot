@@ -40,26 +40,26 @@ func NewTariffService(repo TariffRepository) *TariffService {
 
 // TariffView is the admin projection of a product.
 type TariffView struct {
-	ID           uint       `json:"id"`
-	OfferID      string     `json:"offer_id"`
-	Name         string     `json:"name"`
-	PlanID       uint       `json:"plan_id"`
-	PlanName     string     `json:"plan_name"`
-	PlanActive   bool       `json:"plan_active"`
-	BuilderID    *uint      `json:"builder_id"`
-	DurationDays int        `json:"duration_days"`
-	PriceCents   int64      `json:"price_cents"`
-	Currency     string     `json:"currency"`
-	IsActive     bool       `json:"is_active"`
-	Description  string     `json:"description"`
-	Features     []string   `json:"features"`
-	Badge        string     `json:"badge"`
-	SortOrder    int        `json:"sort_order"`
-	Version      int        `json:"version"`
-	PreviousID   *uint      `json:"previous_id"`
-	ReplacedByID *uint      `json:"replaced_by_id"`
-	Orders       int64      `json:"orders"`
-	Subscriptions int64     `json:"subscriptions"`
+	ID            uint     `json:"id"`
+	OfferID       string   `json:"offer_id"`
+	Name          string   `json:"name"`
+	PlanID        uint     `json:"plan_id"`
+	PlanName      string   `json:"plan_name"`
+	PlanActive    bool     `json:"plan_active"`
+	BuilderID     *uint    `json:"builder_id"`
+	DurationDays  int      `json:"duration_days"`
+	PriceCents    int64    `json:"price_cents"`
+	Currency      string   `json:"currency"`
+	IsActive      bool     `json:"is_active"`
+	Description   string   `json:"description"`
+	Features      []string `json:"features"`
+	Badge         string   `json:"badge"`
+	SortOrder     int      `json:"sort_order"`
+	Version       int      `json:"version"`
+	PreviousID    *uint    `json:"previous_id"`
+	ReplacedByID  *uint    `json:"replaced_by_id"`
+	Orders        int64    `json:"orders"`
+	Subscriptions int64    `json:"subscriptions"`
 	// InUse: orders or subscriptions reference the product, so changing the
 	// purchase terms creates a new version instead of editing in place.
 	InUse       bool       `json:"in_use"`
@@ -84,8 +84,6 @@ type TariffPlanView struct {
 	ID            uint   `json:"id"`
 	Name          string `json:"name"`
 	IsActive      bool   `json:"is_active"`
-	DevicesLimit  int    `json:"devices_limit"`
-	TrafficLimit  int64  `json:"traffic_limit"`
 	BuilderID     *uint  `json:"subscription_builder_id"`
 	BuilderName   string `json:"builder_name"`
 	Tariffs       int64  `json:"tariffs"`
@@ -171,7 +169,7 @@ func (s *TariffService) ListPlans(ctx context.Context) ([]TariffPlanView, error)
 	for i := range rows {
 		r := &rows[i]
 		views = append(views, TariffPlanView{
-			ID: r.ID, Name: r.Name, IsActive: r.IsActive, DevicesLimit: r.DevicesLimit, TrafficLimit: r.TrafficLimit,
+			ID: r.ID, Name: r.Name, IsActive: r.IsActive,
 			BuilderID: r.SubscriptionBuilderID, BuilderName: r.BuilderName, Tariffs: r.Tariffs,
 			Subscriptions: r.Subscriptions, Selectable: r.Selectable(),
 		})

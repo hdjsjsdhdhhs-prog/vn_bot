@@ -62,7 +62,7 @@ func newSourceAPIFixture(t *testing.T) *sourceAPIFixture {
 	require.NoError(t, err)
 	cfg := &config.Config{AdminUsername: "admin", AdminPasswordHash: string(hash), SiteURL: "https://admin.example.com"}
 	s := NewServer("127.0.0.1:0", nil, cfg, "", nil, nil)
-	s.SetAdminService(service.NewAdminService(f.db, nil, nil))
+	s.SetAdminService(service.NewAdminService(f.db, nil))
 	builders := service.NewBuilderService(f.db)
 	builders.SetCatalogueFetcher(func(ctx context.Context, src database.ProviderSource) (*service.FetchedCatalogue, error) {
 		c, err := subserver.FetchSourceCatalogue(ctx, src)

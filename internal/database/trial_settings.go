@@ -56,7 +56,6 @@ const (
 	TrialMaxBadgeLength    = TariffMaxBadgeLength
 	TrialMaxSources        = 50
 	TrialMaxRules          = 500
-	TrialMaxLegacyNodes    = 50
 	trialMaxBuilderNameLen = 128
 	trialHistoryLimit      = 10
 )
@@ -72,12 +71,6 @@ const (
 	TrialModeSelected = "selected"
 )
 
-// Trial issuance modes reported by the preview.
-const (
-	TrialServeBuilder = "builder"
-	TrialServeLegacy  = "legacy"
-)
-
 // Problem severities: an invalid draft is never saved; an unavailable one is
 // saved only with the trial switched off (it cannot issue subscriptions).
 const (
@@ -89,7 +82,7 @@ var (
 	// ErrTrialDisabled: the admin switched the trial off; no new trial is issued.
 	ErrTrialDisabled = errors.New("trial is disabled")
 	// ErrTrialUnavailable: the configuration cannot issue a working trial
-	// (builder disabled or missing, empty composition, no trial node).
+	// (no builder assigned, builder disabled or missing, empty composition).
 	ErrTrialUnavailable = errors.New("trial configuration cannot issue a subscription")
 	// ErrTrialInvalid is unwrapped from TrialFieldError.
 	ErrTrialInvalid = errors.New("trial configuration is invalid")
@@ -234,21 +227,6 @@ type TrialDraft struct {
 	Badge            string            `json:"badge"`
 	BuilderID        *uint             `json:"builder_id"`
 	Composition      *TrialComposition `json:"composition"`
-	// LegacyNodeIDs replaces the issuance nodes of the trial plan (plan_nodes).
-	// nil leaves the links untouched. These nodes only carry the anonymous
-	// client CreateTrial provisions; the VPN composition comes from the builder.
-	LegacyNodeIDs *[]uint `json:"legacy_node_ids"`
-}
-
-// TrialLegacyNode is a node of the nodes table offered as the trial issuance
-// node. Host, API token and subscription URL are never part of it.
-type TrialLegacyNode struct {
-	ID       uint     `json:"id"`
-	Name     string   `json:"name"`
-	Type     NodeType `json:"type"`
-	IsActive bool     `json:"is_active"`
-	// Linked: currently linked to the trial plan (plan_nodes).
-	Linked bool `json:"linked"`
 }
 
 // TrialProblem is one reason a draft cannot be saved or cannot issue trials.
@@ -292,13 +270,11 @@ type TrialPreview struct {
 	Issuable      bool                `json:"issuable"`
 	Enabled       bool                `json:"enabled"`
 	Problems      []TrialProblem      `json:"problems"`
-	Serve         string              `json:"serve"`
 	DurationHours int                 `json:"duration_hours"`
 	ExpiresAt     time.Time           `json:"expires_at"`
 	Builder       *TrialBuilderRef    `json:"builder"`
 	Mode          string              `json:"mode"`
 	Sources       []TrialSourceRef    `json:"sources"`
-	LegacyNodes   int                 `json:"legacy_nodes"`
 	Total         int                 `json:"total"`
 	Countries     []TrialCountryCount `json:"countries"`
 	Items         []PreviewItem       `json:"items"`
@@ -571,89 +547,6 @@ func (s *Service) validateComposition(ctx context.Context, b *SubscriptionBuilde
 	return model, nil
 }
 
-// trialIssuanceNodes counts the issuance nodes a draft would leave the trial
-// plan with: the stored active links (nil ids, what CreateTrial uses), or the
-// chosen ids, each of which must be an existing, active node. ok is false when
-// the choice is invalid (the problem is recorded, the count is meaningless).
-func (s *Service) trialIssuanceNodes(ctx context.Context, ids *[]uint, p *TrialPreview) (int, bool, error) {
-	if ids == nil {
-		nodes, err := s.GetNodesByPlanName(ctx, TrialPlanName)
-		if err != nil {
-			return 0, false, err
-		}
-		return len(nodes), true, nil
-	}
-	const field = "legacy_node_ids"
-	chosen := *ids
-	if len(chosen) > TrialMaxLegacyNodes {
-		p.add(field, "too_many", TrialProblemInvalid)
-		return 0, false, nil
-	}
-	seen := make(map[uint]bool, len(chosen))
-	for _, id := range chosen {
-		if id == 0 || seen[id] {
-			p.add(field, "duplicate", TrialProblemInvalid)
-			return 0, false, nil
-		}
-		seen[id] = true
-	}
-	if len(chosen) == 0 {
-		return 0, true, nil
-	}
-	var nodes []Node
-	if err := s.db.WithContext(ctx).Select("id", "is_active").Where("id IN ?", chosen).Find(&nodes).Error; err != nil {
-		return 0, false, fmt.Errorf("check trial nodes: %w", err)
-	}
-	if len(nodes) != len(chosen) {
-		p.add(field, "legacy_node_not_found", TrialProblemInvalid)
-		return 0, false, nil
-	}
-	for _, n := range nodes {
-		if !n.IsActive {
-			p.add(field, "legacy_node_inactive", TrialProblemInvalid)
-			return 0, false, nil
-		}
-	}
-	return len(chosen), true, nil
-}
-
-// trialPlanNodeIDs returns every node linked to the plan (active or not), by id.
-func trialPlanNodeIDs(tx *gorm.DB, planID uint) ([]uint, error) {
-	ids := []uint{}
-	if err := tx.Model(&PlanNode{}).Where("plan_id = ?", planID).Order("node_id ASC").Pluck("node_id", &ids).Error; err != nil {
-		return nil, fmt.Errorf("load trial plan nodes: %w", err)
-	}
-	return ids, nil
-}
-
-// replaceTrialPlanNodes makes ids the exact node links of the trial plan. Only
-// rows of that plan are touched; links of every other plan stay as they are.
-func replaceTrialPlanNodes(tx *gorm.DB, planID uint, current, ids []uint) error {
-	keep := make(map[uint]bool, len(ids))
-	for _, id := range ids {
-		keep[id] = true
-	}
-	linked := make(map[uint]bool, len(current))
-	for _, id := range current {
-		linked[id] = true
-		if keep[id] {
-			continue
-		}
-		if err := tx.Where("plan_id = ? AND node_id = ?", planID, id).Delete(&PlanNode{}).Error; err != nil {
-			return fmt.Errorf("unlink trial node %d: %w", id, err)
-		}
-	}
-	for _, id := range ids {
-		if linked[id] {
-			continue
-		}
-		if err := tx.Create(&PlanNode{PlanID: planID, NodeID: id}).Error; err != nil {
-			return fmt.Errorf("link trial node %d: %w", id, err)
-		}
-	}
-	return nil
-}
-
 // evaluateTrialDraft resolves a draft into what a new trial would receive.
 // It never writes. Problems are collected, not returned as errors; an error
 // is an infrastructure failure.
@@ -667,27 +560,17 @@ func (s *Service) evaluateTrialDraft(ctx context.Context, d *TrialDraft, now tim
 		p.ExpiresAt = now.Add(time.Duration(d.DurationHours) * time.Hour)
 	}
 
-	nodes, ok, err := s.trialIssuanceNodes(ctx, d.LegacyNodeIDs, p)
-	if err != nil {
-		return nil, err
-	}
-	p.LegacyNodes = nodes
-	// CreateTrial provisions the anonymous client on the first trial node in
-	// every mode (a no-op for proxman/fetch nodes): without one it fails.
-	if ok && p.LegacyNodes == 0 {
-		p.add("legacy_nodes", "no_trial_node", TrialProblemUnavailable)
-	}
-
+	// The trial is served exclusively by the trial plan builder: /sub has no
+	// other route for it, so a trial without a builder can never be issued.
 	if d.BuilderID == nil {
-		p.Serve = TrialServeLegacy
+		p.add("builder_id", "builder_required", TrialProblemUnavailable)
 		if d.Composition != nil {
 			p.add("composition", "builder_required", TrialProblemInvalid)
 		}
-		p.Issuable = len(p.Problems) == 0
+		p.Issuable = false
 		return p, nil
 	}
 
-	p.Serve = TrialServeBuilder
 	b, err := s.GetBuilder(ctx, *d.BuilderID)
 	if errors.Is(err, ErrBuilderNotFound) {
 		p.add("builder_id", "builder_not_found", TrialProblemInvalid)
@@ -701,8 +584,8 @@ func (s *Service) evaluateTrialDraft(ctx context.Context, d *TrialDraft, now tim
 		Announce: b.Announce, Version: b.Version,
 	}
 	if !b.Enabled {
-		// /sub would silently skip a disabled builder; a new trial must not be
-		// issued onto an unknown fallback.
+		// /sub answers 503 for a subscription without an enabled builder, so a
+		// new trial must not be issued onto a disabled one.
 		p.add("builder_id", "builder_disabled", TrialProblemUnavailable)
 	}
 
@@ -864,10 +747,7 @@ type TrialAdminView struct {
 	BuilderID   *uint                 `json:"builder_id"`
 	Composition *TrialComposition     `json:"composition"`
 	Builders    []TrialBuilderSummary `json:"builders"`
-	// LegacyNodes is every node of the nodes table (by id) with its link to
-	// the trial plan: the issuance node choice of the editor.
-	LegacyNodes []TrialLegacyNode `json:"legacy_nodes"`
-	Preview     *TrialPreview     `json:"preview"`
+	Preview     *TrialPreview         `json:"preview"`
 	// Trials counts the anonymous (not yet bound) trials by status.
 	ActiveTrials int64           `json:"active_trials"`
 	History      []AdminAuditLog `json:"history"`
@@ -887,24 +767,7 @@ func (s *Service) GetTrialAdminView(ctx context.Context, d TrialDefaults) (*Tria
 		return nil, err
 	}
 	view := &TrialAdminView{Settings: *eff, Defaults: d, PlanID: plan.ID, BuilderID: plan.SubscriptionBuilderID,
-		Builders: []TrialBuilderSummary{}, LegacyNodes: []TrialLegacyNode{}, History: []AdminAuditLog{}}
-
-	linkedIDs, err := trialPlanNodeIDs(db, plan.ID)
-	if err != nil {
-		return nil, err
-	}
-	linked := make(map[uint]bool, len(linkedIDs))
-	for _, id := range linkedIDs {
-		linked[id] = true
-	}
-	var nodes []Node
-	// Only the safe columns are read: host, token and URLs never leave the DB.
-	if err := db.Select("id", "name", "type", "is_active").Order("id ASC").Find(&nodes).Error; err != nil {
-		return nil, fmt.Errorf("load trial nodes: %w", err)
-	}
-	for _, n := range nodes {
-		view.LegacyNodes = append(view.LegacyNodes, TrialLegacyNode{ID: n.ID, Name: n.Name, Type: n.Type, IsActive: n.IsActive, Linked: linked[n.ID]})
-	}
+		Builders: []TrialBuilderSummary{}, History: []AdminAuditLog{}}
 
 	var builders []SubscriptionBuilder
 	if err := db.Preload("Sources", func(q *gorm.DB) *gorm.DB { return q.Order("position ASC") }).
@@ -984,8 +847,6 @@ type trialAuditView struct {
 	Settings    TrialEffective    `json:"settings"`
 	BuilderID   *uint             `json:"builder_id"`
 	Composition *TrialComposition `json:"composition,omitempty"`
-	// LegacyNodeIDs are the issuance node links of the trial plan.
-	LegacyNodeIDs []uint `json:"legacy_node_ids"`
 }
 
 // UpdateTrial saves the trial configuration: settings, the trial plan builder
@@ -1093,11 +954,7 @@ func (s *Service) updateTrialOnce(ctx context.Context, meta AdminConfigMeta, in 
 				}
 			}
 
-			oldNodes, err := trialPlanNodeIDs(tx, plan.ID)
-			if err != nil {
-				return configChange{}, err
-			}
-			old := trialAuditView{Settings: effectiveFromRow(row, in.Defaults), BuilderID: plan.SubscriptionBuilderID, LegacyNodeIDs: oldNodes}
+			old := trialAuditView{Settings: effectiveFromRow(row, in.Defaults), BuilderID: plan.SubscriptionBuilderID}
 			if builder != nil {
 				c := compositionOf(builder)
 				old.Composition = &c
@@ -1145,21 +1002,11 @@ func (s *Service) updateTrialOnce(ctx context.Context, meta AdminConfigMeta, in 
 					return configChange{}, err
 				}
 			}
-			if draft.LegacyNodeIDs != nil {
-				if err := replaceTrialPlanNodes(tx, plan.ID, oldNodes, *draft.LegacyNodeIDs); err != nil {
-					return configChange{}, err
-				}
-			}
-
 			saved, err := loadTrialSettings(tx)
 			if err != nil {
 				return configChange{}, err
 			}
-			nextNodes, err := trialPlanNodeIDs(tx, plan.ID)
-			if err != nil {
-				return configChange{}, err
-			}
-			next := trialAuditView{Settings: effectiveFromRow(saved, in.Defaults), BuilderID: draft.BuilderID, LegacyNodeIDs: nextNodes}
+			next := trialAuditView{Settings: effectiveFromRow(saved, in.Defaults), BuilderID: draft.BuilderID}
 			if builder != nil {
 				reloaded, err := svc.GetBuilder(ctx, builder.ID)
 				if err != nil {

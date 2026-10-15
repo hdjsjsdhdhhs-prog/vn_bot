@@ -62,8 +62,6 @@ func TestE2E_DelCommand_Success(t *testing.T) {
 
 	_, err = env.db.GetByID(ctx, subID)
 	assert.Error(t, err, "Subscription should be deleted")
-
-	// Sync-based: XUI is called via sync module, not directly in DeleteByID()
 }
 
 func TestE2E_DelCommand_ArgValidation(t *testing.T) {
@@ -113,55 +111,6 @@ func TestE2E_DelCommand_ArgValidation(t *testing.T) {
 	}
 }
 
-func TestE2E_DelCommand_XUIFailure(t *testing.T) {
-	t.Parallel()
-
-	env := setupE2EEnv(t)
-	defer func() {
-		err := env.db.Close()
-		if err != nil {
-			t.Logf("Warning: failed to close database: %v", err)
-		}
-	}()
-
-	ctx := context.Background()
-	adminID := env.cfg.TelegramAdminID
-
-	_, err := env.subService.Create(ctx, env.chatID, env.username, "")
-	require.NoError(t, err)
-
-	sub, err := env.db.GetByTelegramID(ctx, env.chatID)
-	require.NoError(t, err)
-
-	env.xui.DeleteClientFunc = func(ctx context.Context, email string) error {
-		return fmt.Errorf("xui delete: connection refused")
-	}
-
-	resetBotAPI(env.botAPI)
-
-	update := tgbotapi.Update{
-		Message: &tgbotapi.Message{
-			Chat: &tgbotapi.Chat{ID: adminID},
-			From: &tgbotapi.User{
-				ID:       adminID,
-				UserName: "admin",
-			},
-			Text:     fmt.Sprintf("/del %d", sub.ID),
-			Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 4}},
-		},
-	}
-	env.handler.HandleDel(ctx, update)
-
-	assert.True(t, env.botAPI.SendCalledSafe())
-	// Failed external deprovisioning keeps the subscription revoked so the
-	// background sync worker can retry the pending_remove operation.
-	assert.Contains(t, env.botAPI.LastSentText, "Ошибка удаления подписки")
-
-	stored, err := env.db.GetByID(ctx, sub.ID)
-	require.NoError(t, err, "revoked subscription must remain for retry")
-	assert.Equal(t, database.SubscriptionStatusRevoked, database.SubscriptionStatus(stored.Status))
-}
-
 func TestE2E_SetPlanCommand_Success(t *testing.T) {
 	t.Parallel()
 
@@ -182,10 +131,8 @@ func TestE2E_SetPlanCommand_Success(t *testing.T) {
 	sub, err := env.db.GetByTelegramID(ctx, env.chatID)
 	require.NoError(t, err)
 
-	// Seed a premium plan and link the existing node to it.
-	premiumPlan := &database.Plan{Name: "e2e-premium", DevicesLimit: 2, TrafficLimit: 1024}
+	premiumPlan := &database.Plan{Name: "e2e-premium"}
 	require.NoError(t, env.db.GetDB().WithContext(ctx).Create(premiumPlan).Error)
-	require.NoError(t, env.db.LinkNodeToPlan(ctx, premiumPlan.Name, 1), "link node to premium plan")
 
 	resetBotAPI(env.botAPI)
 
@@ -210,13 +157,6 @@ func TestE2E_SetPlanCommand_Success(t *testing.T) {
 	assert.Equal(t, premiumPlan.ID, stored.PlanID)
 	require.NotNil(t, stored.ExpiresAt)
 	assert.WithinDuration(t, time.Now().Add(30*24*time.Hour), *stored.ExpiresAt, time.Minute)
-
-	// Node bindings were reconciled and the best-effort sync pushed the new
-	// plan to the panel: the shared node ends up active with the new plan.
-	nodes, err := env.db.GetBySubscriptionID(ctx, sub.ID)
-	require.NoError(t, err)
-	require.Len(t, nodes, 1)
-	assert.Equal(t, database.SyncStatusActive, nodes[0].Status)
 }
 
 func TestE2E_SetPlanCommand_ArgValidation(t *testing.T) {

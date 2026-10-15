@@ -20,7 +20,7 @@
 │                     cmd/bot/main.go (Entry Point)                    │
 │  ┌────────────────────────────────────────────────────────────────┐ │
 │  │ • Config loading                                                │ │
-│  │ • Service initialization (DB, XUI, Bot, Web, Subserver)          │ │
+│  │ • Service initialization (DB, Bot, Web, Subserver)          │ │
 │  │ • Graceful shutdown coordination (signal handling)              │ │
 │  │ • Worker pool semaphore (10 concurrent handlers)                │ │
 │  └────────────────────────────────────────────────────────────────┘ │
@@ -44,13 +44,13 @@
         ┌─────────────────────┼─────────────────────┐
         ▼                     ▼                     ▼
 ┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│   Database    │    │   XUI Panel   │    │ External      │
-│  SQLite DB    │    │  3x-ui API    │    │ Services      │
+│   Database    │    │ Provider src  │    │ External      │
+│  SQLite DB    │    │ (read-only)   │    │ Services      │
 │               │    │               │    │               │
-│ • Subscriptions│   │ • AddClient   │    │ • Telegram    │
-│ • Invites      │   │ • GetTraffic  │    │ • Sentry      │
-│ • TrialReqs    │   │ • Delete      │    │ • Heartbeat   │
-│ • Indexes      │   │ • RetryWithBk │    │   endpoint    │
+│ • Subscriptions│   │ • Catalogue   │    │ • Telegram    │
+│ • Invites      │   │ • Live fetch  │    │ • Sentry      │
+│ • TrialReqs    │   │ • No writes   │    │ • Heartbeat   │
+│ • Indexes      │   │ • Builders    │    │   endpoint    │
 └───────────────┘    └───────────────┘    └───────────────┘
 ```
 
@@ -74,17 +74,10 @@ Handler.HandleUpdate → HandleCallback ("create_subscription")
         └─ Cache miss → proceed
         │
         ▼
-SubscriptionService.Create(ctx, telegramID)
+SubscriptionService.Create(ctx, telegramID, ...)
         │
-        ├─ Generate UUID, SubID (14 random bytes → 28 hex)
-        ├─ Build subscription URL: GLOBAL_SUB_URL + SubID
-        │
-        ▼
-ensureSubscriptionNodes(ctx, sub)
-        │
-        ├─ Load active nodes for plan (GetNodesByPlanID)
-        ├─ Create pending_add records in subscription_nodes
-        ├─ Best-effort SyncSubscription (async, errors don't rollback)
+        ├─ Generate UUID, SubID and the public subscription token
+        ├─ Build subscription URL from GLOBAL_SUB_URL + token
         │
         ▼
 Database: CreateSubscription (transaction)
@@ -100,10 +93,9 @@ Notify admin: "New subscription: @username"
         │
         ▼
 Send message to user: subscription URL + QR code
+```
 
-Background sync (eventual consistency):
-    SyncSubscription → vpn.Client.CreateSubscription per node
-    pending_add → active on success, retry on failure
+There is no panel provisioning or sync step: access is the subscription row itself. The content is assembled on request (see "Subscription Proxy Flow").
 
 ### Data Flow: Trial Activation via Landing Page
 
@@ -120,10 +112,8 @@ GET /i/{code} Handler
         ▼ (passed)
 CreateTrialSubscription(ctx, inviteCode)
         │
-        ├─ XUI: AddClientWithID
-        │   • Email: "trial_{subID}"
-        │   • Traffic: 1 GB (hardcoded)
-        │   • Expiry: now + TRIAL_DURATION_HOURS
+        ├─ Resolve the trial plan and its Builder (admin trial settings)
+        │   • Expiry: now + trial duration
         │
         ▼
        Database: CreateTrialSubscription (отрицательный telegram_id до активации)
@@ -148,31 +138,31 @@ User clicks "Активировать" → opens Telegram bot, binds trial to ac
 User opens subscription link in client
         │
         ▼
-GET /sub/{subID}
+GET /sub/...
         │
-        ├─ Validate subID format (regex: ^[a-zA-Z0-9_-]+$)
+        ├─ Validate the identifier format
         ├─ Check cache (TTL 240s)
         │
         ├─ Cache hit? → verify subscription active in DB → serve cached
         └─ Cache miss → proceed
         │
         ▼
-GetWithPlanAndNodes(subID) — load subscription + plan + active nodes
+Load the subscription (status, plan, expiry); revoked / missing / expired → 404
         │
         ▼
-For each active node:
-  ├─ Build sourceURL:
-  │   • 3x-ui/proxman: subscription_url + "/" + subID
-  │   • fetch: subscription_url as-is
-  ├─ FetchFromNode(ctx, sourceURL) — HTTP GET
+ResolveSubscriptionBuilder: subscription override → plan default builder
+        │
+        ▼
+Fetch the builder's linked, enabled ProviderSources (best-effort per source):
+  ├─ FetchFromProviderSource(ctx, source) — HTTP GET with server-side headers
   ├─ DetectFormat (JSON / Clash / Base64 / Plain)
-  └─ Aggregate subscription-userinfo headers
+  └─ Collect subscription-userinfo headers
         │
         ▼
-Merge all sources:
+Apply the builder rules (country/node items, renames, ordering):
   • JSON configs → share links if mixed mode
   • Base64/Plain → decode and join
-  • Aggregate upload/download/expire across nodes
+  • No source reachable → ErrProviderSourceUnavailable (no fallback)
         │
         ▼
 Cache.Set(240s) → return body with Content-Type + Subscription-Userinfo
@@ -209,7 +199,7 @@ Cache.Set(240s) → return body with Content-Type + Subscription-Userinfo
 
 **Admin Features:**
 - `/del <id>` — delete subscription by ID
-- `/setplan <subscription_id> <plan_id> [days]` — change subscription plan through the service layer (subscription row + node reconciliation + best-effort VPN sync; free plan clears expiry, future expiry preserved when `days` omitted, else 30-day default)
+- `/setplan <subscription_id> <plan_id> [days]` — change subscription plan through the service layer (subscription row; free plan clears expiry, future expiry preserved when `days` omitted, else 30-day default)
 - `/broadcast` — asynchronous broadcast flow: name → draft → **filter selection** → **recipient count preview** → inline confirm. Confirmation queues a campaign; a durable worker snapshots the audience into `broadcasts.recipients_state`, sends in batches (100, concurrency 10), retries transient errors twice, recovers stale leases after restart, and stores final counters/report in `broadcasts`. The confirm step offers **send now** or **schedule** (day picker → hour picker, Moscow time). A scheduled campaign keeps `planned_at` (persisted, never overwritten) and stays `scheduled`; `GetRunnableBroadcasts` only returns it once `planned_at` is due, so it also survives restarts and can be canceled before launch.
 - `/broadcasts` — recent campaign history with details, cancellation of active campaigns, and retry of failed recipients. Anonymous trials are excluded; `expired` is not offered as a broadcast status, while `all` is explicit. Migration 036 creates `broadcasts` with recipient state, delivery classification, and retry metadata columns; no recipient table is created. `blocked` means Telegram explicitly reports that the user blocked the bot; deactivated or missing chats are `unreachable`. Details send one compact admin message, while complete ID lists remain in the persisted campaign report.
 
@@ -294,21 +284,17 @@ The admin can go back to adjust filters or confirm to start the broadcast.
 - 📊 Stats — bot statistics
 
 | **Infrastructure** |
-| - 3x-ui integration — Bearer token auth (no session/login/CSRF), client CRUD, RetryWithBackoff (3 retries, jitter), flow detection
-| - Multi-node subscription synchronization — `subscription_nodes` table with 4-state sync machine (active/pending_add/pending_remove/pending_update), per-subscription locking, retry with exponential backoff |
 | - Health endpoints — `/healthz` (503 when Down), `/readyz` (503 during init)
 | - Invite/trial landing — `/i/{code}` with IP rate limit (3/hour), cookie dedup (3h) |
 | - Per-user rate limiting — chatID token bucket (30 tokens, 5/sec refill, 10-min idle cleanup) |
-| - Subscription proxy — `GET /sub/{subID}` with multi-node aggregation, headers, 240s TTL cache, singleflight |
+| - Subscription proxy — `GET /sub/{subID}` with Builder-based aggregation of ProviderSources, headers, 240s TTL cache, singleflight |
 | - Daily backups — WAL checkpoint, atomic copy, 30 rotated backups by default |
 | - Sentry error tracking (+ traces), Zap structured JSON logging with rotation
 | - Order/Product tracking — payment lifecycle (pending/paid/expired/canceled) with 30-min payment window
 | - Docker: multi-stage build (UPX compression), non-root user, healthcheck, GHCR images
 | - CI/CD: GitHub Actions — golangci-lint, gosec, tests (race), Docker build/push
-| - Prometheus metrics — `/metrics` endpoint with HTTP, bot, XUI, DB, cache, subscription, and payment metrics |
-| - VPN client abstraction — `internal/vpn/` package with `Client` interface, `NewClient` factory routing by node type (3x-ui, proxman, fetch) |
+| - Prometheus metrics — `/metrics` endpoint with HTTP, bot, DB, cache, subscription, and payment metrics |
 | - Plans & pricing — `plans`, `products`, `orders` tables for subscription plan management and payment lifecycle |
-| - Orphan reconciliation — initial pass after 30s, then every 8h; orphaned subscriptions are revoked rather than deleted |
 | - Subscription expire worker — background worker handling subscription expiration |
 
 ### Test Coverage
@@ -320,7 +306,6 @@ The admin can go back to adjust filters or confirm to start the broadcast.
 | `internal/heartbeat` | **96.2%** | ✅ |
 | `internal/service` | **95.2%** | ✅ |
 | `internal/config` | **91.8%** | ✅ |
-| `internal/xui` | **90.9%** | ✅ |
 | `internal/web` | **90.3%** | ✅ |
 | `internal/bot` | **92.6%** | ✅ |
 | `internal/utils` | **90.0%** | ✅ |
@@ -338,22 +323,16 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 
 ## Critical Nuances
 
-### 3x-ui Integration
-- **API Token auth:** Bearer token via `Authorization` header (no session/login/CSRF/cookiejar)
-- **Node configuration:** Managed entirely via the `nodes` DB table (host, API token, inbound IDs, type, subscription URL). Multi-node support via `nodes` table.
-- **VPN client abstraction:** `internal/vpn/` package provides `Client` interface with `NewClient` factory routing by `NodeType` (3x-ui, proxman, fetch). Each node gets its own VPN client instance. Fetch nodes use no-op client — subscription_url fetched directly by subserver.
-- **Circuit breaker:** implementation is covered by tests but is not currently wired into the live XUI client path; production resilience currently relies on retry/backoff. Monitor the retry/error metrics.
-- **RetryWithBackoff:** 3 retries with exponential backoff + jitter. DNS errors fast-fail.
-- **Subscription defaults:** `reset: 30` (days from creation), `expiresAt: now + 30 days`
-- **Auto-reset:** Only works when `expiresAt` > 0. Traffic resets every 30 days, expiry extends (3x-ui auto-renew logic)
-- **Client email:** `trial_{subID}` for trial, `{username}` for regular
-- **Flow detection:** When creating/updating clients, fetches inbound config via `GET /panel/api/inbounds/get/{id}` to determine transport type. Flow is set based on transport: `tcp` → `"xtls-rprx-vision"`, `xhttp/h2/ws/grpc` → `""` (empty). Falls back to `"xtls-rprx-vision"` if inbound cannot be fetched.
-- **Multi-inbound:** Nodes store `inbound_ids` as a JSON array. Client creation iterates all inbounds for the node.
+### Subscription Content (Builders)
+- **No panel integration:** the bot never registers clients on a VPN panel; a subscription is a local row. The legacy node subsystem (3x-ui/proxman, `nodes`, the sync state machine, panel traffic accounting) was removed in migration `051_remove_legacy_nodes`.
+- **Builder resolution:** `ResolveSubscriptionBuilder` picks `subscriptions.subscription_builder_id`, otherwise the plan default (`plans.subscription_builder_id`); a disabled or dangling builder is skipped.
+- **Sources:** `provider_sources` hold URL, format and headers (server-side only). The stored catalogue (`provider_source_entries`) only enriches entries; live upstream data is authoritative.
+- **Resilience:** a failing source is skipped; if no source can be fetched the request fails with `ErrProviderSourceUnavailable`. Fetch errors never contain upstream URLs or credentials.
+- **Configuration:** ProviderSources, Builders and their rules are managed in the admin UI/API.
 
 ### Subscription Flow
 - **Trial:** `/i/{code}` → IP rate limit (3/hour) → DB trial record (negative telegram_id) → user clicks link in Telegram → `BindTrialSubscription` sets telegram_id (из отрицательного в реальный), sets referred_by if from invite
-- **Regular:** `create_subscription` callback → VPN client provisioning (per-node) → `subscription_nodes` records created as `pending_add` → DB record → cache invalidate → admin notify
-- **Sync pipeline:** Background `SyncPendingNodes` worker processes `pending_add`/`pending_remove`/`pending_update` states with per-subscription locking and exponential backoff retry
+- **Regular:** `create_subscription` callback → DB record (`SubscriptionService.Create`) → cache invalidate → admin notify (no external provisioning)
 - **Trial cookie:** `rs8kvn_trial_{code}` prevents duplication for 3 hours (HttpOnly, Secure, SameSite=Strict)
 - **Atomic cleanup:** `DELETE ... RETURNING` for expired trials (prevent race with bind)
 - **Share referral:** `pendingInvites[chatID]` cached 60 min (in-memory, periodic cleanup prevents leak)
@@ -361,7 +340,7 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 
 ### Payments (Platega)
 - **Entry point:** `POST /payment/callback` — guard chain 405/503/401/400/200; body 256 KiB, `UseNumber`, single JSON document.
-- **Confirm:** `CONFIRMED` → `OrderService.ConfirmPayment` — atomic CAS `pending → paid` + subscription update + plan reconciliation in one DB transaction (`ConfirmOrderPaidCAS` with `ApplyPlanInTxFn`). Post-commit `SyncSubscription` is best-effort (≤20 s timeout, background worker retries).
+- **Confirm:** `CONFIRMED` → `OrderService.ConfirmPayment` — atomic CAS `pending → paid` + subscription update + plan update in one DB transaction (`ConfirmOrderPaidCAS`). There is no external sync step after commit.
 - **Admin alerts (best-effort Markdown, `TelegramAdminID`):** on activation (`Activated=true`, only the pending→paid caller) `notifyAdminPaid` — tariff, formatted amount, clickable buyer link (`utils.FormatUserLink`), `🆕 Покупка` vs `🔄 Продление` (from `PricePaidCents`/`ProductID` captured before CAS); on paid-order chargeback (`WasPaid=true`) `notifyAdminChargeback` — single alert with tariff, amount, buyer link and access status (downgraded to free / preserved). Every integration problem (mismatch, late/unknown callback, provider error, DB failure) → `NotifyPaymentIssue` → `notifyAdmin` + `payment_issues_total{event}`. Duplicate callbacks are silent.
 - **Late confirmed payment:** `CONFIRMED` for an `expired`/`canceled` order never activates it — money flagged for manual review (refund or manual activation), admin alerted (`late_confirmed_callback`). Race documented in `doc/platega-T3.md` §5.4.
 - **Chargeback:** `CHARGEBACKED` on a paid order auto-downgrades the subscription to the free plan unless another paid order exists (access preserved for manual review).
@@ -369,13 +348,13 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 - **Metrics:** `payment_operations_total{operation,result}`, `payment_operation_duration_seconds`, `payment_amounts_cents_total{operation,currency}` (confirmed/chargeback), `payment_issues_total{event}`.
 
 ### Subscription Deletion
-- **Order:** Mark as revoked → best-effort deprovision VPN access → physical deletion of DB row
-- **Rationale:** Subscription is immediately inaccessible after revoked status is set. VPN deprovisioning is best-effort (background sync retries on failure). Physical deletion happens last. See AGENTS.md for detailed flow description.
+- **Order:** mark as revoked (journaled) → physical deletion of the DB row → cache invalidation (no external deprovisioning)
+- **Rationale:** the subscription is inaccessible (`/sub` answers 404) as soon as the revoked status is set; physical deletion happens last. There is no VPN deprovisioning. See AGENTS.md for the flow description.
 - **Referral cache:** `DecrementReferralCount` called after successful deletion.
 
 ### Subscription Proxy
 - **Endpoint:** `GET /sub/{subID}` — subID = SubscriptionID from DB (14 random bytes → 28 hex chars)
-- **Config:** Subserver агрегирует ответы активных нод как-is; отдельный extra-servers файл не используется.
+- **Config:** the subserver serves the content assembled by the resolved Builder from ProviderSources; no extra-servers file is used.
 - **Cache:** 240s TTL hardcoded (`config.SubServerCacheTTL`)
 - **Singleflight:** First request fetches, others wait and get same result (prevents thundering herd) — загрузка внешнего конфиг-файла не выполняется (фича удалена)
 - **Content-Length:** Removed after merge (body size changes, Go uses chunked encoding)
@@ -390,15 +369,14 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 
 ### Database
 - **Engine:** SQLite (mattn/go-sqlite3, WAL mode)
-- **Soft deletes:** Отсутствуют — при удалении подписка сначала помечается `status='revoked'`, затем выполняется best-effort депровизионирование VPN-доступа, и только потом происходит физическое удаление строки из БД (см. AGENTS.md: Delete flow).
+- **Soft deletes:** none. On deletion the subscription is first marked revoked, then the row is physically deleted (see AGENTS.md: Delete flow).
 - **Trial subscriptions:** `telegram_id < 0` (negative value) until activated via `/start trial_{subID}`
 - **Migrations:** Auto-applied on startup from `internal/database/migrations/` (embedded via `go:embed`)
 - **Legacy support:** Auto-migration for pre-embedded databases (adds `subscription_id` column, drops `x_ui_host`)
 - **trial_requests cleanup:** 1-hour cutoff (matching rate-limit window) + 1s buffer to avoid boundary race
 - **Connection pool:** `MaxOpenConns=1` (SQLite single-writer), `MaxIdle=1`, `ConnMaxLifetime=5m`
 - **Orders:** `orders` table tracks payment lifecycle: pending → paid → expired/canceled. Statuses enforced via CHECK constraint (created with the table, migration 017 — effective, unlike the ALTER-based retry CHECK from 025). Payment window is provider-defined by Platega `expiresIn` and stored as absolute `payment_expires_at`; a new `RequestPayment` after that timestamp terminalizes the pending order as `expired`, while a late `CONFIRMED` for an `expired`/`canceled` order never activates it and is handled as manual review.
-- **Nodes:** `nodes` table stores VPN panel sources (host, api_token, inbound_ids, type, subscription_url). Managed via DB only.
-- **Plans:** `plans` table (name, devices_limit, traffic_limit), `plan_nodes` M2M join, `products` (duration, price), `subscription_nodes` (sync state machine: active/pending_add/pending_remove/pending_update)
+- **Plans:** `plans` table (name, default builder reference) and `products` (duration, price). Builders and ProviderSources live in the `subscription_builders*` and `provider_sources*` tables.
 - **Devices tracking:** `subscriptions.devices` column stores JSON array of client request header maps (HWID, Device-OS, etc.). `ips` column stores IP→timestamp entries. `last_request` column (*time, indexed) records the last time a client fetched its subscription via `/sub/{id}` (best-effort, updated on both cache hit and cache miss).
 
 ### Configuration
@@ -408,7 +386,7 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
   - `SENTRY_DSN`, `HEARTBEAT_URL` — must be valid URLs with http/https scheme
   - `SITE_URL` — must be valid URL
 - **Web server:** Runs on `WEB_SERVER_PORT` (default 8880), bound to all interfaces
-- **Init failure:** Fatal exit for DB, XUI, and Bot API init errors (cannot operate without them)
+- **Init failure:** Fatal exit for DB and Bot API init errors (cannot operate without them)
 - **SUBSERVER_ACCESS_LOG:** Optional path for `/sub/{id}` access logging (space-separated format with upstream fetch stats)
 
 ### Rate Limiting
@@ -429,7 +407,6 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 - **HTTP timeouts:** ReadHeaderTimeout 5s, ReadTimeout 10s, WriteTimeout 30s, IdleTimeout 60s
 - **Port binding:** Verified before goroutine launch — `net.Listen()` then `Serve()` in separate goroutine
 - **Non-root Docker:** UID 1000, `no-new-privileges:true`
-- **RetryWithBackoff:** 3 retries with exponential backoff + jitter; DNS errors fast-fail
 
 
 ### Health Checks

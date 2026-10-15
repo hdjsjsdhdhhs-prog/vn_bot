@@ -23,10 +23,7 @@ func TestSubscriptionProviderSource_LegacySubscriptionRemainsUnlinked(t *testing
 	require.NoError(t, err)
 	assert.Nil(t, stored.ProviderSourceID)
 	assert.Nil(t, stored.ProviderSource)
-
-	legacy, err := svc.GetWithPlanAndNodes(ctx, sub.SubscriptionID)
-	require.NoError(t, err)
-	assert.Equal(t, sub.ID, legacy.Subscription.ID)
+	assert.Equal(t, sub.ID, stored.ID)
 }
 
 func TestSubscriptionProviderSource_CreateAndLoadAssociation(t *testing.T) {

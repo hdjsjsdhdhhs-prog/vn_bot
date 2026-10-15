@@ -43,7 +43,7 @@ func TestConfirmPayment_SameOrderParallelCallbacksActivateOnlyOnce(t *testing.T)
 		},
 		GetProductByIDFunc: func(context.Context, uint) (*database.Product, error) { return product, nil },
 		GetByIDFunc:        func(context.Context, uint) (*database.Subscription, error) { return sub, nil },
-		ConfirmOrderPaidCASFunc: func(_ context.Context, orderID uint, _, _ time.Time, _ *database.Subscription, _ *database.Product, _ database.ApplyPlanInTxFn, _ int64) (bool, error) {
+		ConfirmOrderPaidCASFunc: func(_ context.Context, orderID uint, _, _ time.Time, _ *database.Subscription, _ *database.Product, _ int64) (bool, error) {
 			count := casCalls.Add(1)
 			if count == 1 {
 				firstStartedOnce.Do(func() { close(firstStarted) })
@@ -59,11 +59,8 @@ func TestConfirmPayment_SameOrderParallelCallbacksActivateOnlyOnce(t *testing.T)
 
 			return false, nil
 		},
-		GetPendingBySubscriptionIDFunc: func(context.Context, uint) ([]database.SubscriptionNode, error) {
-			return nil, nil
-		},
 	}
-	o := NewOrderService(mock, nil, NewSyncService(mock, nil, nil), fakePaymentProvider{}, "", &config.Config{})
+	o := NewOrderService(mock, nil, fakePaymentProvider{}, "", &config.Config{})
 
 	const workers = 4
 
@@ -176,7 +173,7 @@ func TestConfirmPayment_DifferentOrdersRunInParallel(t *testing.T) {
 
 			return sub, nil
 		},
-		ConfirmOrderPaidCASFunc: func(_ context.Context, orderID uint, _, _ time.Time, _ *database.Subscription, _ *database.Product, _ database.ApplyPlanInTxFn, _ int64) (bool, error) {
+		ConfirmOrderPaidCASFunc: func(_ context.Context, orderID uint, _, _ time.Time, _ *database.Subscription, _ *database.Product, _ int64) (bool, error) {
 			casCalls.Add(1)
 
 			if orderID == order1.ID {
@@ -199,11 +196,8 @@ func TestConfirmPayment_DifferentOrdersRunInParallel(t *testing.T) {
 
 			return false, nil
 		},
-		GetPendingBySubscriptionIDFunc: func(context.Context, uint) ([]database.SubscriptionNode, error) {
-			return nil, nil
-		},
 	}
-	o := NewOrderService(mock, nil, NewSyncService(mock, nil, nil), fakePaymentProvider{}, "", &config.Config{})
+	o := NewOrderService(mock, nil, fakePaymentProvider{}, "", &config.Config{})
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -276,7 +270,7 @@ func TestCancelPaymentByProvider_DifferentOrdersRunInParallel(t *testing.T) {
 
 			return o, nil
 		},
-		CancelPaidOrderAndDowngradeCASFunc: func(_ context.Context, _ string, id uuid.UUID, _ time.Time, _ uint, _ database.ChargebackPlanInTxFn) (*database.ChargebackResult, error) {
+		CancelPaidOrderAndDowngradeCASFunc: func(_ context.Context, _ string, id uuid.UUID, _ time.Time, _ uint) (*database.ChargebackResult, error) {
 			o := orders[id]
 			if id == firstID {
 				startOnce1.Do(func() { close(started1) })
@@ -301,7 +295,7 @@ func TestCancelPaymentByProvider_DifferentOrdersRunInParallel(t *testing.T) {
 			return nil, nil
 		},
 	}
-	o := NewOrderService(mock, nil, NewSyncService(mock, nil, nil), fakePaymentProvider{}, "", nil)
+	o := NewOrderService(mock, nil, fakePaymentProvider{}, "", nil)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -390,7 +384,7 @@ func TestRequestPayment_ConcurrentCallersSingleProviderTransaction(t *testing.T)
 			return sub, nil
 		},
 		GetPlanByIDFunc: func(context.Context, uint) (*database.Plan, error) {
-			return &database.Plan{ID: 2, IsActive: true}, nil
+			return &database.Plan{ID: 2, IsActive: true, SubscriptionBuilderID: sellableBuilderID()}, nil
 		},
 		FindPendingPaymentOrderFunc: func(_ context.Context, subID, productID uint, _ time.Time) (*database.Order, error) {
 			return &database.Order{
@@ -423,7 +417,7 @@ func TestRequestPayment_ConcurrentCallersSingleProviderTransaction(t *testing.T)
 			}, nil
 		},
 	}
-	o := NewOrderService(mock, nil, nil, provider, "", &config.Config{})
+	o := NewOrderService(mock, nil, provider, "", &config.Config{})
 
 	const workers = 6
 
@@ -507,7 +501,7 @@ func TestCancelPaymentByProvider_SameOrderParallelChargebacksTransitionOnce(t *t
 		GetByIDFunc: func(context.Context, uint) (*database.Subscription, error) {
 			return sub, nil
 		},
-		CancelPaidOrderAndDowngradeCASFunc: func(_ context.Context, _ string, _ uuid.UUID, _ time.Time, freePlanID uint, _ database.ChargebackPlanInTxFn) (*database.ChargebackResult, error) {
+		CancelPaidOrderAndDowngradeCASFunc: func(_ context.Context, _ string, _ uuid.UUID, _ time.Time, freePlanID uint) (*database.ChargebackResult, error) {
 			n := lockCASCalls.Add(1)
 			if n == 1 {
 				close(started)
@@ -529,12 +523,9 @@ func TestCancelPaymentByProvider_SameOrderParallelChargebacksTransitionOnce(t *t
 			// before this CAS acquired its subscription lock.
 			return &database.ChargebackResult{Order: order, WasPaid: false, Transitioned: false, Downgraded: false}, nil
 		},
-		GetNodesByPlanIDFunc: func(context.Context, uint) ([]database.Node, error) {
-			return nil, nil
-		},
 	}
 	adminBot := testutil.NewBotAPI()
-	o := NewOrderService(mock, nil, NewSyncService(mock, nil, nil), fakePaymentProvider{}, "", &config.Config{TelegramAdminID: 999})
+	o := NewOrderService(mock, nil, fakePaymentProvider{}, "", &config.Config{TelegramAdminID: 999})
 	o.SetAdminBot(adminBot)
 
 	const workers = 4
@@ -639,7 +630,7 @@ func TestCancelPaymentByProvider_SameOrderParallelPendingCancelsIdempotent(t *te
 		},
 	}
 	adminBot := testutil.NewBotAPI()
-	o := NewOrderService(mock, nil, nil, fakePaymentProvider{}, "", &config.Config{TelegramAdminID: 999})
+	o := NewOrderService(mock, nil, fakePaymentProvider{}, "", &config.Config{TelegramAdminID: 999})
 	o.SetAdminBot(adminBot)
 
 	const workers = 4

@@ -36,24 +36,6 @@ func TestOrder_StatusUsesOrderStatusType(t *testing.T) {
 	assert.Equal(t, "database.OrderStatus", statusField.Type.String())
 }
 
-func TestNode_TypeUsesNodeType(t *testing.T) {
-	t.Parallel()
-
-	nodeType := reflect.TypeFor[Node]()
-	typeField, ok := nodeType.FieldByName("Type")
-	require.True(t, ok)
-	assert.Equal(t, "database.NodeType", typeField.Type.String())
-}
-
-func TestSubscriptionNode_StatusUsesSyncStatus(t *testing.T) {
-	t.Parallel()
-
-	subscriptionNodeType := reflect.TypeFor[SubscriptionNode]()
-	statusField, ok := subscriptionNodeType.FieldByName("Status")
-	require.True(t, ok)
-	assert.Equal(t, "database.SyncStatus", statusField.Type.String())
-}
-
 func TestSubscription_IsExpired(t *testing.T) {
 	t.Parallel()
 
@@ -1280,14 +1262,17 @@ func TestService_CleanupExpiredTrials(t *testing.T) {
 	// Create old trial request
 	oldRequest := &TrialRequest{
 		IP:        "10.0.0.1",
-		CreatedAt: time.Now().Add(-48 * time.Hour),
+		CreatedAt: time.Now().UTC().Add(-48 * time.Hour),
 	}
 	require.NoError(t, svc.db.Create(oldRequest).Error)
 
-	// Create recent trial request (30 min ago — within the 1-hour rate limit window)
+	// Create recent trial request (30 min ago — within the 1-hour rate limit window).
+	// Explicit timestamps are UTC like every production write (GORM NowFunc):
+	// SQLite compares the stored text, so a local-zone value would be
+	// mis-ordered against the UTC cutoff on hosts west of UTC.
 	recentRequest := &TrialRequest{
 		IP:        "10.0.0.2",
-		CreatedAt: time.Now().Add(-30 * time.Minute),
+		CreatedAt: time.Now().UTC().Add(-30 * time.Minute),
 	}
 	require.NoError(t, svc.db.Create(recentRequest).Error)
 

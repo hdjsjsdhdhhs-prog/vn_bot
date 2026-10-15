@@ -10,7 +10,6 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/logger"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/testutil"
-	"github.com/kereal/rs8kvn_bot/internal/vpn"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,7 +26,7 @@ func newTestSubService(t testing.TB, db *database.Service) *service.Subscription
 		TrialDurationHours: 1,
 	}
 
-	return service.NewSubscriptionService(db, nil, nil, nil, cfg)
+	return service.NewSubscriptionService(db, cfg)
 }
 
 func TestTrialCleanupScheduler_New(t *testing.T) {
@@ -111,7 +110,7 @@ func TestTrialCleanupScheduler_RunCleanup_WithExpiredTrials(t *testing.T) {
 	}
 }
 
-func TestTrialCleanupScheduler_RunCleanup_XUIFailure(t *testing.T) {
+func TestTrialCleanupScheduler_RunCleanup_TrialWithoutExpiry(t *testing.T) {
 	t.Parallel()
 
 	db, err := testutil.NewTestDatabaseService(t)
@@ -121,8 +120,8 @@ func TestTrialCleanupScheduler_RunCleanup_XUIFailure(t *testing.T) {
 
 	expiredSub := &database.Subscription{
 		TelegramID:     -2001,
-		ClientID:       "client-xui-fail",
-		SubscriptionID: "sub-xui-fail",
+		ClientID:       "client-no-expiry",
+		SubscriptionID: "sub-no-expiry",
 		PlanID:         1,
 		Status:         "active",
 		CreatedAt:      time.Now().Add(-2 * time.Hour),
@@ -138,40 +137,6 @@ func TestTrialCleanupScheduler_RunCleanup_XUIFailure(t *testing.T) {
 	remaining, err := db.GetAllSubscriptions(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, remaining)
-}
-
-func TestTrialCleanupScheduler_FallbackDeprovisionEvenWithSyncService(t *testing.T) {
-	t.Parallel()
-
-	// database.CleanupExpiredTrials returns only id/client_id/subscription_id
-	// (RETURNING), so sub.Status is empty and the sync branch inside
-	// SubscriptionService.CleanupExpiredTrials is unreachable: expired trial
-	// clients must still be deprovisioned via the direct fallback even when a
-	// sync service is wired (the wiring in main.go must not break this).
-	db := &testutil.DatabaseService{
-		CleanupExpiredTrialsFunc: func(context.Context, int) ([]database.Subscription, error) {
-			return []database.Subscription{
-				{ID: 1, ClientID: "c1", SubscriptionID: "exp1"},
-				{ID: 2, ClientID: "c2", SubscriptionID: "exp2"},
-			}, nil
-		},
-	}
-	mockVPN := &mockVPNClientForExpire{}
-	vpnClients := map[uint]vpn.Client{1: mockVPN}
-	nodes := []database.Node{{ID: 1, IsActive: true, Host: "http://node"}}
-
-	subService := service.NewSubscriptionService(db, nil, vpnClients, nodes, &config.Config{TrialDurationHours: 24})
-	subService.SetSyncService(service.NewSyncService(db, nil, nodes))
-	scheduler := NewTrialCleanupScheduler(subService)
-
-	scheduler.runCleanup(context.Background())
-
-	assert.True(t, mockVPN.deleteCalled, "expired trial clients must be deprovisioned via the direct fallback")
-	require.Len(t, mockVPN.deleteProvisions, 2, "both expired trial clients must be deleted")
-	assert.Equal(t, "exp1", mockVPN.deleteProvisions[0].SubID)
-	assert.Equal(t, "c1", mockVPN.deleteProvisions[0].ClientID)
-	assert.Equal(t, "exp2", mockVPN.deleteProvisions[1].SubID)
-	assert.Equal(t, "c2", mockVPN.deleteProvisions[1].ClientID)
 }
 
 func TestTrialCleanupScheduler_Start_ContextCancel(t *testing.T) {

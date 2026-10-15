@@ -207,7 +207,7 @@ func isPrintableProfileTitle(value string) bool {
 // ApplyProfileTitleSuffix appends suffix to the profile-title entry of a header
 // map in place and returns the map. It is a no-op when the header is absent or
 // the suffix is empty. The key lookup is case-insensitive because upstream
-// headers arrive lowercased (FetchFromNode) while ResponseHeaders canonicalizes
+// headers arrive lowercased (FetchFromProviderSource) while ResponseHeaders canonicalizes
 // keys to Title-Case via http.Header.
 func ApplyProfileTitleSuffix(headers map[string]string, suffix string) map[string]string {
 	if headers == nil || suffix == "" {

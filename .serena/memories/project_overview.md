@@ -1,8 +1,10 @@
+> **Внимание:** записи ниже о панелях 3x-ui/proxman, узлах (`nodes`, `subscription_nodes`), синхронизации, `internal/vpn`, `internal/xui` и панельных уведомлениях трафика — **исторические**: подсистема удалена миграцией `051_remove_legacy_nodes`. Актуальная модель: подписка — локальное состояние, содержимое `/sub` собирает Subscription Builder из ProviderSource (см. `doc/architecture.md`).
+
 # rs8kvn_bot — Telegram Bot для раздачи VLESS-подписок
 
 ## Назначение
-Telegram-бот для продажи и управления VLESS+Reality+Vision подписками через панели 3x-ui.
-Production-grade: миграции, мониторинг, rate-limiting, circuit breaker, graceful shutdown.
+Telegram-бот для продажи и управления VLESS+Reality+Vision подписками. Подписка — локальное состояние; содержимое `/sub` собирает Subscription Builder из каталогов ProviderSource (клиентов на панелях 3x-ui/proxman больше нет).
+Production-grade: миграции, мониторинг, rate-limiting, graceful shutdown.
 
 ## Subscription expiry reminders
 - Окна: 3 дня, 1 день, 3 часа до истечения подписки (`internal/service/subscription_reminders.go`)
@@ -18,19 +20,8 @@ Production-grade: миграции, мониторинг, rate-limiting, circuit
 - Paid-подписки автоматически помечаются `expired`, если истёк `expires_at` и план не free/trial (`GetExpiredPaidSubscriptions`).
 - Таймер истечения хранится в БД на момент Create.
 
-## Subscription traffic notifications
-- Только тарифы с ненулевым лимитом (`traffic_limit > 0`); Premium безлимит — не участвует.
-- Фоновая задача: `SubscriptionTrafficWorker` выполняет первый проход сразу после старта приложения, затем работает раз в 60 минут, вызывает `SubscriptionService.ProcessTrafficNotifications` для каждой подписки с лимитом (`GetActiveSubscriptionsWithTrafficLimit`).
-- Три сценария используют битовую маску `subscriptions.traffic_reminders_sent` и атомарные `ClaimTrafficReminder`/`ReleaseTrafficReminder`; уведомление 90% может повториться после освобождения `TrafficBit90` при снижении использования ниже 90%:
-  1. **90%** — клиент включён, использовано ≥90%: «Осталось меньше 10% трафика» + кнопка `💎 Перейти на Premium` (`buy_premium_list`).
-  2. **Исчерпан** — использовано 100%, панель отключила клиента: «Доступ приостановлен» (трафик исчерпан и VPN отключён) + кнопка Premium; клиент **не включается обратно** — предлагается покупка.
-  3. **Сброшен + включён** — счёт сброшен (`used < limit`), клиент ещё выключен, и установлен `TrafficBitExhausted`: воркер **включает** клиента (`UpdateClient(Enable=true)`) и шлёт простое «приходи пользоваться» без продажи.
-- При ошибке Telegram claim освобождается для повтора; per-node сбои — best-effort (`Warn`).
-- В `UpdateClient` добавлен `Enable *bool` (xui), `GetClientTraffic` отдаёт `Enable`.
-- Метрики: `TrafficNotificationsTotal{kind,result}`, `TrafficNotificationRunsTotal`.
-- Миграция 038: `subscriptions.traffic_reminders_sent` (битовая маска 90%/исчерпан/сброс).
-- Жизненный цикл: `SubscriptionTrafficWorker` в `cmd/bot/main.go` (startBackgroundWorkers).
-- Ограничение: работает для клиентов, которых панель **выключила, но оставила в списке**; реально удалённых из core не находит (`ErrClientNotFound` — пропускает).
+## Subscription traffic notifications — удалено (историческая справка)
+Воркер панельных уведомлений трафика (`SubscriptionTrafficWorker`, `ProcessTrafficNotifications`, `subscriptions.traffic_reminders_sent`, `plans.traffic_limit`) удалён миграцией 051 вместе с подсистемой VPN-узлов. Детали старой реализации: `fixes/2026-08-27-subscription-traffic-worker` (историческая запись).
 
 ## Типы подписок и фильтр планов
 - Trial-подписки теперь **не** считаются paid при автоматическом истечении и не получают напоминания: `GetExpiredPaidSubscriptions` и `GetSubscriptionsExpiringInRange` исключают `plans.name = TrialPlanName`.
@@ -38,16 +29,12 @@ Production-grade: миграции, мониторинг, rate-limiting, circuit
 ## Ключевые фичи
 - Планы (trial/free/paid) без `duration`, без `price` (duration/price вынесены в products)
 - `subscriptions.client_id` и `subscriptions.subscription_id` имеют `NOT NULL UNIQUE` enforcement через migration 023 и GORM-модель
-- Мульти-источник 3x-ui: trial-подписки создаются на всех trial-нодах, BindTrial — первый успешный, Reconcile — все
-- Таблица `subscription_nodes` — очередь реальной синхронизации подписки×нода (`active|pending_add|pending_remove|pending_update`)
-- SyncService с state machine, retry logic (exponential backoff), per-subscription locking
-- VPN Client abstraction (`internal/vpn`) — поддержка 3x-ui и proxman нод
-- Авто-продление free-подписок через совместимый с 3x-ui v3.7.0 rolling-профиль: `reset=30`, `resetDay=0`, `resetMax=0`, `trafficReset=monthly`, `trafficResetDay=1`; trial использует `reset=0`
+- Subscription Builder + ProviderSource: содержимое `/sub` собирается из каталогов источников; панельной провизии, очереди синхронизации и fallback через `nodes` нет (миграция 051)
 - Реферальная система: in-memory cache + периодический sync
 - Админ-уведомления, heartbeat, health endpoints (`/healthz`, `/readyz`)
 - Hysteria2/Clash port-hopping нормализация: `firstPortFromPorts` берёт первый конкретный порт из `ports`/диапазона
 - Ротация логов (zap), ежедневные бэкапы БД (имя `rs8kvn.db.backup.YYYYMMDD_HHMMSS`)
-- Sentry, rate-limiting per-user, circuit breaker для x-ui
+- Sentry, rate-limiting per-user
 - O(1) LRU кэш подписок (RLock для concurrent reads)
 - Subscription status check в `/sub/{subID}` — revoked/expired → 404
 - Subscription expiration хранится в БД на момент Create
@@ -119,27 +106,25 @@ Production-grade: миграции, мониторинг, rate-limiting, circuit
 - Транспортная нормализация сведена в `normaliseTransportNetwork` + `setPacketEncoding`.
 
 ## Scheduler
-- Backup ежедневно, trial cleanup сразу при старте и затем каждые 3 часа, sync workers фоном, reminders — каждые 30 минут (`SubscriptionReminderWorker`).
+- Backup ежедневно, trial cleanup сразу при старте и затем каждые 3 часа, expire — каждый час, reminders — каждые 30 минут (`SubscriptionReminderWorker`), provider fee — каждые 5 минут, warm-up — каждые 10 минут.
 
 ## Базовый worker set
-- Backup ежедневно, trial cleanup каждые 3 часа, sync workers фоном, reminders — каждые 30 минут, subscription traffic — каждые 60 минут.
+- Backup ежедневно, trial cleanup каждые 3 часа, expire — каждый час, reminders — каждые 30 минут, provider fee — каждые 5 минут, warm-up — каждые 10 минут.
 
 ## Структура
 ```text
 cmd/bot/                     — точка входа, graceful shutdown, lifecycle workers
 internal/bot/                — handlers, commands, callbacks, referral cache, keyboard/menu
 internal/database/           — GORM-модели, embedded migrations, транзакции
-internal/service/            — SubscriptionService + SyncService + reminders
-internal/vpn/                — VPN client abstraction (3x-ui, proxman, fetch)
-internal/xui/                — 3x-ui HTTP-клиент + circuit breaker
-internal/interfaces/         — контракты (XUIClient, SubscriptionRepository, reminder repr.)
+internal/service/            — SubscriptionService + OrderService + reminders + builders
+internal/interfaces/         — контракты (SubscriptionRepository, reminder repr.)
 internal/testutil/           — моки (db slice fakes, testutil helpers)
 internal/utils/              — time, UUID, QR, Markdown EscapeMarkdownV2/EscapeMarkdown
 internal/config/             — загрузка, валидация
 internal/logger/             — zap setup
 internal/heartbeat/          — мониторинг
 internal/backup/             — ежедневные бэкапы БД с WAL checkpoint
-internal/scheduler/          — backup + trial cleanup + subscription sync + expiry reminders
+internal/scheduler/          — backup + trial cleanup + expiry reminders
 internal/ratelimiter/        — per-user token bucket
 internal/web/                — /healthz, /readyz, /i/{code}, /sub/{subID}, /metrics, /payment/callback, ... + singleflight
 internal/subserver/           — кэш + merge подписок; Clash/Mihomo нормализация share-ссылок; optional access log
@@ -150,8 +135,8 @@ internal/metrics/            — Prometheus/обёртка; напоминани
 При старте сессии **обязательно**:
 1. `activate_project("rs8kvn_bot")`
 2. Прочитать памяти: `project_overview` (этот), `git-workflow`, `architecture`, `code_style`
-3. При работе с x-ui API — прочитать `xui/auth-mechanism` + `xui/client-crud`
-4. При работе с reminders/subscriptions/subscription-nodes — `architecture`, `subscription-nodes/state-machine`, `fixes/2026-07-...`; при работе с traffic-уведомлениями — `fixes/2026-08-27-subscription-traffic-worker`
+3. Папки `xui/*`, `vpn/*`, `subscription-nodes/*` — исторические (подсистема удалена миграцией 051), для текущей работы не нужны
+4. При работе с reminders/subscriptions — `architecture`; фиксы — `fixes/*` (исторические)
 5. **Отвечать на русском** (AGENTS.md)
 6. **Не удалять** legacy-код без явного запроса
 
@@ -166,5 +151,5 @@ internal/metrics/            — Prometheus/обёртка; напоминани
 - Исторические фиксы: см. `fixes/*`
 - Рассылки (кратко): см. `doc/broadcast.md`
 - Traffic-уведомления: см. `fixes/2026-08-27-subscription-traffic-worker`
-- x-ui протокол: см. `xui/*`
-- Subscription Nodes: см. `subscription-nodes/state-machine` + `subscription-nodes/orders-table`
+- x-ui протокол (историческая справка, подсистема удалена): см. `xui/*`
+- Subscription Nodes (историческая справка, подсистема удалена): см. `subscription-nodes/*`

@@ -1,3 +1,5 @@
+> **ИСТОРИЧЕСКАЯ ЗАПИСЬ — описываемая подсистема удалена** (миграция `051_remove_legacy_nodes`: панели 3x-ui/proxman, узлы, синхронизация, панельный учёт трафика). Файл сохранён как история решений и не описывает текущий код.
+
 # Subscription Nodes — фактическое состояние синхронизации подписки с VPN-нодами
 
 **Status:** IMPLEMENTED (migration 018 + 027, `internal/service/sync.go` + `internal/database/subscription_nodes.go`)

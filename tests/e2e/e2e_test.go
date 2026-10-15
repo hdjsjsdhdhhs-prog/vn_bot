@@ -11,11 +11,9 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/bot"
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/logger"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/testutil"
-	"github.com/kereal/rs8kvn_bot/internal/vpn"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/stretchr/testify/require"
@@ -58,22 +56,30 @@ func createE2ESub(t *testing.T, db *database.Service, sub *database.Subscription
 	require.NoError(t, db.CreateSubscription(ctx, sub, ""))
 }
 
-func e2eNodes(host string) []database.Node {
-	return []database.Node{{ID: 1, Name: "main", IsActive: true, Host: host, APIToken: "test-api-token", Type: database.NodeType3xUI, InboundIDs: "[1]"}}
+// createE2ESellablePlan stores an active paid plan served by an enabled
+// subscription builder: a plan without a builder is not sold.
+func createE2ESellablePlan(t *testing.T, db *database.Service, name string) *database.Plan {
+	t.Helper()
+
+	builder := &database.SubscriptionBuilder{Name: name + "-builder", Enabled: true}
+	require.NoError(t, db.GetDB().Create(builder).Error)
+
+	plan := &database.Plan{Name: name, IsActive: true, SubscriptionBuilderID: &builder.ID}
+	require.NoError(t, db.GetDB().Create(plan).Error)
+
+	return plan
 }
 
 type e2eTestEnv struct {
-	t           *testing.T
-	db          *database.Service
-	xui         *testutil.XUIClient
-	botAPI      *testutil.BotAPI
-	handler     *bot.Handler
-	cfg         *config.Config
-	botConfig   *bot.BotConfig
-	chatID      int64
-	username    string
-	subService  *service.SubscriptionService
-	syncService *service.SyncService
+	t          *testing.T
+	db         *database.Service
+	botAPI     *testutil.BotAPI
+	handler    *bot.Handler
+	cfg        *config.Config
+	botConfig  *bot.BotConfig
+	chatID     int64
+	username   string
+	subService *service.SubscriptionService
 }
 
 // waitForServerReady polls the server's /healthz endpoint until it responds
@@ -117,7 +123,6 @@ func setupE2EEnv(t *testing.T) *e2eTestEnv {
 		PaymentEnabled:   true,
 	}
 
-	mockXUI := testutil.NewXUIClient()
 	mockBotAPI := testutil.NewBotAPI()
 
 	botCfg := &bot.BotConfig{
@@ -127,32 +132,19 @@ func setupE2EEnv(t *testing.T) *e2eTestEnv {
 		IsBot:     true,
 	}
 
-	ctx := context.Background()
-	node := &database.Node{Name: "main", IsActive: true, Host: "https://panel.example.com", APIToken: "test-api-token", Type: database.NodeType3xUI, InboundIDs: "[1]"}
-	require.NoError(t, db.CreateNode(ctx, node), "create test node")
-	require.NoError(t, db.LinkNodeToPlan(ctx, "trial", node.ID), "link node to trial plan")
-	require.NoError(t, db.LinkNodeToPlan(ctx, "free", node.ID), "link node to free plan")
-
-	xuiClients := map[uint]interfaces.XUIClient{1: mockXUI}
-	nodes := e2eNodes("https://panel.example.com")
-	vpnClients := e2eVPNClients(xuiClients)
-	syncService := service.NewSyncService(db, vpnClients, nodes)
-	subService := service.NewSubscriptionService(db, xuiClients, vpnClients, nodes, cfg)
-	subService.SetSyncService(syncService)
+	subService := service.NewSubscriptionService(db, cfg)
 	handler := bot.NewHandler(mockBotAPI, cfg, db, botCfg, subService, "")
 
 	return &e2eTestEnv{
-		t:           t,
-		db:          db,
-		xui:         mockXUI,
-		botAPI:      mockBotAPI,
-		handler:     handler,
-		cfg:         cfg,
-		botConfig:   botCfg,
-		chatID:      987654321,
-		username:    "testuser",
-		subService:  subService,
-		syncService: syncService,
+		t:          t,
+		db:         db,
+		botAPI:     mockBotAPI,
+		handler:    handler,
+		cfg:        cfg,
+		botConfig:  botCfg,
+		chatID:     987654321,
+		username:   "testuser",
+		subService: subService,
 	}
 }
 
@@ -198,16 +190,4 @@ func newCommandMessage(chatID int64, userID int64, username, text string, cmdLen
 			{Type: "bot_command", Offset: 0, Length: cmdLen},
 		},
 	}
-}
-
-// e2eVPNClients builds a vpn.Client map mirroring the given XUI clients map so
-// that SubscriptionService can provision/deprovision trials and subscriptions in
-// tests the same way production wiring does (cmd/bot/main.go buildRuntimeNodeClients).
-func e2eVPNClients(xuiClients map[uint]interfaces.XUIClient) map[uint]vpn.Client {
-	m := make(map[uint]vpn.Client, len(xuiClients))
-	for id, xc := range xuiClients {
-		m[id] = vpn.NewThreeXUIClient(xc, []int{1})
-	}
-
-	return m
 }

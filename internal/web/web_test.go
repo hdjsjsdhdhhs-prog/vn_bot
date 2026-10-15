@@ -142,7 +142,7 @@ func TestRenderTrialPage(t *testing.T) {
 				mockDB := testutil.NewDatabaseService()
 				cfg := &config.Config{SiteURL: "https://example.com", TrialDurationHours: 24}
 				mockDB.GetPlanByNameFunc = func(ctx context.Context, name string) (*database.Plan, error) {
-					return &database.Plan{ID: 1, Name: "trial", DevicesLimit: 1, TrafficLimit: 1073741824}, nil
+					return &database.Plan{ID: 1, Name: "trial"}, nil
 				}
 
 				srv = NewServer(":8880", mockDB, cfg, "testbot", nil, nil)

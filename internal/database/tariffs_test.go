@@ -26,7 +26,7 @@ type tariffFixture struct {
 func newTariffFixture(t *testing.T) *tariffFixture {
 	t.Helper()
 	svc := newTestService(t)
-	plan := &Plan{Name: "tariff-premium", IsActive: true, DevicesLimit: 3}
+	plan := &Plan{Name: "tariff-premium", IsActive: true}
 	require.NoError(t, svc.db.Create(plan).Error)
 	return &tariffFixture{t: t, svc: svc, ctx: context.Background(), plan: plan}
 }
@@ -244,7 +244,7 @@ func TestTariffUpdate_UsedProductChangingTermsCreatesNewVersion(t *testing.T) {
 func TestTariffUpdate_EachImmutableTermVersionsUsedProduct(t *testing.T) {
 	t.Parallel()
 	other := func(f *tariffFixture) uint {
-		p := &Plan{Name: "tariff-other", IsActive: true, DevicesLimit: 1}
+		p := &Plan{Name: "tariff-other", IsActive: true}
 		require.NoError(t, f.svc.db.Create(p).Error)
 		return p.ID
 	}

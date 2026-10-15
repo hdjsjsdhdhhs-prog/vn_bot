@@ -7,7 +7,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 func TestGetOrderByID_Success(t *testing.T) {
@@ -17,7 +16,7 @@ func TestGetOrderByID_Success(t *testing.T) {
 	ctx := context.Background()
 
 	sub := createTestSubscription(t, svc, 300, "user3", "client-order-3")
-	plan := &Plan{Name: "plan-order-get", DevicesLimit: 1, TrafficLimit: 1024}
+	plan := &Plan{Name: "plan-order-get"}
 	require.NoError(t, svc.db.WithContext(ctx).Create(plan).Error)
 	product := &Product{PlanID: plan.ID, Name: "1M", DurationDays: 30, PriceCents: 100, Currency: "RUB", IsActive: true}
 	require.NoError(t, svc.db.WithContext(ctx).Create(product).Error)
@@ -56,7 +55,7 @@ func TestSaveOrderPaymentAmounts(t *testing.T) {
 	ctx := context.Background()
 
 	sub := createTestSubscription(t, svc, 301, "user-payment-amounts", "client-payment-amounts")
-	plan := &Plan{Name: "plan-order-amounts", DevicesLimit: 1, TrafficLimit: 1024}
+	plan := &Plan{Name: "plan-order-amounts"}
 	require.NoError(t, svc.db.WithContext(ctx).Create(plan).Error)
 	product := &Product{PlanID: plan.ID, Name: "1M", DurationDays: 30, PriceCents: 5000, Currency: "RUB", IsActive: true}
 	require.NoError(t, svc.db.WithContext(ctx).Create(product).Error)
@@ -106,7 +105,7 @@ func TestGetPaidOrdersWithoutProviderFee(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
 	sub := createTestSubscription(t, svc, 302, "user-provider-fee-queue", "client-provider-fee-queue")
-	plan := &Plan{Name: "plan-provider-fee-queue", DevicesLimit: 1, TrafficLimit: 1024}
+	plan := &Plan{Name: "plan-provider-fee-queue"}
 	require.NoError(t, svc.db.WithContext(ctx).Create(plan).Error)
 	product := &Product{PlanID: plan.ID, Name: "1M", DurationDays: 30, PriceCents: 100, Currency: "RUB", IsActive: true}
 	require.NoError(t, svc.db.WithContext(ctx).Create(product).Error)
@@ -138,7 +137,7 @@ func TestConfirmOrderPaidCAS_PersistsCallbackAmount(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
 
-	plan := &Plan{Name: "plan-cas-callback-amount", DevicesLimit: 1, TrafficLimit: 1024}
+	plan := &Plan{Name: "plan-cas-callback-amount"}
 	require.NoError(t, svc.db.WithContext(ctx).Create(plan).Error)
 	product := &Product{PlanID: plan.ID, Name: "1M", DurationDays: 30, PriceCents: 5000, Currency: "RUB", IsActive: true}
 	require.NoError(t, svc.db.WithContext(ctx).Create(product).Error)
@@ -151,7 +150,7 @@ func TestConfirmOrderPaidCAS_PersistsCallbackAmount(t *testing.T) {
 	require.NoError(t, svc.db.WithContext(ctx).Create(order).Error)
 
 	now := time.Now().UTC().Truncate(time.Second)
-	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, nil, 5250)
+	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, 5250)
 	require.NoError(t, err)
 	require.True(t, activated)
 
@@ -216,7 +215,7 @@ func TestConfirmOrderPaidCAS_RecalculatesFromCurrentSubscription(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Minute)
-	plan := &Plan{Name: "plan-current-expiry", DevicesLimit: 1}
+	plan := &Plan{Name: "plan-current-expiry"}
 	require.NoError(t, svc.db.Create(plan).Error)
 	product := &Product{PlanID: plan.ID, Name: "1M", DurationDays: 30, PriceCents: 100, Currency: "RUB", IsActive: true}
 	require.NoError(t, svc.db.Create(product).Error)
@@ -231,7 +230,7 @@ func TestConfirmOrderPaidCAS_RecalculatesFromCurrentSubscription(t *testing.T) {
 
 	// The CAS must recompute expiry from the current subscription, not from any
 	// stale caller snapshot: the expired-at value passed in is irrelevant.
-	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, &Subscription{ID: sub.ID, PlanID: plan.ID}, product, nil, order.AmountCents)
+	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, &Subscription{ID: sub.ID, PlanID: plan.ID}, product, order.AmountCents)
 	require.NoError(t, err)
 	assert.True(t, activated)
 
@@ -247,7 +246,7 @@ func TestConfirmOrderPaidCAS_AcceptsExpiredOrderForSettlementCallback(t *testing
 	svc := newTestService(t)
 	ctx := context.Background()
 
-	plan := &Plan{Name: "plan-cas-expired-callback", DevicesLimit: 1}
+	plan := &Plan{Name: "plan-cas-expired-callback"}
 	require.NoError(t, svc.db.WithContext(ctx).Create(plan).Error)
 	product := &Product{PlanID: plan.ID, Name: "1M", DurationDays: 30, PriceCents: 100, Currency: "RUB", IsActive: true}
 	require.NoError(t, svc.db.WithContext(ctx).Create(product).Error)
@@ -266,7 +265,7 @@ func TestConfirmOrderPaidCAS_AcceptsExpiredOrderForSettlementCallback(t *testing
 	require.NoError(t, svc.db.WithContext(ctx).Create(order).Error)
 
 	now := time.Now().UTC().Truncate(time.Second)
-	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, nil, order.AmountCents)
+	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, order.AmountCents)
 	require.NoError(t, err)
 	require.True(t, activated, "the service grace-period check allows an expired order to enter the atomic paid transition")
 
@@ -281,10 +280,10 @@ func TestConfirmOrderPaidCAS_SwitchesPlanAndStatus(t *testing.T) {
 	ctx := context.Background()
 
 	// trial plan + paid plan; sub starts on trial with expired status.
-	trialPlan := &Plan{Name: "plan-cas-trial", DevicesLimit: 1, TrafficLimit: 100}
+	trialPlan := &Plan{Name: "plan-cas-trial"}
 	require.NoError(t, svc.db.WithContext(ctx).Create(trialPlan).Error)
 
-	paidPlan := &Plan{Name: "plan-cas-premium", DevicesLimit: 2, TrafficLimit: 20000}
+	paidPlan := &Plan{Name: "plan-cas-premium"}
 	require.NoError(t, svc.db.WithContext(ctx).Create(paidPlan).Error)
 	product := &Product{PlanID: paidPlan.ID, Name: "1M", DurationDays: 30, PriceCents: 499, Currency: "RUB", IsActive: true}
 	require.NoError(t, svc.db.WithContext(ctx).Create(product).Error)
@@ -305,21 +304,9 @@ func TestConfirmOrderPaidCAS_SwitchesPlanAndStatus(t *testing.T) {
 
 	now := time.Now().UTC().Truncate(time.Second)
 
-	var gotPlanID uint
-
-	applyPlan := func(_ context.Context, tx *gorm.DB, subscriptionID uint, planID uint) error {
-		assert.Equal(t, sub.ID, subscriptionID)
-
-		gotPlanID = planID
-
-		return nil
-	}
-
-	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, applyPlan, order.AmountCents)
+	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, order.AmountCents)
 	require.NoError(t, err)
 	assert.True(t, activated)
-	// applyPlan must receive the PRODUCT plan, not the stale sub.PlanID.
-	assert.Equal(t, paidPlan.ID, gotPlanID)
 
 	got, err := svc.GetByID(ctx, sub.ID)
 	require.NoError(t, err)
@@ -328,21 +315,20 @@ func TestConfirmOrderPaidCAS_SwitchesPlanAndStatus(t *testing.T) {
 	assert.Equal(t, product.ID, *got.ProductID)
 
 	// Idempotent retry: order already paid, no second activation.
-	activated, err = svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, applyPlan, order.AmountCents)
+	activated, err = svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, order.AmountCents)
 	require.NoError(t, err)
 	assert.False(t, activated)
 }
 
-// TestConfirmOrderPaidCAS_SamePlanRenewalSkipsApplyPlan locks the renewal
-// contract: paying for the plan the subscription already has extends the expiry
-// but must NOT schedule a VPN re-sync (no pending_update rows, no traffic
-// reset). Only an actual plan change runs applyPlan.
-func TestConfirmOrderPaidCAS_SamePlanRenewalSkipsApplyPlan(t *testing.T) {
+// TestConfirmOrderPaidCAS_SamePlanRenewalExtendsExpiry locks the renewal
+// contract: paying for the plan the subscription already has keeps the plan
+// and extends the existing future expiry.
+func TestConfirmOrderPaidCAS_SamePlanRenewalExtendsExpiry(t *testing.T) {
 	t.Parallel()
 	svc := newTestService(t)
 	ctx := context.Background()
 
-	plan := &Plan{Name: "plan-renew", DevicesLimit: 2, TrafficLimit: 20000}
+	plan := &Plan{Name: "plan-renew"}
 	require.NoError(t, svc.db.WithContext(ctx).Create(plan).Error)
 	product := &Product{PlanID: plan.ID, Name: "1M", DurationDays: 30, PriceCents: 499, Currency: "RUB", IsActive: true}
 	require.NoError(t, svc.db.WithContext(ctx).Create(product).Error)
@@ -365,18 +351,9 @@ func TestConfirmOrderPaidCAS_SamePlanRenewalSkipsApplyPlan(t *testing.T) {
 
 	now := time.Now().UTC().Truncate(time.Second)
 
-	applyPlanCalls := 0
-	applyPlan := func(_ context.Context, tx *gorm.DB, subscriptionID uint, planID uint) error {
-		applyPlanCalls++
-
-		return nil
-	}
-
-	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, applyPlan, order.AmountCents)
+	activated, err := svc.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, order.AmountCents)
 	require.NoError(t, err)
 	assert.True(t, activated)
-	// Same-plan renewal: the CAS must not schedule a VPN re-sync.
-	assert.Zero(t, applyPlanCalls, "same-plan renewal must not run applyPlan (no pending_update, no traffic reset)")
 
 	got, err := svc.GetByID(ctx, sub.ID)
 	require.NoError(t, err)
@@ -384,9 +361,4 @@ func TestConfirmOrderPaidCAS_SamePlanRenewalSkipsApplyPlan(t *testing.T) {
 	require.NotNil(t, got.ExpiresAt)
 	// Renewal extends the existing future expiry by the product duration.
 	assert.True(t, got.ExpiresAt.After(expiresAt), "renewal must extend the existing expiry")
-
-	// No pending subscription_node rows were created by the renewal.
-	rows, err := svc.GetBySubscriptionID(ctx, sub.ID)
-	require.NoError(t, err)
-	assert.Empty(t, rows)
 }

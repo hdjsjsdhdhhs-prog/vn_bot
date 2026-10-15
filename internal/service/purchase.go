@@ -12,9 +12,9 @@ import (
 
 var (
 	ErrPurchaseAccessDenied = errors.New("purchase access denied")
-	ErrInvalidPurchase = errors.New("invalid purchase request")
-	ErrOfferUnavailable = errors.New("offer unavailable")
-	ErrPurchaseUnavailable = errors.New("purchase service unavailable")
+	ErrInvalidPurchase      = errors.New("invalid purchase request")
+	ErrOfferUnavailable     = errors.New("offer unavailable")
+	ErrPurchaseUnavailable  = errors.New("purchase service unavailable")
 )
 
 // PurchaseAuthorizer resolves a verified application identity, never request
@@ -31,7 +31,7 @@ type purchaseRepository interface {
 // products/orders repository. It cannot provision, renew, or contact payments.
 // SubscriptionService supplies the shared repository, not another account model.
 type PurchaseService struct {
-	repo purchaseRepository
+	repo      purchaseRepository
 	authorize PurchaseAuthorizer
 }
 
@@ -45,17 +45,17 @@ func NewPurchaseService(subscriptions *SubscriptionService, authorize PurchaseAu
 
 // SubscriptionOffer is a safe projection of a server-defined Product.
 type SubscriptionOffer struct {
-	OfferID string `json:"offer_id"`
-	Name string `json:"name"`
-	DurationDays int `json:"duration_days"`
-	AmountCents int64 `json:"amount_cents"`
-	Currency string `json:"currency"`
+	OfferID        string     `json:"offer_id"`
+	Name           string     `json:"name"`
+	DurationDays   int        `json:"duration_days"`
+	AmountCents    int64      `json:"amount_cents"`
+	Currency       string     `json:"currency"`
 	AvailableUntil *time.Time `json:"available_until,omitempty"`
 	// Card presentation from the tariff editor (migration 046). Empty values
 	// mean "not configured": the Mini App falls back to its default card.
-	Description string `json:"description"`
-	Features []string `json:"features"`
-	Badge string `json:"badge"`
+	Description string   `json:"description"`
+	Features    []string `json:"features"`
+	Badge       string   `json:"badge"`
 	// SortOrder is the shared catalogue position; offers are already returned
 	// in catalogue order (database.ProductCatalogOrder).
 	SortOrder int `json:"sort_order"`
@@ -65,16 +65,16 @@ type SubscriptionOffer struct {
 // provider fields and subscription credentials. ExpiresAt is the intent deadline,
 // not the subscription entitlement or the provider's payment-link deadline.
 type PurchaseOrderInfo struct {
-	OrderID string `json:"order_id"`
-	OfferID string `json:"offer_id"`
-	Name string `json:"name"`
-	DurationDays int `json:"duration_days"`
-	AmountCents int64 `json:"amount_cents"`
-	Currency string `json:"currency"`
-	Status database.OrderStatus `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt *time.Time `json:"expires_at"`
-	CheckoutStarted bool `json:"checkout_started"`
+	OrderID         string               `json:"order_id"`
+	OfferID         string               `json:"offer_id"`
+	Name            string               `json:"name"`
+	DurationDays    int                  `json:"duration_days"`
+	AmountCents     int64                `json:"amount_cents"`
+	Currency        string               `json:"currency"`
+	Status          database.OrderStatus `json:"status"`
+	CreatedAt       time.Time            `json:"created_at"`
+	ExpiresAt       *time.Time           `json:"expires_at"`
+	CheckoutStarted bool                 `json:"checkout_started"`
 }
 
 func (p *PurchaseService) customer(ctx context.Context) (int64, error) {
@@ -185,6 +185,10 @@ func validatePurchaseOffer(c *database.PurchaseCatalog, product *database.Produc
 		if _, _, err := c.Source.RequestConfiguration(); err != nil {
 			return time.Time{}, ErrOfferUnavailable
 		}
+	} else if product.Plan.SubscriptionBuilderID == nil {
+		// Plan access is served only by the plan builder (/sub answers 503
+		// without one): never sell a tariff whose plan has no builder.
+		return time.Time{}, ErrOfferUnavailable
 	}
 	// Use the existing payment expiry calculation, not renewal/grant semantics.
 	if expiry := database.CalculatePaymentExpiry(c.Now, sub, product); !expiry.After(c.Now) || expiry.Year() > 9999 {
@@ -233,9 +237,10 @@ func purchaseInfo(record *database.PurchaseRecord, id int64) (*PurchaseOrderInfo
 
 // Preserve trusted diagnostics via Unwrap while keeping raw SQL/credentials out
 // of the public error text, following the management service's error convention.
-type purchaseError struct { kind, cause error }
-func (e *purchaseError) Error() string { return e.kind.Error() }
-func (e *purchaseError) Unwrap() error { return e.cause }
+type purchaseError struct{ kind, cause error }
+
+func (e *purchaseError) Error() string        { return e.kind.Error() }
+func (e *purchaseError) Unwrap() error        { return e.cause }
 func (e *purchaseError) Is(target error) bool { return target == e.kind }
 
 func safePurchaseError(err error) error {

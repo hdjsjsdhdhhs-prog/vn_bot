@@ -27,9 +27,7 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/subserver"
 	"github.com/kereal/rs8kvn_bot/internal/telegramstars"
-	"github.com/kereal/rs8kvn_bot/internal/vpn"
 	"github.com/kereal/rs8kvn_bot/internal/web"
-	"github.com/kereal/rs8kvn_bot/internal/xui"
 	"go.uber.org/zap"
 )
 
@@ -39,91 +37,6 @@ var (
 	commit    = "unknown"
 	buildTime = "unknown"
 )
-
-// Option is a functional option for Run.
-type Option func(*runOptions)
-
-// runOptions содержит инъектируемые фабричные функции для XUI- и VPN-клиентов,
-// позволяющие подменять реальные реализации моками в тестах.
-type runOptions struct {
-	xuiClientFn func(host, apiToken string) (interfaces.XUIClient, error)
-	vpnClientFn func(cfg vpn.Config) (vpn.Client, error)
-}
-
-// WithXUIClient sets a custom XUI client factory (for testing).
-func WithXUIClient(fn func(host, apiToken string) (interfaces.XUIClient, error)) Option {
-	return func(o *runOptions) { o.xuiClientFn = fn }
-}
-
-// WithVPNClient sets a custom VPN client factory (for testing).
-func WithVPNClient(fn func(cfg vpn.Config) (vpn.Client, error)) Option {
-	return func(o *runOptions) { o.vpnClientFn = fn }
-}
-
-// defaultOptions возвращает настройки запуска с фабриками клиентов по умолчанию.
-// XUI- и VPN-клиенты создаются реальными реализациями; для тестов их можно
-// переопределить через WithXUIClient / WithVPNClient.
-func defaultOptions() *runOptions {
-	return &runOptions{
-		xuiClientFn: func(host, apiToken string) (interfaces.XUIClient, error) {
-			c, err := xui.NewClient(host, apiToken)
-			if err != nil {
-				return nil, err
-			}
-
-			return c, nil
-		},
-		vpnClientFn: vpn.NewClient,
-	}
-}
-
-// buildRuntimeNodeClients фильтрует активные ноды и для каждой создаёт
-// runtime-клиенты: XUI-клиент (только для 3x-ui нод) и VPN-клиент. Возвращает
-// отфильтрованные ноды и карты клиентов, индексированные по ID ноды.
-func buildRuntimeNodeClients(nodes []database.Node, opts *runOptions) ([]database.Node, map[uint]interfaces.XUIClient, map[uint]vpn.Client, error) {
-	runtimeNodes := make([]database.Node, 0, len(nodes))
-	for _, node := range nodes {
-		if node.IsActive {
-			runtimeNodes = append(runtimeNodes, node)
-		}
-	}
-
-	if len(runtimeNodes) == 0 {
-		return nil, nil, nil, fmt.Errorf("no active nodes configured")
-	}
-
-	xuiClients := make(map[uint]interfaces.XUIClient)
-	vpnClients := make(map[uint]vpn.Client)
-
-	for _, node := range runtimeNodes {
-		var xuiClient interfaces.XUIClient
-
-		if node.Type == database.NodeType3xUI {
-			client, err := opts.xuiClientFn(node.Host, node.APIToken)
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("init 3x-ui client for node %d: %w", node.ID, err)
-			}
-
-			xuiClient = client
-			xuiClients[node.ID] = client
-		}
-
-		client, err := opts.vpnClientFn(vpn.Config{
-			Host:       node.Host,
-			APIToken:   node.APIToken,
-			Type:       node.Type,
-			InboundIDs: node.ResolveInboundIDs(),
-			XUIClient:  xuiClient,
-		})
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("init vpn client for node %d: %w", node.ID, err)
-		}
-
-		vpnClients[node.ID] = client
-	}
-
-	return runtimeNodes, xuiClients, vpnClients, nil
-}
 
 // getVersion returns the service version string prefixed with "rs8kvn_bot@".
 // It prefers a non-"dev" ldflag version, then a module tag from build info, then a short VCS revision from build info, then an ldflag commit, and finally falls back to the ldflag version.
@@ -279,24 +192,18 @@ func startWebServer(subService *service.SubscriptionService, cfg *config.Config,
 }
 
 // startBackgroundWorkers запускает фоновые goroutine-воркеры: сбор метрик пула БД,
-// периодическую сверку осиротевших клиентов, бэкапы, heartbeat, очистку trial,
-// а также синхронизацию и истечение подписок. Возвращает WaitGroup для ожидания
-// завершения при штатном выключении.
-func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subService *service.SubscriptionService, syncSvc *service.SyncService, orderSvc *service.OrderService, dbService *database.Service, cfg *config.Config) *sync.WaitGroup {
+// бэкапы, heartbeat, очистку trial, повтор запросов комиссий провайдера,
+// истечение и напоминания подписок и прогрев клиентов. Синхронизации с
+// VPN-панелями нет: доступ — локальное состояние, выдачу собирает Builder.
+// Возвращает WaitGroup для ожидания завершения при штатном выключении.
+func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subService *service.SubscriptionService, orderSvc *service.OrderService, dbService *database.Service, cfg *config.Config) *sync.WaitGroup {
 	var wg sync.WaitGroup
-	wg.Add(10)
+	wg.Add(8)
 
 	// Customer warm-up: /start records contacts (wired before the update loop
 	// starts), the worker sends the scenarios through the handler's sender.
 	warmupSvc := service.NewWarmupService(dbService, subService.TrialDefaults())
 	handler.SetWarmupContacts(warmupSvc)
-
-	// The services are wired before any background goroutine starts. Reuse the
-	// same SyncService instance that was injected into payment/subscription
-	// services so chargeback, expiry, and the worker share one DB-sync contract.
-	if syncSvc == nil {
-		logger.Warn("SyncService not available; background sync workers may be degraded")
-	}
 
 	go func() {
 		defer recoverAndReport("DB pool metrics collector")
@@ -311,47 +218,6 @@ func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subServic
 				return
 			case <-ticker.C:
 				metrics.CollectDBPoolMetrics(ctx, dbService.GetDB())
-			}
-		}
-	}()
-
-	go func() {
-		defer recoverAndReport("Orphan reconciler")
-		defer wg.Done()
-
-		select {
-		case <-time.After(30 * time.Second):
-		case <-ctx.Done():
-			return
-		}
-
-		svc := handler.GetSubscriptionService()
-		if svc == nil {
-			logger.Warn("SubscriptionService not available, skipping orphan reconciliation")
-			return
-		}
-
-		count, err := svc.ReconcileOrphanedClients(ctx)
-		if err != nil {
-			logger.Warn("Initial orphan reconciliation failed", zap.Error(err))
-		} else {
-			logger.Info("Orphan reconciliation completed", zap.Int("revoked", count))
-		}
-
-		ticker := time.NewTicker(8 * time.Hour)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				count, err := svc.ReconcileOrphanedClients(ctx)
-				if err != nil {
-					logger.Warn("Orphan reconciliation failed", zap.Error(err))
-				} else {
-					logger.Info("Orphan reconciliation completed", zap.Int("revoked", count))
-				}
 			}
 		}
 	}()
@@ -381,11 +247,11 @@ func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subServic
 	}()
 
 	go func() {
-		defer recoverAndReport("Subscription sync worker")
+		defer recoverAndReport("Provider fee worker")
 		defer wg.Done()
 
-		syncWorker := scheduler.NewSubscriptionSyncWorker(syncSvc, orderSvc)
-		syncWorker.Run(ctx)
+		feeWorker := scheduler.NewProviderFeeWorker(orderSvc)
+		feeWorker.Run(ctx)
 	}()
 
 	go func() {
@@ -402,14 +268,6 @@ func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subServic
 
 		reminderWorker := scheduler.NewSubscriptionReminderWorker(dbService, subService)
 		reminderWorker.Run(ctx)
-	}()
-
-	go func() {
-		defer recoverAndReport("Subscription traffic worker")
-		defer wg.Done()
-
-		trafficWorker := scheduler.NewSubscriptionTrafficWorker(dbService, subService)
-		trafficWorker.Run(ctx)
 	}()
 
 	go func() {
@@ -449,7 +307,7 @@ func startNetworkMonitor(ctx context.Context, wg *sync.WaitGroup, monitor *netmo
 // main — точка входа: инициализирует конфигурацию и сервисы, запускает фоновые
 // воркеры и веб-сервер, обрабатывает обновления Telegram с ограниченным
 // параллелизмом и выполняет корректное завершение при получении сигнала.
-// Инициализация опциональных компонентов (Sentry, БД, 3x-ui клиент, бот) делается
+// Инициализация опциональных компонентов (Sentry, БД, бот) делается
 // по принципу best-effort, чтобы сервис стартовал даже при недоступности части
 // зависимостей.
 func main() {
@@ -480,8 +338,8 @@ func main() {
 		}
 	}()
 
-	// 4. Initialize database and node clients
-	dbService, deps, err := initDatabase(cfg)
+	// 4. Initialize database (no VPN node clients: access is local state)
+	dbService, err := initDatabase(cfg)
 	if err != nil {
 		logger.Fatal("Failed to initialize database", zap.Error(err))
 	}
@@ -489,16 +347,6 @@ func main() {
 		err := dbService.Close()
 		if err != nil {
 			logger.Error("Failed to close database", zap.Error(err))
-		}
-	}()
-	defer func() {
-		for id, client := range deps.xuiClients {
-			err := client.Close()
-			if err != nil {
-				logger.Error("Failed to close 3x-ui client",
-					zap.Uint("node_id", id),
-					zap.Error(err))
-			}
 		}
 	}()
 
@@ -510,7 +358,7 @@ func main() {
 	// injected via SetBotConfig once initBot returns.
 	botConfig := &bot.BotConfig{}
 	botAPI := &tgbotapi.BotAPI{Self: tgbotapi.User{UserName: ""}}
-	svc := initServices(cfg, dbService, deps, botAPI, botConfig)
+	svc := initServices(cfg, dbService, botAPI, botConfig)
 
 	// 6. Start web server so subscriptions are served; bot is initialised next.
 	// The web server starts with an empty bot username; initBot injects the real
@@ -581,7 +429,7 @@ func main() {
 	svc.handler.StartReferralCacheSync(ctx)
 	svc.handler.StartBroadcastWorker(ctx)
 	svc.handler.StartStarsPaymentWorker(ctx)
-	bgWg := startBackgroundWorkers(ctx, svc.handler, svc.subService, svc.syncService, svc.orderService, dbService, cfg)
+	bgWg := startBackgroundWorkers(ctx, svc.handler, svc.subService, svc.orderService, dbService, cfg)
 	startNetworkMonitor(ctx, bgWg, svc.netMonitor, cfg)
 
 	if webServer != nil {

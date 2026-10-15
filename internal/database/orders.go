@@ -257,23 +257,15 @@ func (s *Service) GetPaidOrdersWithoutProviderFeeAfterID(ctx context.Context, af
 	return orders, nil
 }
 
-// ApplyPlanInTxFn is invoked inside the transaction that confirms an order.
-// It must materialize all DB prerequisites (pending_add / pending_remove rows)
-// needed by the background sync worker using the supplied tx handle.
-// Returning an error aborts the transaction and rolls back the payment
-// confirmation; returning nil commits it.
-type ApplyPlanInTxFn func(ctx context.Context, tx *gorm.DB, subscriptionID uint, planID uint) error
-
 // ConfirmOrderPaidCAS atomically marks an order paid and updates its subscription.
 // The order and subscription expiry are both computed inside the transaction from
 // the current subscription state, so the caller does not need to pre-calculate
 // (and cannot pass a stale) expiry value. The OrderService may call this method
 // for an expired order when its provider callback is still inside the short
 // settlement grace period; the service validates that time window before
-// entering this transaction. If applyPlan is non-nil and the CAS succeeds, it
-// is called with the same tx used to write the subscription; on error the whole
-// transaction rolls back.
-func (s *Service) ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *Subscription, product *Product, applyPlan ApplyPlanInTxFn, callbackAmountCents int64) (bool, error) {
+// entering this transaction. Access is local state only: the purchased plan's
+// builder serves the subscription from the next /sub request on.
+func (s *Service) ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *Subscription, product *Product, callbackAmountCents int64) (bool, error) {
 	var activated bool
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -332,18 +324,6 @@ func (s *Service) ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt,
 		expiryCopy := newExpiry
 
 		sub.ExpiresAt = &expiryCopy
-		// Plan reconciliation runs only when the purchased plan actually differs
-		// from the subscription's current one. A same-plan renewal extends the
-		// expiry but must NOT recreate pending_update rows: that path re-syncs
-		// the VPN client and resets its traffic counter, which would wipe the
-		// user's remaining quota mid-period. Renewals only touch the DB; the
-		// panel keeps serving the client (its own 30-day auto-renew continues).
-		if applyPlan != nil && currentSub.PlanID != product.PlanID {
-			err := applyPlan(ctx, tx, sub.ID, product.PlanID)
-			if err != nil {
-				return fmt.Errorf("apply plan after payment: %w", err)
-			}
-		}
 
 		recordPaymentJournal(ctx, tx, orderID, &currentSub, product, newExpiry, activatedAt)
 
@@ -416,19 +396,14 @@ func CalculatePaymentExpiry(now time.Time, sub *Subscription, product *Product) 
 	return base.AddDate(0, 0, product.DurationDays)
 }
 
-// ChargebackPlanInTxFn materializes the DB-side VPN sync prerequisites while the
-// chargeback transaction is open. It must not perform external network calls.
-type ChargebackPlanInTxFn func(ctx context.Context, tx *gorm.DB, subscriptionID uint, freePlanID uint) error
-
 // CancelPaidOrderAndDowngradeCAS atomically records a paid-order chargeback and,
 // when no other currently-valid paid order covers the subscription, resets the
-// subscription to the free plan and materializes its pending sync state.
+// subscription to the free plan.
 //
-// The order status, entitlement update, and pending node transitions share one
-// transaction. A concurrent confirmation therefore cannot commit an entitlement
-// after this chargeback's decision without first observing the serialized DB
-// state. External VPN calls must happen after this method returns successfully.
-func (s *Service) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint, applyPlan ChargebackPlanInTxFn) (*ChargebackResult, error) {
+// The order status and entitlement update share one transaction. A concurrent
+// confirmation therefore cannot commit an entitlement after this chargeback's
+// decision without first observing the serialized DB state.
+func (s *Service) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint) (*ChargebackResult, error) {
 	var result ChargebackResult
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -538,13 +513,6 @@ func (s *Service) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider s
 
 		if updated.RowsAffected == 0 {
 			return fmt.Errorf("downgrade subscription after chargeback: %w", ErrSubscriptionNotFound)
-		}
-
-		if applyPlan != nil {
-			err := applyPlan(ctx, tx, order.SubscriptionID, freePlanID)
-			if err != nil {
-				return fmt.Errorf("apply free plan after chargeback: %w", err)
-			}
 		}
 
 		result.Downgraded = true

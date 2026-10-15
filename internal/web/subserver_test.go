@@ -40,10 +40,29 @@ func testServer(t *testing.T, db interfaces.DatabaseService, cfg *config.Config)
 			return &database.Subscription{ID: 1, SubscriptionID: "test123", Token: testSubscriptionToken, Status: string(database.SubscriptionStatusActive)}, nil
 		}
 	}
-	subSvc := service.NewSubscriptionService(db, nil, nil, nil, cfg)
+	subSvc := service.NewSubscriptionService(db, cfg)
 	srv := NewServer(":0", db, cfg, "testbot", subSvc, subserver.NewService(config.SubServerCacheTTL))
 
 	return srv
+}
+
+// providerSourceDB returns a fake DB whose active subscription is served from a
+// single directly linked ProviderSource pointing at sourceURL — the serving
+// route that needs no builder.
+func providerSourceDB(sourceURL string) *testutil.DatabaseService {
+	source := &database.ProviderSource{ID: 1, Name: "src", SubscriptionURL: sourceURL, Headers: `{}`, Enabled: true, UpdatedAt: time.Unix(1, 0)}
+	db := testutil.NewDatabaseService()
+	db.GetSubscriptionWithProviderSourceFunc = func(_ context.Context, subscriptionID string) (*database.Subscription, error) {
+		return &database.Subscription{
+			ID:               1,
+			SubscriptionID:   subscriptionID,
+			Status:           string(database.SubscriptionStatusActive),
+			ProviderSourceID: &source.ID,
+			ProviderSource:   source,
+		}, nil
+	}
+
+	return db
 }
 
 func TestHandleSubscription_MethodNotAllowed(t *testing.T) {
@@ -114,41 +133,6 @@ func TestHandleSubscription_InvalidTokenDoesNotLookupSubscription(t *testing.T) 
 	assert.Zero(t, lookups.Load())
 }
 
-func TestHandleSubscription_TokenRoutesToLegacySubscription(t *testing.T) {
-	t.Parallel()
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("vless://legacy@legacy.example:443#Legacy"))
-	}))
-	defer upstream.Close()
-
-	db := testutil.NewDatabaseService()
-	db.GetByTokenFunc = func(_ context.Context, token string) (*database.Subscription, error) {
-		require.Equal(t, testSubscriptionToken, token)
-		return &database.Subscription{ID: 71, SubscriptionID: "internal-legacy-sub", Token: token, Status: string(database.SubscriptionStatusActive)}, nil
-	}
-	db.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
-		return &database.Subscription{ID: 71, SubscriptionID: "internal-legacy-sub", Status: string(database.SubscriptionStatusActive)}, nil
-	}
-	db.GetWithPlanAndNodesFunc = func(_ context.Context, subscriptionID string) (*database.SubscriptionFull, error) {
-		require.Equal(t, "internal-legacy-sub", subscriptionID)
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 71, SubscriptionID: subscriptionID, Status: string(database.SubscriptionStatusActive)},
-			Plan:         database.Plan{TrafficLimit: 1 << 30},
-			Nodes:        []database.Node{{ID: 1, Name: "legacy", SubscriptionURL: upstream.URL + "/"}},
-		}, nil
-	}
-
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
-	testServer(t, db, &config.Config{}).handleSubscription(w, r)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	decoded, err := base64.StdEncoding.DecodeString(w.Body.String())
-	require.NoError(t, err)
-	assert.Contains(t, string(decoded), "vless://legacy@legacy.example")
-}
-
 func TestHandleSubscription_TokenRoutesToProviderSource(t *testing.T) {
 	t.Parallel()
 
@@ -165,10 +149,6 @@ func TestHandleSubscription_TokenRoutesToProviderSource(t *testing.T) {
 	db.GetSubscriptionWithProviderSourceFunc = func(_ context.Context, subscriptionID string) (*database.Subscription, error) {
 		require.Equal(t, "internal-provider-sub", subscriptionID)
 		return &database.Subscription{ID: 72, SubscriptionID: subscriptionID, Status: string(database.SubscriptionStatusActive), ProviderSourceID: &source.ID, ProviderSource: source}, nil
-	}
-	db.GetWithPlanAndNodesFunc = func(context.Context, string) (*database.SubscriptionFull, error) {
-		t.Fatal("provider token request must not enter legacy plan/nodes lookup")
-		return nil, errors.New("unexpected legacy lookup")
 	}
 
 	w := httptest.NewRecorder()
@@ -208,8 +188,8 @@ func TestHandleSubscription_AccessLog(t *testing.T) {
 	t.Parallel()
 
 	db := testutil.NewDatabaseService()
-	db.GetWithPlanAndNodesFunc = func(ctx context.Context, _ string) (*database.SubscriptionFull, error) {
-		return nil, gorm.ErrRecordNotFound
+	db.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
+		return nil, database.ErrSubscriptionNotFound
 	}
 	srv := testServer(t, db, &config.Config{})
 
@@ -221,16 +201,31 @@ func TestHandleSubscription_AccessLog(t *testing.T) {
 	assert.Equal(t, "Subscription not found", w.Body.String())
 }
 
-func TestHandleSubscription_NoServersAvailable(t *testing.T) {
+// TestHandleSubscription_NoBuilderReturns503: an active subscription with no
+// enabled builder (neither its own nor its plan's) and no linked ProviderSource
+// is a configuration error. /sub answers 503 with a generic body — no fallback
+// route, no 404 (the subscription exists), and no internal details leak.
+func TestHandleSubscription_NoBuilderReturns503(t *testing.T) {
 	t.Parallel()
 
+	builderID := uint(404)
 	db := testutil.NewDatabaseService()
-	db.GetWithPlanAndNodesFunc = func(ctx context.Context, _ string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 1, Status: "active"},
-			Plan:         database.Plan{TrafficLimit: 1 << 30},
-			Nodes:        []database.Node{},
+	db.GetSubscriptionWithProviderSourceFunc = func(_ context.Context, subscriptionID string) (*database.Subscription, error) {
+		return &database.Subscription{
+			ID:                    1,
+			SubscriptionID:        subscriptionID,
+			PlanID:                7,
+			Status:                string(database.SubscriptionStatusActive),
+			SubscriptionBuilderID: &builderID, // dangling override: resolves to no builder
 		}, nil
+	}
+	db.ResolveSubscriptionBuilderFunc = func(context.Context, *database.Subscription) (*database.ResolvedBuilder, error) {
+		return nil, nil
+	}
+	var deviceWrites atomic.Int32
+	db.UpdateDevicesFunc = func(context.Context, uint, string) error {
+		deviceWrites.Add(1)
+		return nil
 	}
 	srv := testServer(t, db, &config.Config{})
 
@@ -238,19 +233,22 @@ func TestHandleSubscription_NoServersAvailable(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
-	assert.Equal(t, http.StatusNotFound, w.Code)
-	assert.Equal(t, "Subscription not found", w.Body.String())
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, "text/plain; charset=utf-8", w.Header().Get("Content-Type"))
+	assert.Equal(t, "Subscription is temporarily unavailable", w.Body.String())
+	assert.NotContains(t, w.Body.String(), "builder")
+	assert.NotContains(t, w.Body.String(), "test123")
+	assert.Zero(t, deviceWrites.Load(), "an unservable subscription must not record device analytics")
 }
 
 func TestHandleSubscription_SourceVariants(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		body        string
-		userInfo    string
-		mockDBExtra func(db *testutil.DatabaseService)
-		check       func(t *testing.T, w *httptest.ResponseRecorder, body string)
+		name     string
+		body     string
+		userInfo string
+		check    func(t *testing.T, w *httptest.ResponseRecorder, body string)
 	}{
 		{
 			name:     "plain source",
@@ -288,48 +286,6 @@ func TestHandleSubscription_SourceVariants(t *testing.T) {
 			},
 		},
 		{
-			name:     "multiple sources",
-			body:     "vless://a@x.com:443",
-			userInfo: "upload=100; download=200; total=500; expire=111",
-			mockDBExtra: func(db *testutil.DatabaseService) {
-				db.GetWithPlanAndNodesFunc = func(ctx context.Context, _ string) (*database.SubscriptionFull, error) {
-					return &database.SubscriptionFull{
-						Subscription: database.Subscription{ID: 1, Status: "active"},
-						Plan:         database.Plan{TrafficLimit: 10 << 30},
-						Nodes: []database.Node{
-							{ID: 1, Name: "s1", IsActive: true, SubscriptionURL: httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-								w.Header().Set("Subscription-Userinfo", "upload=100; download=200; total=500; expire=111")
-								w.Write([]byte("vless://a@x.com:443"))
-							})).URL + "/sub/"},
-							{ID: 2, Name: "s2", IsActive: true, SubscriptionURL: httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-								w.Header().Set("Subscription-Userinfo", "upload=300; download=400; total=500; expire=222")
-								w.Write([]byte("trojan://b@y.com:8443"))
-							})).URL + "/sub/"},
-						},
-					}, nil
-				}
-			},
-			check: func(t *testing.T, w *httptest.ResponseRecorder, body string) {
-				decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(body))
-				require.NoError(t, err)
-				assert.Contains(t, string(decoded), "vless://a@x.com:443")
-				assert.Contains(t, string(decoded), "trojan://b@y.com:8443")
-
-				userInfo := w.Header().Get("Subscription-Userinfo")
-				assert.Contains(t, userInfo, "upload=400")
-				assert.Contains(t, userInfo, "download=600")
-			},
-		},
-		{
-			name: "mixed JSON and plain",
-			body: `{"type":"vless","address":"j.com","port":443,"uuid":"abc","encryption":"none","remark":"J"}`,
-			check: func(t *testing.T, w *httptest.ResponseRecorder, body string) {
-				decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(body))
-				require.NoError(t, err)
-				assert.Contains(t, string(decoded), "vless://abc@j.com:443")
-			},
-		},
-		{
 			name:     "base64 encoded source",
 			body:     base64.StdEncoding.EncodeToString([]byte("vless://b64@x.com:443\nvmess://b64@y.com:443")),
 			userInfo: "upload=10; download=20; total=100; expire=555",
@@ -344,69 +300,13 @@ func TestHandleSubscription_SourceVariants(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var b1, b2 *httptest.Server
-			if tt.name == "mixed JSON and plain" {
-				b1 = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					w.Write([]byte(`{"type":"vless","address":"j.com","port":443,"uuid":"abc","encryption":"none","remark":"J"}`))
-				}))
-				b2 = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					w.Write([]byte("vless://p@plain.com:443"))
-				}))
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Subscription-Userinfo", tt.userInfo)
+				w.Write([]byte(tt.body))
+			}))
+			defer backend.Close()
 
-				defer b1.Close()
-				defer b2.Close()
-			}
-
-			if tt.name == "multiple sources" {
-				defer func() {
-					if b1 != nil {
-						b1.Close()
-					}
-				}()
-				defer func() {
-					if b2 != nil {
-						b2.Close()
-					}
-				}()
-			}
-
-			var sourceURL string
-			if tt.name == "mixed JSON and plain" {
-				sourceURL = b1.URL + "/sub/"
-			} else if tt.name == "multiple sources" {
-				// already set in mockDBExtra
-			} else {
-				backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					w.Header().Set("Subscription-Userinfo", tt.userInfo)
-					w.Write([]byte(tt.body))
-				}))
-				defer backend.Close()
-
-				sourceURL = backend.URL + "/sub/"
-			}
-
-			db := testutil.NewDatabaseService()
-			if tt.mockDBExtra != nil {
-				tt.mockDBExtra(db)
-			} else {
-				db.GetWithPlanAndNodesFunc = func(ctx context.Context, _ string) (*database.SubscriptionFull, error) {
-					nodes := []database.Node{{ID: 1, Name: tt.name, IsActive: true, SubscriptionURL: sourceURL}}
-					if tt.name == "mixed JSON and plain" {
-						nodes = []database.Node{
-							{ID: 1, Name: "json", IsActive: true, SubscriptionURL: b1.URL + "/sub/"},
-							{ID: 2, Name: "plain", IsActive: true, SubscriptionURL: b2.URL + "/sub/"},
-						}
-					}
-
-					return &database.SubscriptionFull{
-						Subscription: database.Subscription{ID: 1, Status: "active"},
-						Plan:         database.Plan{TrafficLimit: 1 << 30},
-						Nodes:        nodes,
-					}, nil
-				}
-			}
-
-			srv := testServer(t, db, &config.Config{})
+			srv := testServer(t, providerSourceDB(backend.URL), &config.Config{})
 
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
@@ -551,24 +451,17 @@ func TestHandleSubscription_SourceFetchError(t *testing.T) {
 	}))
 	defer b.Close()
 
-	db := testutil.NewDatabaseService()
-	db.GetWithPlanAndNodesFunc = func(ctx context.Context, _ string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 1, Status: "active"},
-			Plan:         database.Plan{TrafficLimit: 1 << 30},
-			Nodes: []database.Node{
-				{ID: 1, Name: "bad", IsActive: true, SubscriptionURL: b.URL + "/sub/"},
-			},
-		}, nil
-	}
-	srv := testServer(t, db, &config.Config{})
+	srv := testServer(t, providerSourceDB(b.URL), &config.Config{})
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
 	srv.handleSubscription(w, r)
 
-	assert.Equal(t, http.StatusNotFound, w.Code)
-	assert.Equal(t, "Subscription not found", w.Body.String())
+	// A failed upstream fetch is terminal for a ProviderSource route: safe 503,
+	// no fallback and no upstream details in the body.
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, "Subscription source is unavailable", w.Body.String())
+	assert.NotContains(t, w.Body.String(), b.URL)
 }
 
 // TestHandleSubscription_DatabaseError_Returns500GenericBody verifies the audit #5
@@ -578,7 +471,7 @@ func TestHandleSubscription_DatabaseError_Returns500GenericBody(t *testing.T) {
 	t.Parallel()
 
 	db := testutil.NewDatabaseService()
-	db.GetWithPlanAndNodesFunc = func(ctx context.Context, _ string) (*database.SubscriptionFull, error) {
+	db.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
 		return nil, gorm.ErrInvalidDB // arbitrary non-not-found infra error
 	}
 	srv := testServer(t, db, &config.Config{})
@@ -636,29 +529,16 @@ func TestHandleSubscription_CacheSubscriptionResult(t *testing.T) {
 
 	plainContent := "vless://cached@x.com:443"
 
-	callCount := 0
+	var callCount atomic.Int32
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
+		callCount.Add(1)
 
 		w.Write([]byte(plainContent))
 	}))
 	defer backend.Close()
 
-	db := testutil.NewDatabaseService()
-	db.GetWithPlanAndNodesFunc = func(ctx context.Context, _ string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 1, Status: "active"},
-			Plan:         database.Plan{TrafficLimit: 1 << 30},
-			Nodes: []database.Node{
-				{ID: 1, Name: "src", IsActive: true, SubscriptionURL: backend.URL + "/sub/"},
-			},
-		}, nil
-	}
-	db.GetSubscriptionStatusFunc = func(ctx context.Context, _ string) (string, time.Time, error) {
-		return "active", time.Time{}, nil
-	}
-	srv := testServer(t, db, &config.Config{})
+	srv := testServer(t, providerSourceDB(backend.URL), &config.Config{})
 
 	w1 := httptest.NewRecorder()
 	r1 := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
@@ -670,7 +550,7 @@ func TestHandleSubscription_CacheSubscriptionResult(t *testing.T) {
 	srv.handleSubscription(w2, r2)
 	assert.Equal(t, http.StatusOK, w2.Code)
 
-	assert.Equal(t, 1, callCount, "second request served from per-subID cache")
+	assert.Equal(t, int32(1), callCount.Load(), "second request served from per-subID cache")
 }
 
 func TestHandleSubscription_DevicesTracking(t *testing.T) {
@@ -685,16 +565,7 @@ func TestHandleSubscription_DevicesTracking(t *testing.T) {
 
 	var savedDevices string
 
-	db := testutil.NewDatabaseService()
-	db.GetWithPlanAndNodesFunc = func(ctx context.Context, _ string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 1, Status: "active"},
-			Plan:         database.Plan{TrafficLimit: 1 << 30},
-			Nodes: []database.Node{
-				{ID: 1, Name: "src", IsActive: true, SubscriptionURL: backend.URL + "/sub/"},
-			},
-		}, nil
-	}
+	db := providerSourceDB(backend.URL)
 	db.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error {
 		savedDevices = devicesJSON
 		return nil
@@ -718,29 +589,6 @@ func TestHandleSubscription_DevicesTracking(t *testing.T) {
 	assert.Equal(t, "v2rayn/1.0", devices[0]["user-agent"])
 	_, err = time.Parse(time.RFC3339, devices[0]["timestamp"])
 	assert.NoError(t, err, "timestamp should be RFC3339")
-}
-
-func TestHandleSubscription_SourceWithoutSubURL(t *testing.T) {
-	t.Parallel()
-
-	db := testutil.NewDatabaseService()
-	db.GetWithPlanAndNodesFunc = func(ctx context.Context, _ string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 1, Status: "active"},
-			Plan:         database.Plan{TrafficLimit: 1 << 30},
-			Nodes: []database.Node{
-				{ID: 1, Name: "nosuburl", IsActive: true, SubscriptionURL: ""},
-			},
-		}, nil
-	}
-	srv := testServer(t, db, &config.Config{})
-
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, testSubscriptionPath, nil)
-	srv.handleSubscription(w, r)
-
-	assert.Equal(t, http.StatusNotFound, w.Code)
-	assert.Equal(t, "Subscription not found", w.Body.String())
 }
 
 func init() {

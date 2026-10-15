@@ -12,7 +12,6 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
 	"github.com/kereal/rs8kvn_bot/internal/testutil"
-	"github.com/kereal/rs8kvn_bot/internal/xui"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,7 +38,6 @@ type inviteTrialFixture struct {
 	rateChecks   int
 	rateRecorded int
 	created      int
-	panelCalls   int
 	requests     int
 }
 
@@ -47,7 +45,7 @@ func newInviteTrialFixture(t *testing.T, policy *webTrialPolicy, priorRequests i
 	t.Helper()
 	f := &inviteTrialFixture{requests: priorRequests}
 	mockDB := testutil.NewDatabaseService()
-	cfg, subService, mockXUI := makeTestSubService(mockDB)
+	cfg, subService := makeTestSubService(mockDB)
 	f.cfg, f.db = cfg, mockDB
 	mockDB.GetInviteByCodeFunc = func(context.Context, string) (*database.Invite, error) {
 		return &database.Invite{Code: "trialcode", ReferrerTGID: 1}, nil
@@ -63,10 +61,6 @@ func newInviteTrialFixture(t *testing.T, policy *webTrialPolicy, priorRequests i
 	mockDB.CreateTrialSubscriptionFunc = func(_ context.Context, inviteCode, subID, clientID string, expiry time.Time) (*database.Subscription, error) {
 		f.created++
 		return &database.Subscription{SubscriptionID: subID, ClientID: clientID, InviteCode: &inviteCode, ExpiresAt: &expiry}, nil
-	}
-	mockXUI.AddClientWithIDFunc = func(_ context.Context, req xui.ClientRequest) (*xui.ClientConfig, error) {
-		f.panelCalls++
-		return &xui.ClientConfig{ID: req.ClientID, SubID: req.SubID}, nil
 	}
 	if policy != nil {
 		subService.SetTrialPolicy(policy)
@@ -126,7 +120,6 @@ func TestHandleInvite_IssuedTrialShowsItsOwnExpiry(t *testing.T) {
 		assert.Contains(t, body, "Пробный", "the landing card still comes from the settings")
 		// Issuance and eligibility are untouched: nothing new is created or counted.
 		assert.Zero(t, f.created)
-		assert.Zero(t, f.panelCalls)
 		assert.Zero(t, f.rateChecks+f.rateRecorded)
 		assert.Empty(t, rec.Result().Cookies(), "the cookie of the issued trial is not re-issued")
 	}
@@ -179,7 +172,6 @@ func TestHandleInvite_TrialDisabledOrUnavailable503(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), "Пробный доступ временно недоступен")
 		assert.Zero(t, f.rateChecks+f.rateRecorded, "the IP quota is not consumed")
 		assert.Zero(t, f.created, "no subscription row")
-		assert.Zero(t, f.panelCalls, "no panel client")
 	}
 }
 

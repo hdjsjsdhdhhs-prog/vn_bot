@@ -69,7 +69,7 @@ func (f *journalPaidFixture) confirm(t *testing.T, order *Order) bool {
 	sub, err := f.svc.GetByID(context.Background(), f.sub.ID)
 	require.NoError(t, err)
 	now := time.Now().UTC()
-	activated, err := f.svc.ConfirmOrderPaidCAS(context.Background(), order.ID, now, now, sub, f.product, nil, order.AmountCents)
+	activated, err := f.svc.ConfirmOrderPaidCAS(context.Background(), order.ID, now, now, sub, f.product, order.AmountCents)
 	require.NoError(t, err)
 	return activated
 }
@@ -197,8 +197,8 @@ func TestJournal_ExpirationIsRecordedOncePerTerm(t *testing.T) {
 		"plan_id": f.plan.ID, "expires_at": past, "product_id": f.product.ID, "price_paid_cents": 29900,
 	}).Error)
 
-	require.NoError(t, f.svc.ExpireSubscriptionWithPlanCAS(ctx, f.sub.ID, freePlan.ID, nil))
-	require.NoError(t, f.svc.ExpireSubscriptionWithPlanCAS(ctx, f.sub.ID, freePlan.ID, nil), "a queued repeat is a no-op")
+	require.NoError(t, f.svc.ExpireSubscriptionWithPlanCAS(ctx, f.sub.ID, freePlan.ID))
+	require.NoError(t, f.svc.ExpireSubscriptionWithPlanCAS(ctx, f.sub.ID, freePlan.ID), "a queued repeat is a no-op")
 
 	events := journalOf(t, f.svc, f.sub.ID)
 	require.Equal(t, []string{string(JournalUserRegistered), string(JournalExpired)}, journalTypes(events))
@@ -290,7 +290,7 @@ func TestJournal_PaymentFailureAndChargeback(t *testing.T) {
 	paid := f.pendingOrder(t, paidID)
 	require.True(t, f.confirm(t, paid))
 	for i := 0; i < 2; i++ {
-		_, err := f.svc.CancelPaidOrderAndDowngradeCAS(ctx, "platega", paidID, time.Now().UTC(), freePlan.ID, nil)
+		_, err := f.svc.CancelPaidOrderAndDowngradeCAS(ctx, "platega", paidID, time.Now().UTC(), freePlan.ID)
 		require.NoError(t, err)
 	}
 

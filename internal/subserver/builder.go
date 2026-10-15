@@ -315,7 +315,7 @@ func parseBuilderSourceCounted(subID string, source database.ProviderSource, res
 
 	format := DetectFormat(resp.Body)
 	agg := aggregatedSources{allJSON: true}
-	aggregateFormat(&agg, format, resp.Body, database.Node{ID: source.ID, Name: source.Name}, subID)
+	aggregateFormat(&agg, format, resp.Body, source.Name, subID)
 
 	out := builderSource{source: source, headers: headers, allJSON: agg.allJSON && len(agg.jsonConfigs) > 0}
 	var stats builderParseStats

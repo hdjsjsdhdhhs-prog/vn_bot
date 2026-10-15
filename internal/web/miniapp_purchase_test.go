@@ -23,8 +23,7 @@ func TestMiniAppPurchase_NullableOrderRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	ctx := context.Background()
-	plan := &database.Plan{Name: "purchase-paid", IsActive: true}
-	require.NoError(t, db.GetDB().Create(plan).Error)
+	plan := createSellablePlan(t, db, "purchase-paid")
 	product := &database.Product{PlanID: plan.ID, Name: "Monthly", DurationDays: 30, PriceCents: 5000, Currency: "RUB", IsActive: true}
 	require.NoError(t, db.GetDB().Create(product).Error)
 	sub := &database.Subscription{TelegramID: 42003, ClientID: "purchase-client", SubscriptionID: "purchase-sub", PlanID: plan.ID, Status: "active"}
@@ -32,7 +31,7 @@ func TestMiniAppPurchase_NullableOrderRoundTrip(t *testing.T) {
 	before, err := db.GetByID(ctx, sub.ID)
 	require.NoError(t, err)
 	cfg := &config.Config{TelegramBotToken: miniAppTestToken}
-	handler := newMiniAppHandler(cfg, service.NewSubscriptionService(db, nil, nil, nil, cfg))
+	handler := newMiniAppHandler(cfg, service.NewSubscriptionService(db, cfg))
 	key := uuid.NewString()
 	request := func(method, path, body string, identity int64, want int) *httptest.ResponseRecorder {
 		t.Helper()

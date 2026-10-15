@@ -57,23 +57,11 @@ func (s *SubscriptionService) publicSubscriptionInfo(sub *database.Subscription)
 
 // FormatSubscriptionMessage renders the canonical subscription presentation.
 // Both the bot's "My subscription" screen and payment success notification use
-// this helper so tariff, traffic, dates, reset information and URL stay aligned.
-func FormatSubscriptionMessage(heading, status string, traffic *TrafficInfo, subURL string) string {
-	if traffic == nil {
-		traffic = &TrafficInfo{}
-	}
-
-	trafficInfo := "неограничен"
-	progress := ""
-
-	if traffic.LimitGB > 0 {
-		trafficInfo = fmt.Sprintf("%.2f из %d Гб (%.0f%%)", traffic.UsedGB, traffic.LimitGB, traffic.Percentage)
-		progress = "\n" + traffic.ProgressBar
-	}
-
-	resetInfo := traffic.ResetInfo
-	if resetInfo == "" {
-		resetInfo = "нет"
+// this helper so tariff, dates and URL stay aligned. It shows no traffic quota:
+// the bot does not meter traffic (see SubscriptionDetails).
+func FormatSubscriptionMessage(heading, status string, details *SubscriptionDetails, subURL string) string {
+	if details == nil {
+		details = &SubscriptionDetails{}
 	}
 
 	if status == "" {
@@ -81,15 +69,12 @@ func FormatSubscriptionMessage(heading, status string, traffic *TrafficInfo, sub
 	}
 
 	return fmt.Sprintf(
-		"%s\n\n✌️ Статус: *%s*\n💡 Тариф: *%s*\n📊 Трафик: %s%s\n\n📅 Создана: %s\n⏰ Истекает: %s\n🔄 Сброс: %s\n\n🔗 Ссылка\n`%s`",
+		"%s\n\n✌️ Статус: *%s*\n💡 Тариф: *%s*\n\n📅 Создана: %s\n⏰ Истекает: %s\n\n🔗 Ссылка\n`%s`",
 		heading,
 		status,
-		utils.EscapeLegacyMarkdown(traffic.PlanName),
-		trafficInfo,
-		progress,
-		traffic.CreatedAtFormatted,
-		traffic.ExpiresAtFormatted,
-		resetInfo,
+		utils.EscapeLegacyMarkdown(details.PlanName),
+		details.CreatedAtFormatted,
+		details.ExpiresAtFormatted,
 		subURL,
 	)
 }

@@ -52,8 +52,7 @@ func TestE2E_PremiumPurchase_FullFlow(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed a purchasable premium product bound to a paid plan.
-	paidPlan := &database.Plan{Name: "premium-e2e", IsActive: true, DevicesLimit: 2}
-	require.NoError(t, env.db.GetDB().Create(paidPlan).Error)
+	paidPlan := createE2ESellablePlan(t, env.db, "premium-e2e")
 
 	product := &database.Product{
 		PlanID:       paidPlan.ID,
@@ -75,7 +74,7 @@ func TestE2E_PremiumPurchase_FullFlow(t *testing.T) {
 	assert.Nil(t, freeSub.ProductID, "free subscription has no product yet")
 
 	// Wire the payment provider and order service into the bot handler.
-	orderSvc := service.NewOrderService(env.db, env.subService, env.syncService, fixedPaymentProvider{}, env.botConfig.Username, env.cfg)
+	orderSvc := service.NewOrderService(env.db, env.subService, fixedPaymentProvider{}, env.botConfig.Username, env.cfg)
 	orderSvc.SetAdminBot(env.botAPI)
 	env.handler.SetOrderService(orderSvc)
 

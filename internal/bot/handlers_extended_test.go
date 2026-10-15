@@ -262,42 +262,26 @@ func TestGetHelpText_EdgeCases(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		trafficLimit    int
 		subscriptionURL string
 	}{
 		{
-			name:            "zero traffic limit",
-			trafficLimit:    0,
-			subscriptionURL: "https://example.com/sub",
-		},
-		{
-			name:            "one GB traffic limit",
-			trafficLimit:    1,
-			subscriptionURL: "https://example.com/sub",
-		},
-		{
-			name:            "large traffic limit",
-			trafficLimit:    1000,
+			name:            "plain subscription URL",
 			subscriptionURL: "https://example.com/sub",
 		},
 		{
 			name:            "empty subscription URL",
-			trafficLimit:    10,
 			subscriptionURL: "",
 		},
 		{
 			name:            "very long subscription URL",
-			trafficLimit:    10,
 			subscriptionURL: "https://example.com/" + strings.Repeat("a", 500),
 		},
 		{
 			name:            "subscription URL with special chars",
-			trafficLimit:    10,
 			subscriptionURL: "https://example.com/sub?key=value&other=123",
 		},
 		{
 			name:            "unicode in URL",
-			trafficLimit:    10,
 			subscriptionURL: "https://example.com/подписка",
 		},
 	}
@@ -306,9 +290,10 @@ func TestGetHelpText_EdgeCases(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			text := h.getHelpText(tt.trafficLimit, tt.subscriptionURL)
+			text := h.getHelpText(tt.subscriptionURL)
 
-			assert.Contains(t, text, fmt.Sprintf("%dГб", tt.trafficLimit))
+			// The bot does not meter traffic: no quota is advertised.
+			assert.NotContains(t, text, "Гб")
 			assert.Contains(t, text, tt.subscriptionURL)
 			assert.Contains(t, text, "Happ")
 			assert.Contains(t, text, "iOS")
@@ -497,7 +482,7 @@ func TestHelpText_InjectionSafety(t *testing.T) {
 		t.Run("url_safety", func(t *testing.T) {
 			t.Parallel()
 
-			text := h.getHelpText(10, url)
+			text := h.getHelpText(url)
 			// URL should be included as-is (Markdown code block handles special chars)
 			assert.Contains(t, text, url)
 		})

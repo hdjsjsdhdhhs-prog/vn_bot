@@ -8,10 +8,8 @@ import (
 
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/testutil"
-	"github.com/kereal/rs8kvn_bot/internal/xui"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/stretchr/testify/assert"
@@ -59,8 +57,8 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 	tests := []struct {
 		name            string
 		callbackData    string
-		setupMock       func(*testutil.DatabaseService, *testutil.XUIClient)
-		setupSubService func(*testutil.DatabaseService, *testutil.XUIClient, *config.Config) *service.SubscriptionService
+		setupMock       func(*testutil.DatabaseService)
+		setupSubService func(*testutil.DatabaseService, *config.Config) *service.SubscriptionService
 		wantSend        bool
 		wantText        string
 		wantRequest     bool
@@ -69,29 +67,20 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "create_subscription",
 			callbackData: "create_subscription",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				mockDB.GetByTelegramIDFunc = func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
 					return nil, gorm.ErrRecordNotFound
 				}
 				mockDB.GetPlanByNameFunc = func(ctx context.Context, name string) (*database.Plan, error) {
-					return &database.Plan{ID: 1, Name: database.FreePlanName, TrafficLimit: 1073741824}, nil
+					return &database.Plan{ID: 1, Name: database.FreePlanName}, nil
 				}
 				mockDB.CreateSubscriptionFunc = func(ctx context.Context, sub *database.Subscription, inviteCode string) error {
 					sub.ID = 1
 					return nil
 				}
-				mockDB.GetNodesByPlanIDFunc = func(ctx context.Context, planID uint) ([]database.Node, error) {
-					return nil, nil
-				}
-				mockDB.GetBySubscriptionIDFunc = func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-					return nil, nil
-				}
 			},
-			setupSubService: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient, cfg *config.Config) *service.SubscriptionService {
-				mockXUIClients := map[uint]interfaces.XUIClient{1: mockXUI}
-				nodes := []database.Node{{ID: 1, Name: "main", IsActive: true, Host: "http://example.com", APIToken: "token", InboundIDs: "[1]"}}
-
-				return service.NewSubscriptionService(mockDB, mockXUIClients, nil, nodes, cfg)
+			setupSubService: func(mockDB *testutil.DatabaseService, cfg *config.Config) *service.SubscriptionService {
+				return service.NewSubscriptionService(mockDB, cfg)
 			},
 			wantSend: true,
 			wantText: "Ваша подписка готова",
@@ -99,7 +88,7 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "qr_code",
 			callbackData: "qr_code",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				mockDB.GetByTelegramIDFunc = func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
 					return &database.Subscription{
 						TelegramID: telegramID,
@@ -114,7 +103,7 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "admin_stats",
 			callbackData: "admin_stats",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				mockDB.CountAllSubscriptionsFunc = func(ctx context.Context) (int64, error) {
 					return 10, nil
 				}
@@ -128,7 +117,7 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "admin_lastreg",
 			callbackData: "admin_lastreg",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				mockDB.GetLatestSubscriptionsFunc = func(ctx context.Context, limit int) ([]database.Subscription, error) {
 					return []database.Subscription{
 						{ID: 1, Username: "user1"},
@@ -142,7 +131,7 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "back_to_start",
 			callbackData: "back_to_start",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				mockDB.GetByTelegramIDFunc = func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
 					return nil, gorm.ErrRecordNotFound
 				}
@@ -153,7 +142,7 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "menu_donate",
 			callbackData: "menu_donate",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				// No special setup needed
 			},
 			wantSend: true,
@@ -162,7 +151,7 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "menu_subscription",
 			callbackData: "menu_subscription",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				mockDB.GetByTelegramIDFunc = func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
 					return &database.Subscription{
 						TelegramID: telegramID,
@@ -170,15 +159,9 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 						Status:     "active",
 					}, nil
 				}
-				mockXUI.GetClientTrafficFunc = func(ctx context.Context, username string) (*xui.ClientTraffic, error) {
-					return &xui.ClientTraffic{Up: 1000, Down: 2000}, nil
-				}
 			},
-			setupSubService: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient, cfg *config.Config) *service.SubscriptionService {
-				mockXUIClients := map[uint]interfaces.XUIClient{1: mockXUI}
-				nodes := []database.Node{{ID: 1, Name: "main", IsActive: true, Host: "http://example.com", APIToken: "token", InboundIDs: "[1]"}}
-
-				return service.NewSubscriptionService(mockDB, mockXUIClients, nil, nodes, cfg)
+			setupSubService: func(mockDB *testutil.DatabaseService, cfg *config.Config) *service.SubscriptionService {
+				return service.NewSubscriptionService(mockDB, cfg)
 			},
 			wantSend: true,
 			wantText: "Ваша подписка",
@@ -186,7 +169,7 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "back_to_subscription",
 			callbackData: "back_to_subscription",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				// No special setup needed - just deletes message via Request, not Send
 			},
 			wantSend: false,
@@ -195,7 +178,7 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "menu_help",
 			callbackData: "menu_help",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				mockDB.GetByTelegramIDFunc = func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
 					return &database.Subscription{
 						TelegramID: telegramID,
@@ -210,7 +193,7 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "share_invite",
 			callbackData: "share_invite",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				mockDB.GetOrCreateInviteFunc = func(ctx context.Context, referrerTGID int64, code string) (*database.Invite, error) {
 					return &database.Invite{Code: code, ReferrerTGID: referrerTGID}, nil
 				}
@@ -221,35 +204,35 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 		{
 			name:         "menu_documents",
 			callbackData: "menu_documents",
-			setupMock:    func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {},
+			setupMock:    func(mockDB *testutil.DatabaseService) {},
 			wantSend:     true,
 			wantText:     "Документы",
 		},
 		{
 			name:         "menu_privacy",
 			callbackData: "menu_privacy",
-			setupMock:    func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {},
+			setupMock:    func(mockDB *testutil.DatabaseService) {},
 			wantSend:     true,
 			wantText:     "*Политика конфиденциальности*",
 		},
 		{
 			name:         "menu_terms",
 			callbackData: "menu_terms",
-			setupMock:    func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {},
+			setupMock:    func(mockDB *testutil.DatabaseService) {},
 			wantSend:     true,
 			wantText:     "*Пользовательское соглашение*",
 		},
 		{
 			name:         "menu_support",
 			callbackData: "menu_support",
-			setupMock:    func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {},
+			setupMock:    func(mockDB *testutil.DatabaseService) {},
 			wantSend:     true,
 			wantText:     "С любыми проблемами и вопросами обращайтесь сюда: @kereal",
 		},
 		{
 			name:         "unknown callback",
 			callbackData: "unknown_callback",
-			setupMock: func(mockDB *testutil.DatabaseService, mockXUI *testutil.XUIClient) {
+			setupMock: func(mockDB *testutil.DatabaseService) {
 				// No setup needed
 			},
 			wantSend: false,
@@ -266,14 +249,13 @@ func TestHandleCallback_CallbackDataRouting(t *testing.T) {
 				SiteURL:         "https://example.com",
 			}
 			mockDB := testutil.NewDatabaseService()
-			mockXUI := testutil.NewXUIClient()
 			mockBot := testutil.NewBotAPI()
 
-			tt.setupMock(mockDB, mockXUI)
+			tt.setupMock(mockDB)
 
 			var subService *service.SubscriptionService
 			if tt.setupSubService != nil {
-				subService = tt.setupSubService(mockDB, mockXUI, cfg)
+				subService = tt.setupSubService(mockDB, cfg)
 			}
 
 			handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), subService, "")
@@ -489,11 +471,8 @@ func TestHandleCallback_MenuSubscription_NoSubscription(t *testing.T) {
 	mockDB := testutil.NewDatabaseService()
 
 	mockBot := testutil.NewBotAPI()
-	mockXUI := testutil.NewXUIClient()
 	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
-	mockXUIClients := map[uint]interfaces.XUIClient{1: mockXUI}
-	nodes := []database.Node{{ID: 1, Name: "main", IsActive: true, Host: "http://example.com", APIToken: "token", InboundIDs: "[1]"}}
-	handler.subscriptionService = service.NewSubscriptionService(mockDB, mockXUIClients, nil, nodes, cfg)
+	handler.subscriptionService = service.NewSubscriptionService(mockDB, cfg)
 	handler.subscriptionService.SetInvalidateFunc(handler.cache.Invalidate)
 
 	mockDB.GetByTelegramIDFunc = func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
@@ -854,13 +833,11 @@ func TestHandleBackToSubscription_RequestError(t *testing.T) {
 	mockDB := testutil.NewDatabaseService()
 	mockBot := testutil.NewBotAPI()
 	mockBot.RequestError = errors.New("request failed")
-	xuiClients := map[uint]interfaces.XUIClient{1: testutil.NewXUIClient()}
-	nodes := []database.Node{{ID: 1, IsActive: true, Host: "https://p", APIToken: "t", InboundIDs: "[1]"}}
 
 	require.NoError(t, mockDB.CreateSubscription(context.Background(), &database.Subscription{
 		TelegramID: 123456, Username: "testuser", ClientID: "c", SubscriptionID: "s", Status: "active",
 	}, ""))
-	svc := service.NewSubscriptionService(mockDB, xuiClients, nil, nodes, cfg)
+	svc := service.NewSubscriptionService(mockDB, cfg)
 	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), svc, "")
 
 	ctx := context.Background()

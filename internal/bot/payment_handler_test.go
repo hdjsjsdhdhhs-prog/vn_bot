@@ -42,7 +42,7 @@ func newPaymentTestHandler(t *testing.T, mockDB *testutil.DatabaseService, provi
 	cfg := &config.Config{TelegramAdminID: 123, PaymentEnabled: true}
 	bot := testutil.NewBotAPI()
 	h := NewHandler(bot, cfg, mockDB, NewTestBotConfig(), nil, "")
-	o := service.NewOrderService(mockDB, nil, nil, provider, "testbot", cfg)
+	o := service.NewOrderService(mockDB, nil, provider, "testbot", cfg)
 	h.SetOrderService(o)
 
 	return h, bot
@@ -344,7 +344,8 @@ func TestHandleBuyProduct_SuccessShowsPaymentButton(t *testing.T) {
 				return nil, nil
 			}
 			mockDB.GetPlanByIDFunc = func(context.Context, uint) (*database.Plan, error) {
-				return &database.Plan{ID: 2, IsActive: true}, nil
+				// Only a plan with a subscription builder is sellable.
+				return &database.Plan{ID: 2, IsActive: true, SubscriptionBuilderID: testutil.PtrUint(1)}, nil
 			}
 			mockDB.FindOrCreatePendingPaymentOrderFunc = func(context.Context, uint, uint, int64, string, time.Time) (*database.Order, error) {
 				return &database.Order{ID: 3, SubscriptionID: 7, ProductID: 1, Status: database.OrderStatusPending, AmountCents: tt.priceCents, Currency: "RUB"}, nil

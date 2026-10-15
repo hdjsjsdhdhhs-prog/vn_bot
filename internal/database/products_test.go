@@ -12,8 +12,8 @@ func TestListActiveProducts_FiltersAndSortsByActivePlan(t *testing.T) {
 	t.Parallel()
 	svc := newTestService(t)
 	ctx := context.Background()
-	activePlan := &Plan{Name: "active-paid-plan", IsActive: true, DevicesLimit: 1}
-	inactivePlan := &Plan{Name: "inactive-paid-plan", IsActive: false, DevicesLimit: 1}
+	activePlan := &Plan{Name: "active-paid-plan", IsActive: true}
+	inactivePlan := &Plan{Name: "inactive-paid-plan", IsActive: false}
 
 	require.NoError(t, svc.db.Create(activePlan).Error)
 	require.NoError(t, svc.db.Create(inactivePlan).Error)

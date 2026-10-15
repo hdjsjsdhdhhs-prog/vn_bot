@@ -12,8 +12,9 @@ import type { Page, Route } from '@playwright/test';
 //             composition is never edited, an enabled trial is never saved
 //             onto a configuration that cannot issue it)
 //   replay    runAdminConfigMutation (same key + same payload replays)
-//   nodes     issuance nodes = plan_nodes of the trial plan (legacy_node_ids:
-//             null keeps them; only existing active nodes; none = no_trial_node)
+//   builder   the trial is served only by the trial plan builder: without one
+//             the preview reports builder_id builder_required (unavailable);
+//             there are no issuance nodes and legacy_node_ids is an unknown field
 // No real provider address or credential is used.
 
 const CSRF = 'c'.repeat(43);
@@ -33,7 +34,7 @@ interface Builder {
 interface Composition { builder_version: number; mode: 'all' | 'selected'; source_ids: number[]; rules: Rule[] }
 interface Draft {
   enabled: boolean; duration_hours: number; rate_limit_per_hour: number; title: string; description: string; features: string[];
-  badge: string; builder_id: number | null; composition: Composition | null; legacy_node_ids: number[] | null;
+  badge: string; builder_id: number | null; composition: Composition | null;
 }
 interface Settings {
   enabled: boolean; duration_hours: number; rate_limit_per_hour: number; title: string; description: string; features: string[];
@@ -43,7 +44,7 @@ interface Problem { field: string; code: string; severity: 'invalid' | 'unavaila
 interface Call { method: string; path: string; body: Record<string, unknown> }
 
 interface Options {
-  /** Builder of the trial plan when the page loads (7 trial-only, 8 shared, null legacy). */
+  /** Builder of the trial plan when the page loads (7 trial-only, 8 shared, null none). */
   trialBuilder?: number | null;
   /** false: nothing stored yet, the environment values apply. */
   stored?: boolean;
@@ -51,11 +52,10 @@ interface Options {
   viewFailures?: number;
   /** Committed mutations whose response is lost. */
   lostResponses?: number;
-  /** Nodes linked to the trial plan (plan_nodes) when the page loads. */
-  trialNodes?: number[];
 }
 
-const DRAFT_FIELDS = ['enabled', 'duration_hours', 'rate_limit_per_hour', 'title', 'description', 'features', 'badge', 'builder_id', 'composition', 'legacy_node_ids'];
+/** web.trialDraftBody: the only fields the server accepts (unknown ones are rejected). */
+const DRAFT_FIELDS = ['enabled', 'duration_hours', 'rate_limit_per_hour', 'title', 'description', 'features', 'badge', 'builder_id', 'composition'];
 const SAVE_FIELDS = ['request_key', 'version', ...DRAFT_FIELDS];
 const COPY_FIELDS = ['request_key', 'builder_id'];
 const DEFAULTS = { duration_hours: 3, rate_limit_per_hour: 3 };
@@ -108,14 +108,6 @@ async function backend(page: Page, options: Options = {}) {
     { id: 3, name: 'Стандарт', builder: 8 },
   ];
   const trialPlan = plans[0];
-  // nodes table (no host, token or URL ever reaches the editor) and plan_nodes of the trial plan.
-  const legacyNodes = [
-    { id: 1, name: 'Trial fetch', type: 'fetch', is_active: true },
-    { id: 2, name: 'Panel NL', type: '3x-ui', is_active: true },
-    { id: 4, name: 'Old panel', type: '3x-ui', is_active: false },
-  ];
-  let trialLinks = [...(options.trialNodes ?? [1])];
-  const activeNode = (id: number) => legacyNodes.find(x => x.id === id)?.is_active ?? false;
   let settings: Settings = options.stored === false
     ? { enabled: true, ...DEFAULTS, title: '', description: '', features: [], badge: '', version: 0, stored: false, updated_at: null }
     : { enabled: true, duration_hours: 72, rate_limit_per_hour: 3, title: 'Пробный доступ', description: 'Три дня бесплатно',
@@ -168,34 +160,28 @@ async function backend(page: Page, options: Options = {}) {
     const add = (field: string, code: string, severity: Problem['severity']) => list.push({ field, code, severity });
     if (!Number.isInteger(d.duration_hours) || d.duration_hours < 1 || d.duration_hours > 168) add('duration_hours', 'out_of_range', 'invalid');
     if (!Number.isInteger(d.rate_limit_per_hour) || d.rate_limit_per_hour < 1 || d.rate_limit_per_hour > 100) add('rate_limit_per_hour', 'out_of_range', 'invalid');
-    // database.trialIssuanceNodes: the stored active links, or the chosen ids.
-    const chosen = d.legacy_node_ids ?? trialLinks.filter(activeNode);
-    let nodesOk = true;
-    if (d.legacy_node_ids) {
-      if (d.legacy_node_ids.some(id => !legacyNodes.some(x => x.id === id))) { add('legacy_node_ids', 'legacy_node_not_found', 'invalid'); nodesOk = false; }
-      else if (d.legacy_node_ids.some(id => !activeNode(id))) { add('legacy_node_ids', 'legacy_node_inactive', 'invalid'); nodesOk = false; }
-    }
-    if (nodesOk && !chosen.length) add('legacy_nodes', 'no_trial_node', 'unavailable');
     const base = {
-      enabled: d.enabled, duration_hours: d.duration_hours, previewed_at: now(), legacy_nodes: nodesOk ? chosen.length : 0, sources: [] as unknown[], warnings: [] as string[],
+      enabled: d.enabled, duration_hours: d.duration_hours, previewed_at: now(), sources: [] as unknown[], warnings: [] as string[],
       missing: 0, conflicts: 0, expires_at: new Date(clock + d.duration_hours * 3_600_000).toISOString(),
     };
     const done = (rest: Record<string, unknown>) => ({ ...base, problems: list, issuable: list.length === 0, ...rest });
+    // The trial is served only by its plan builder: /sub has no other route.
     if (d.builder_id === null) {
+      add('builder_id', 'builder_required', 'unavailable');
       if (d.composition) add('composition', 'builder_required', 'invalid');
-      return done({ serve: 'legacy', builder: null, mode: '', total: 0, countries: [], items: [] });
+      return done({ builder: null, mode: '', total: 0, countries: [], items: [] });
     }
     const b = builderOf(d.builder_id);
     if (!b) {
       add('builder_id', 'builder_not_found', 'invalid');
-      return done({ serve: 'builder', builder: null, mode: '', total: 0, countries: [], items: [] });
+      return done({ builder: null, mode: '', total: 0, countries: [], items: [] });
     }
     if (!b.enabled) add('builder_id', 'builder_disabled', 'unavailable');
     let model = compositionOf(b);
     if (d.composition) {
       if (shared(b)) {
         add('composition', 'builder_shared', 'invalid');
-        return done({ serve: 'builder', builder: ref(b), mode: '', total: 0, countries: [], items: [] });
+        return done({ builder: ref(b), mode: '', total: 0, countries: [], items: [] });
       }
       const c = d.composition;
       if (c.mode === 'selected' && !c.rules.length) add('composition.rules', 'required', 'invalid');
@@ -210,7 +196,7 @@ async function backend(page: Page, options: Options = {}) {
     if (!model.source_ids.length) add('composition.source_ids', 'no_sources', 'unavailable');
     else if (!served.length) add('composition', 'empty_result', 'unavailable');
     return done({
-      serve: 'builder', builder: ref(b), mode: model.rules.length ? 'selected' : 'all', total: served.length,
+      builder: ref(b), mode: model.rules.length ? 'selected' : 'all', total: served.length,
       countries: [...counts].map(([code, count]) => ({ code, count })),
       items: served.map(x => ({ kind: 'source', source_id: x.source_id, display_name: x.original_name, status: 'matched', entry: x })),
       sources: model.source_ids.map(id => ({ id, name: sources.find(s => s.id === id)?.name ?? '', enabled: true, usable: true })),
@@ -234,8 +220,7 @@ async function backend(page: Page, options: Options = {}) {
       settings: { ...settings, features: [...settings.features] }, defaults: DEFAULTS, plan_id: trialPlan.id, builder_id: trialPlan.builder,
       composition: b ? compositionOf(b) : null,
       builders: [...builders].sort((x, y) => x.name.localeCompare(y.name)).map(summary),
-      legacy_nodes: legacyNodes.map(x => ({ ...x, linked: trialLinks.includes(x.id) })),
-      preview: evaluate({ ...settings, builder_id: trialPlan.builder, composition: null, legacy_node_ids: null }),
+      preview: evaluate({ ...settings, builder_id: trialPlan.builder, composition: null }),
       active_trials: 4, history: [...history].reverse(),
     };
   };
@@ -295,7 +280,6 @@ async function backend(page: Page, options: Options = {}) {
       description: d.description, features: [...d.features], badge: d.badge, version: settings.version + 1, stored: true, updated_at: now(),
     };
     trialPlan.builder = d.builder_id;
-    if (d.legacy_node_ids) trialLinks = [...d.legacy_node_ids];
     if (d.composition && b) {
       b.sources = d.composition.source_ids.map((source_id, position) => ({ source_id, position }));
       b.items = d.composition.rules.map((rule, position) => item(rule, position));
@@ -390,7 +374,6 @@ async function backend(page: Page, options: Options = {}) {
     settings: () => settings,
     builder: (id: number) => builderOf(id)!,
     plan: (name: string) => plans.find(p => p.name === name)!,
-    trialLinks: () => trialLinks,
     history: () => history,
     /** Another admin saved the trial after the page loaded. */
     touchSettings: (change: Partial<Settings>) => { settings = { ...settings, ...change, version: settings.version + 1, updated_at: now() }; },
@@ -481,18 +464,28 @@ test('load: nothing stored shows the environment values and saves version 0', as
   await expect(page.getByLabel('Срок', { exact: true })).toHaveValue('3');
   await expect(page.getByLabel('Единица')).toHaveValue('hours');
   await expect(page.getByLabel('Построитель', { exact: true })).toHaveValue('');
-  await expect(page.getByRole('region', { name: 'Состав' })).toContainText('Без построителя подписка собирается из узлов тарифа «trial» (сейчас 1)');
+  await expect(page.getByRole('region', { name: 'Состав' })).toContainText('Пробная подписка собирается только построителем тарифа «trial»: без него она не выдаётся.');
   await expect(page.getByRole('region', { name: 'Страны' })).toContainText('Выберите построитель в разделе «Состав»');
-  await expect(preview(page)).toContainText('Узлы тарифа «trial»');
-  await expect(preview(page)).toContainText('По узлам тарифа');
+  // Without a builder /sub has nothing to serve: the preview blocks issuance.
+  await expect(preview(page).locator('[data-preview="blocked"]')).toContainText('С такой конфигурацией пробная подписка не выдаётся.');
+  await expect(preview(page).locator('.trial-problems')).toContainText('Выберите построитель: без него пробная подписка не выдаётся.');
 
+  // Switched on, the server refuses it and marks the builder field.
   await page.getByLabel('Название', { exact: true }).fill('Пробный');
   await saveButton(page).click();
+  await expect(statusText(page)).toContainText('Сервер не сохранил настройки: Выберите построитель');
+  await expect(page.getByLabel('Построитель', { exact: true })).toHaveAttribute('aria-invalid', 'true');
+  expect(api.settings().version).toBe(0);
+
+  // Switched off, the configuration may be prepared without a builder.
+  await page.getByLabel('Выдавать пробную подписку новым посетителям').uncheck();
+  await saveButton(page).click();
   await expect(statusText(page)).toContainText('Пробная подписка сохранена.');
-  const [put] = api.mutations('/admin/api/trial');
-  expect(put.body).toEqual({
-    request_key: expect.stringMatching(KEY_PATTERN), version: 0, enabled: true, duration_hours: 3, rate_limit_per_hour: 3,
-    title: 'Пробный', description: '', features: [], badge: '', builder_id: null, composition: null, legacy_node_ids: null,
+  const puts = api.mutations('/admin/api/trial');
+  expect(puts).toHaveLength(2);
+  expect(puts[1].body).toEqual({
+    request_key: expect.stringMatching(KEY_PATTERN), version: 0, enabled: false, duration_hours: 3, rate_limit_per_hour: 3,
+    title: 'Пробный', description: '', features: [], badge: '', builder_id: null, composition: null,
   });
   await expect(page.locator('.page-desc')).toContainText('Версия 1');
   expect(api.problems()).toEqual([]);
@@ -561,7 +554,7 @@ test('builder: switching builders shows their composition and usage', async ({ p
   await openTrial(page);
   const select = page.getByLabel('Построитель', { exact: true });
   await expect(select.locator('option')).toHaveText([
-    'Без построителя — узлы тарифа «trial»', 'Основной — общий', 'Отключённый — отключён', 'Пробный',
+    'Не выбран — пробная подписка не выдаётся', 'Основной — общий', 'Отключённый — отключён', 'Пробный',
   ]);
   const composition = page.getByRole('region', { name: 'Состав' });
   await expect(composition).toContainText('Только пробной подпиской');
@@ -577,10 +570,10 @@ test('builder: switching builders shows their composition and usage', async ({ p
   await expect(countryBox(page, 'US')).toBeDisabled();
   await expect(preview(page).locator('.trial-sample li')).toHaveText(['🇺🇸 New York · Provider B', '🇳🇱 Amsterdam · Provider A']);
 
-  // Without a builder: the trial plan nodes, no countries.
+  // Without a builder: nothing to serve, no countries, issuance is blocked.
   await select.selectOption('');
-  await expect(composition).toContainText('Без построителя подписка собирается из узлов тарифа «trial»');
-  await expect(preview(page)).toContainText('Узлы тарифа «trial»');
+  await expect(composition).toContainText('Пробная подписка собирается только построителем тарифа «trial»');
+  await expect(preview(page).locator('.trial-problems')).toContainText('Выберите построитель: без него пробная подписка не выдаётся.');
 
   await select.selectOption('8');
   await expect(composition).toContainText('тарифы: Стандарт');
@@ -703,93 +696,20 @@ test('preview: the server evaluates the draft without saving; problems block iss
   expect(api.problems()).toEqual([]);
 });
 
-test('issuance node: a trial plan without a node is fixed from the editor', async ({ page }) => {
-  const api = await backend(page, { trialNodes: [] });
+test('no issuance nodes: the editor offers no node choice and never sends one', async ({ page }) => {
+  const api = await backend(page);
   await openTrial(page);
-  const p = preview(page);
-  await expect(p.locator('[data-preview="blocked"]')).toBeVisible();
-  await expect(p.locator('.trial-problems')).toContainText('У тарифа «trial» нет узла: пробную подписку не на чем создать.');
+  // The servers of the trial come only from the builder: no «Узел выдачи» block.
+  await expect(page.getByRole('group', { name: 'Узел выдачи' })).toHaveCount(0);
+  await expect(page.locator('.trial-legacy')).toHaveCount(0);
+  await expect(preview(page)).not.toContainText('Узлов выдачи');
 
-  // The block in «Состав»: name, type and status of every node, the note.
-  const group = page.getByRole('region', { name: 'Состав' }).getByRole('group', { name: 'Узел выдачи' });
-  // The note separates the issuance node (legacy `nodes`) from the servers of
-  // the subscription (builder sources and rules) and says where nodes come from.
-  await expect(group).toContainText('Это не сервер из каталога источника: состав VPN-подписки определяет построитель (его источники и правила).');
-  await expect(group.locator('.trial-legacy-origin')).toHaveText(/^Новые узлы не появляются после синхронизации источников и в админке не создаются/);
-  await expect(group).toContainText('Узел не выбран: пробную подписку не на чем создать.');
-  const rows = group.locator('.trial-node');
-  await expect(rows).toHaveCount(3);
-  await expect(rows.nth(0)).toContainText('Trial fetch');
-  await expect(rows.nth(0)).toContainText('fetch');
-  await expect(rows.nth(0)).toContainText('Активен');
-  await expect(rows.nth(1)).toContainText('3x-ui');
-  await expect(rows.nth(2)).toContainText('Old panel');
-  await expect(rows.nth(2)).toContainText('Отключён');
-  // A disabled node cannot be chosen.
-  await expect(group.getByRole('checkbox', { name: 'Old panel' })).toBeDisabled();
-  await expect(saveButton(page)).toBeDisabled();
-
-  // Choosing a node: the preview evaluates the choice, nothing is written.
-  await group.getByRole('checkbox', { name: 'Trial fetch' }).check();
-  await expect(group).toContainText('Выбрано: 1 узел.');
-  await expect(p.locator('[data-preview="ok"]')).toContainText('Новая пробная подписка будет выдана с этим составом.');
-  await expect(p).toContainText('Узлов выдачи');
-  expect(api.previews().at(-1)!.body.legacy_node_ids).toEqual([1]);
-  expect(api.mutations()).toHaveLength(0);
-
-  // Several nodes, saved: plan_nodes of the trial plan change, the composition does not.
-  await group.getByRole('checkbox', { name: 'Panel NL' }).check();
-  await expect(group).toContainText('Выбрано: 2 узла.');
-  await saveButton(page).click();
-  await expect(statusText(page)).toContainText('Пробная подписка сохранена.');
-  const [put] = api.mutations('/admin/api/trial');
-  expect(put.body).toMatchObject({ version: 1, builder_id: 7, composition: null, legacy_node_ids: [1, 2] });
-  expect(api.trialLinks()).toEqual([1, 2]);
-  expect(api.builder(7).version).toBe(1);
-  await expect(saveButton(page)).toBeDisabled();
-  await expect(group.getByRole('checkbox', { name: 'Trial fetch' })).toBeChecked();
-  await expect(rows.nth(0)).toContainText('привязан сейчас');
-
-  // Reopening the page loads the saved choice from the server.
-  await page.reload();
-  await expect(group.getByRole('checkbox', { name: 'Trial fetch' })).toBeChecked();
-  await expect(group.getByRole('checkbox', { name: 'Panel NL' })).toBeChecked();
-  await expect(group).toContainText('Выбрано: 2 узла.');
-  await expect(p.locator('[data-preview="ok"]')).toBeVisible();
-  await expect(saveButton(page)).toBeDisabled();
-
-  // Other edits keep the links untouched (null).
   await page.getByLabel('Бейдж', { exact: true }).fill('Хит');
   await saveButton(page).click();
   await expect(statusText(page)).toContainText('Пробная подписка сохранена.');
-  expect(api.mutations('/admin/api/trial')[1].body.legacy_node_ids).toBeNull();
-  expect(api.trialLinks()).toEqual([1, 2]);
-
-  // Unticking every node of a switched-on trial is stopped before sending.
-  await group.getByRole('checkbox', { name: 'Trial fetch' }).uncheck();
-  await group.getByRole('checkbox', { name: 'Panel NL' }).uncheck();
-  await expect(group).toContainText('Узел не выбран');
-  await saveButton(page).click();
-  await expect(group.getByRole('alert')).toContainText('Выберите хотя бы один активный узел выдачи');
-  expect(api.mutations('/admin/api/trial')).toHaveLength(2);
-  expect(api.trialLinks()).toEqual([1, 2]);
-  expect(api.problems()).toEqual([]);
-});
-
-test('issuance node: a disabled node refused by the server is shown on the block', async ({ page }) => {
-  const api = await backend(page);
-  await openTrial(page);
-  // The node list was loaded active; it was switched off meanwhile.
-  await page.route('**/admin/api/trial', async route => {
-    if (route.request().method() !== 'PUT') return route.fallback();
-    return route.fulfill({ status: 400, contentType: 'application/json', body: JSON.stringify({ error: 'invalid_trial', field: 'legacy_node_ids', reason: 'legacy_node_inactive' }) });
-  });
-  const group = page.getByRole('group', { name: 'Узел выдачи' });
-  await group.getByRole('checkbox', { name: 'Panel NL' }).check();
-  await saveButton(page).click();
-  await expect(statusText(page)).toContainText('Сервер не сохранил настройки: Выбранный узел выдачи отключён');
-  await expect(group.getByRole('alert')).toContainText('Выбранный узел выдачи отключён');
-  expect(api.trialLinks()).toEqual([1]);
+  const [put] = api.mutations('/admin/api/trial');
+  expect(Object.keys(put.body).sort()).toEqual([...SAVE_FIELDS].sort());
+  expect(Object.keys(api.previews().at(-1)?.body ?? {})).not.toContain('legacy_node_ids');
   expect(api.problems()).toEqual([]);
 });
 

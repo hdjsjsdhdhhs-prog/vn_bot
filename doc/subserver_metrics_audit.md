@@ -14,8 +14,6 @@
 | `bot_update_duration_seconds` | histogram | `bot/handler.go:622` |
 | `cache_hits_total{cache}` | counter | `subserver/cache.go:61`, `bot/cache.go:81` |
 | `cache_misses_total{cache}` | counter | `subserver/cache.go:56`, `bot/cache.go:54,71` |
-| `xui_requests_total{operation,result}` | counter | `xui/client.go` — live XUI request instrumentation |
-| `xui_request_duration_seconds{operation}` | histogram | `xui/client.go` — live XUI request timing |
 | `active_subscriptions` | gauge | `service/subscription.go` — `.Set()` после мутаций |
 | `subscription_creates_total` | counter | `service/subscription.go` — `Create`, `GetOrCreateSubscription` |
 | `subscription_renewals_total` | counter | `service/subscription.go` — `RenewSubscription` |
@@ -39,7 +37,7 @@
 | `trial_conversions_total` | Удалена: явного trial→paid флоу нет. |
 | `subserver_partial_sources_total{sub_id}` | Удалена из-за опасной cardinality. |
 
-XUI-метрики не являются мёртвыми: `xui_requests_total{operation,result}` и `xui_request_duration_seconds{operation}` инкрементируются в `internal/xui/client.go`.
+Метрики `xui_requests_total` и `xui_request_duration_seconds` удалены вместе с подсистемой VPN-узлов (миграция `051_remove_legacy_nodes`, пакета `internal/xui` больше нет). Раздел сохранён как историческая справка аудита.
 
 ## Ситуация по subserver конкретно
 
