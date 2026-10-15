@@ -55,10 +55,10 @@ func TestSubscriptionManagement_PublicEndpoints(t *testing.T) {
 			t.Cleanup(upstream.Close)
 			source := &database.ProviderSource{Name: "management-provider", Type: "external", Enabled: true, SubscriptionURL: upstream.URL + "/private-management-feed", HWID: "test-management-hwid", UserAgent: "test-management-agent", Headers: `{"Authorization":"Bearer test-management-auth"}`}
 			require.NoError(t, db.CreateProviderSource(ctx, source))
-			plan := &database.Plan{Name: "management", IsActive: true, TrafficLimit: 1024}
+			plan := &database.Plan{Name: "management", IsActive: true}
 			require.NoError(t, db.GetDB().Create(plan).Error)
 			cfg := &config.Config{GlobalSubURL: "https://customer.example/sub/"}
-			svc := service.NewSubscriptionService(db, nil, nil, nil, cfg)
+			svc := service.NewSubscriptionService(db, cfg)
 			runtime := subserver.NewService(time.Minute)
 			t.Cleanup(runtime.Stop)
 			svc.SetInvalidateBySubIDFunc(runtime.InvalidateCache)

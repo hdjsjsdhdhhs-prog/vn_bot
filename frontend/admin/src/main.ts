@@ -1,7 +1,7 @@
 import './style.css';
 import {
   AdminApi, ApiError, errorText, limits, newRequestKey, RENEW_MAX_DAYS,
-  type AdminNode, type AdminPlan, type AdminSubscription, type Dashboard, type Mutation, type MutationAction,
+  type AdminPlan, type AdminSubscription, type Dashboard, type Mutation, type MutationAction,
   type MutationOutcome, type SubscriptionStatus, type UserDetail, type UsersPage, type UsersQuery,
   type AdminSource, type AdminBuilder, type BuilderItem, type SourceEntry, type SourceSyncResult,
   type CreateSourceInput, type UpdateSourceInput,
@@ -32,8 +32,8 @@ import {
 } from './sources';
 import {
   TRIAL_DURATION_PRESETS, TRIAL_LIMITS, TRIAL_SERVER_FIELDS, compositionFromBuilder, countryName, countrySelection,
-  durationHours, formFromView, groupByCountry, hoursLabel, legacyNodeType, moveRule, nodeSelected, problemText, rulesForSources,
-  sameTrialForm, toggleCountry, toggleLegacyNode, toggleNode, trialDurationLabel, validateTrialForm, withComposition,
+  durationHours, formFromView, groupByCountry, hoursLabel, moveRule, nodeSelected, problemText, rulesForSources,
+  sameTrialForm, toggleCountry, toggleNode, trialDurationLabel, validateTrialForm, withComposition,
   type CompositionState, type TrialErrors, type TrialField, type TrialForm,
 } from './trial';
 import { WarmupApi, parseWarmupRoute, warmupHash, type WarmupRoute } from './warmup';
@@ -454,7 +454,6 @@ const DAY_MS = 24 * HOUR_MS;
 const dateFormat = new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
 const dateTimeFormat = new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 const relativeFormat = new Intl.RelativeTimeFormat('ru-RU', { numeric: 'auto' });
-const trafficFormat = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
 const formatDate = (iso: string) => dateFormat.format(new Date(iso));
 const formatDateTime = (iso: string) => dateTimeFormat.format(new Date(iso));
 
@@ -486,20 +485,6 @@ function formatPrice(amount: number, currency: string | null): string {
     return `${formatCount(amount)} ${currency}`;
   }
 }
-
-function formatTraffic(bytes: number): string {
-  if (bytes === 0) return 'Без ограничения';
-  const gib = bytes / 1024 ** 3;
-  return gib >= 1 ? `${trafficFormat.format(gib)} ГБ` : `${trafficFormat.format(bytes / 1024 ** 2)} МБ`;
-}
-
-// database.SyncStatus values.
-const SYNC_LABELS: Readonly<Record<string, string>> = {
-  active: 'Синхронизирован',
-  pending_add: 'Ожидает добавления',
-  pending_remove: 'Ожидает удаления',
-  pending_update: 'Ожидает обновления',
-};
 
 interface UsersState {
   /** Last applied query; the page size is the server default. */
@@ -685,10 +670,6 @@ const USER_COLUMNS = [
   ['Действует до', ''], ['Последний запрос', 'col-lg'], ['Оплата', 'col-md'],
 ] as const;
 
-const NODE_COLUMNS = [
-  ['Узел', ''], ['Синхронизация', ''], ['Попытки', 'num'], ['Следующая попытка', ''], ['Обновлено', ''], ['Последняя ошибка', ''],
-] as const;
-
 function fact(label: string, value: string | Node, note?: string, noteClass = ''): HTMLElement {
   const item = el('div', 'fact');
   const data = el('dd');
@@ -698,7 +679,7 @@ function fact(label: string, value: string | Node, note?: string, noteClass = ''
   return item;
 }
 
-function subscriptionPanel(user: AdminSubscription, plan: AdminPlan | null, now: number): HTMLElement {
+function subscriptionPanel(user: AdminSubscription, now: number): HTMLElement {
   const panel = el('section', 'panel');
   panel.setAttribute('aria-labelledby', 'subscription-title');
   const expired = isActiveExpired(user, now);
@@ -712,12 +693,12 @@ function subscriptionPanel(user: AdminSubscription, plan: AdminPlan | null, now:
     fact('Тариф', planLabel(user)),
     fact('Оплата', user.is_paid ? 'Платная' : 'Бесплатная',
       user.price_paid_cents > 0 ? formatPrice(user.price_paid_cents, user.currency) : undefined),
-    fact('Устройства', formatCount(user.devices), plan ? `Лимит тарифа: ${formatCount(plan.devices_limit)}` : undefined),
+    fact('Устройства', formatCount(user.devices)),
     fact('IP-адреса', formatCount(user.ips)),
     fact('Последний запрос', user.last_request ? formatDateTime(user.last_request) : 'Не было',
       user.last_request ? relativeTime(user.last_request, now) : undefined),
     fact('Начало', user.started_at ? formatDateTime(user.started_at) : 'Нет данных'),
-    fact('Источник', user.provider_source_id === null ? 'Узлы сервиса' : `Внешний провайдер #${user.provider_source_id}`),
+    fact('Источник', user.provider_source_id === null ? 'Построитель' : `Внешний провайдер #${user.provider_source_id}`),
     fact('Пригласил', referrer),
     fact('Создана', formatDateTime(user.created_at)),
     fact('Обновлена', formatDateTime(user.updated_at)),
@@ -738,46 +719,8 @@ function planPanel(user: AdminSubscription, plan: AdminPlan | null): HTMLElement
   facts.append(
     fact('Название', plan.name || `Тариф #${plan.id}`),
     fact('Состояние', plan.is_active ? 'Доступен' : 'Отключён'),
-    fact('Лимит устройств', formatCount(plan.devices_limit)),
-    fact('Лимит трафика', formatTraffic(plan.traffic_limit)),
   );
   panel.append(facts);
-  return panel;
-}
-
-function nodesPanel(user: AdminSubscription, nodes: readonly AdminNode[]): HTMLElement {
-  const panel = el('section', 'panel');
-  panel.setAttribute('aria-labelledby', 'nodes-title');
-  panel.append(panelHead('nodes-title', 'Узлы', formatCount(nodes.length)));
-  if (nodes.length === 0) {
-    panel.append(el('p', 'panel-note', user.provider_source_id === null
-      ? 'К подписке не привязан ни один узел.'
-      : 'Подписка обслуживается внешним провайдером, узлы сервиса к ней не привязываются.'));
-    return panel;
-  }
-  const table = el('table', 'table table-cards nodes-table');
-  table.append(el('caption', 'sr-only', 'Узлы подписки'), headRow(NODE_COLUMNS));
-  const body = el('tbody');
-  for (const node of nodes) {
-    const sync = el('span', 'status');
-    sync.append(el('span', node.status === 'active' ? 'swatch tone-active' : 'swatch tone-paused'),
-      el('span', '', SYNC_LABELS[node.status] ?? node.status));
-    const row = el('tr');
-    row.append(
-      cell('Узел', node.node_name || `Узел #${node.node_id}`),
-      cell('Синхронизация', sync),
-      cell('Попытки', formatCount(node.retry_count), 'num'),
-      cell('Следующая попытка', node.retry_at ? formatDateTime(node.retry_at) : 'Нет', node.retry_at ? '' : 'muted'),
-      cell('Обновлено', formatDateTime(node.updated_at)),
-      cell('Последняя ошибка', node.last_error ? el('span', 'error-text', node.last_error) : 'Нет',
-        node.last_error ? 'cell-wrap' : 'muted'),
-    );
-    body.append(row);
-  }
-  table.append(body);
-  const wrap = el('div', 'table-wrap');
-  wrap.append(table);
-  panel.append(wrap);
   return panel;
 }
 
@@ -2722,8 +2665,8 @@ class AdminApp {
     const focusKey = active instanceof HTMLElement && view.body.contains(active) ? active.dataset.focusKey : undefined;
     const now = Date.now();
     const grid = el('div', 'detail-grid');
-    grid.append(subscriptionPanel(user, data.plan, now), planPanel(user, data.plan));
-    view.body.replaceChildren(grid, this.managePanel(data, now), this.builderPanel(data), nodesPanel(user, data.nodes));
+    grid.append(subscriptionPanel(user, now), planPanel(user, data.plan));
+    view.body.replaceChildren(grid, this.managePanel(data, now), this.builderPanel(data));
     if (focusKey) this.focusManage(focusKey);
   }
 
@@ -3064,14 +3007,6 @@ class AdminApp {
             settled = true;
             stale = true;
             show({ tone: 'error', text: 'Подписка не найдена. Возможно, она удалена. Закройте окно, чтобы обновить страницу.' });
-          } else if (code === 'sync_failed') {
-            // Committed and audited; only the node sync setup failed. The
-            // same key replays the change and re-runs the sync.
-            frozen = true;
-            stale = true;
-            confirmLabel = 'Повторить синхронизацию';
-            show({ tone: 'error', text: 'Изменение сохранено, но синхронизация с узлами не запущена. Повторите: изменение не применится второй раз.' });
-            void this.loadUser(before.id);
           } else if (httpStatus === 401) {
             // Rejected before the service; the session check above found it alive.
             show({ tone: 'error', text: `${ACTION_FAILED[action]} ${errorText(error)}` });
@@ -6309,7 +6244,7 @@ class AdminApp {
       paintedPlan = form.planId;
       const selected = (this.plansCache ?? plans).find(item => item.id === form.planId) ?? null;
       if (!selected) {
-        planBody.replaceChildren(el('p', 'panel-note', 'Выберите план: он задаёт лимиты подписки и построитель конфигурации.'));
+        planBody.replaceChildren(el('p', 'panel-note', 'Выберите план: он задаёт построитель конфигурации подписки.'));
         return;
       }
       const facts = el('dl', 'facts facts-single');
@@ -6317,8 +6252,6 @@ class AdminApp {
         || (selected.subscription_builder_id !== null ? `Построитель #${selected.subscription_builder_id}` : 'Не назначен');
       facts.append(
         fact('План', selected.name, selected.is_active ? undefined : 'План отключён', 'is-danger'),
-        fact('Устройства', selected.devices_limit ? formatCount(selected.devices_limit) : 'Без ограничения'),
-        fact('Трафик', formatTraffic(selected.traffic_limit)),
         fact('Построитель', builderName, 'Назначается плану и действует для всех его тарифов и подписок.'),
       );
       const assign = button('Изменить построитель', 'btn btn-secondary btn-sm', 'builders');
@@ -6904,29 +6837,13 @@ class AdminApp {
     setters.set('builderId', builderField.setError);
     targets.set('builderId', builderSelect);
     const fillBuilders = () => {
-      builderSelect.replaceChildren(option('', 'Без построителя — узлы тарифа «trial»'));
+      builderSelect.replaceChildren(option('', 'Не выбран — пробная подписка не выдаётся'));
       for (const b of base.builders) {
         const notes = [b.enabled ? '' : 'отключён', b.shared ? 'общий' : ''].filter(Boolean).join(', ');
         builderSelect.append(option(String(b.id), notes ? `${b.name} — ${notes}` : b.name));
       }
     };
     fillBuilders();
-
-    // Issuance node: plan_nodes of the trial plan. Only the client CreateTrial
-    // provisions lives there; the VPN composition comes from the builder.
-    const legacyBody = el('div', 'trial-legacy');
-    legacyBody.id = 'tr-legacy';
-    legacyBody.setAttribute('role', 'group');
-    legacyBody.setAttribute('aria-labelledby', 'tr-legacy-title');
-    legacyBody.tabIndex = -1;
-    const legacyError = el('p', 'field-error');
-    legacyError.id = 'tr-legacy-error';
-    legacyError.setAttribute('role', 'alert');
-    setters.set('legacyNodes', text => {
-      legacyError.textContent = text;
-      if (text) legacyBody.setAttribute('aria-describedby', legacyError.id); else legacyBody.removeAttribute('aria-describedby');
-    });
-    targets.set('legacyNodes', legacyBody);
 
     const read = () => {
       form.enabled = enabled.checked;
@@ -6979,7 +6896,7 @@ class AdminApp {
       el('p', 'field-hint', 'В Mini App пробная подписка не показывается: её выдаёт страница приглашения по реферальной ссылке.'));
     const composition = section('tr-composition', 'Состав', 'Построитель и источники');
     const builderBody = el('div', 'trial-builder');
-    composition.content.append(builderField.root, builderBody, legacyBody);
+    composition.content.append(builderField.root, builderBody);
     const countries = section('tr-countries', 'Страны', 'Страны и серверы');
     const countriesBody = el('div', 'trial-countries');
     countries.content.append(countriesBody, compositionError);
@@ -7068,7 +6985,7 @@ class AdminApp {
       builderSelect.disabled = busy;
       const nodes: HTMLElement[] = [];
       if (form.builderId === null) {
-        nodes.push(el('p', 'field-hint', `Без построителя подписка собирается из узлов тарифа «trial» (сейчас ${formatCount(base.preview.legacy_nodes)}). Страны и серверы при этом не настраиваются.`));
+        nodes.push(el('p', 'field-hint', 'Пробная подписка собирается только построителем тарифа «trial»: без него она не выдаётся. Выберите построитель, чтобы настроить источники, страны и серверы.'));
         builderBody.replaceChildren(...nodes);
         return;
       }
@@ -7124,50 +7041,6 @@ class AdminApp {
         nodes.push(list);
       }
       builderBody.replaceChildren(...nodes);
-    };
-
-    const paintLegacyNodes = (focusId?: number) => {
-      const nodes: HTMLElement[] = [];
-      const title = el('p', 'preview-caption', 'Узел выдачи');
-      title.id = 'tr-legacy-title';
-      nodes.push(title, notice({ tone: 'info', text: TRIAL_LEGACY_NOTE }));
-      nodes.push(el('p', 'field-hint trial-legacy-origin', TRIAL_LEGACY_ORIGIN));
-      if (!base.legacy_nodes.length) {
-        nodes.push(el('p', 'field-hint', 'Узлов выдачи нет: пробную подписку не на чем создать.'));
-      } else {
-        const list = el('ul', 'trial-node-list');
-        list.setAttribute('aria-label', 'Узлы выдачи');
-        for (const n of base.legacy_nodes) {
-          const row = el('li', 'trial-node');
-          const box = el('input');
-          box.type = 'checkbox';
-          box.id = `tr-ln-${n.id}`;
-          box.checked = form.legacyNodeIds.includes(n.id);
-          box.disabled = saving || !n.is_active;
-          box.addEventListener('change', () => {
-            form.legacyNodeIds = toggleLegacyNode(form.legacyNodeIds, n.id);
-            setters.get('legacyNodes')?.('');
-            paintLegacyNodes(n.id);
-            paintActions();
-            schedulePreview();
-          });
-          const label = el('label', 'trial-node-name', n.name || `Узел #${n.id}`);
-          label.htmlFor = box.id;
-          const state = n.is_active ? el('span', 'tag tag-on', 'Активен') : el('span', 'tag', 'Отключён');
-          const note = !n.is_active && n.linked ? 'привязан, но не используется' : n.linked ? 'привязан сейчас' : '';
-          row.append(box, label, el('span', 'tag', legacyNodeType(n.type)), state);
-          if (note) row.append(el('span', 'slot-status', note));
-          list.append(row);
-        }
-        nodes.push(list);
-      }
-      const count = form.legacyNodeIds.length;
-      nodes.push(el('p', 'field-hint', count
-        ? `Выбрано: ${formatCount(count)} ${pluralRu(count, 'узел', 'узла', 'узлов')}. Пробная подписка создаётся на первом из них по порядку id. Отключённые узлы выбрать нельзя.`
-        : 'Узел не выбран: пробную подписку не на чем создать.'));
-      nodes.push(legacyError);
-      legacyBody.replaceChildren(...nodes);
-      if (focusId !== undefined) legacyBody.querySelector<HTMLInputElement>(`#tr-ln-${focusId}`)?.focus();
     };
 
     const paintCountries = () => {
@@ -7374,10 +7247,11 @@ class AdminApp {
       facts.append(
         fact('Срок', p.duration_hours ? trialDurationLabel(p.duration_hours) : '—',
           p.duration_hours ? `Выданная сейчас истечёт ${formatDateTime(p.expires_at)}` : undefined),
-        fact('Построитель', p.builder ? p.builder.name : 'Узлы тарифа «trial»', p.builder && !p.builder.enabled ? 'Отключён' : undefined, 'is-danger'),
-        fact('Узлов выдачи', formatCount(p.legacy_nodes), p.legacy_nodes ? undefined : 'Пробную подписку не на чем создать.', 'is-danger'),
-        fact('Серверов', p.serve === 'builder' ? formatCount(p.total) : 'По узлам тарифа'),
-        fact('Стран', p.serve === 'builder' ? formatCount(p.countries.length) : '—',
+        fact('Построитель', p.builder ? p.builder.name : 'Не выбран', p.builder
+          ? (p.builder.enabled ? undefined : 'Отключён')
+          : 'Без построителя пробная подписка не выдаётся.', 'is-danger'),
+        fact('Серверов', p.builder ? formatCount(p.total) : '—'),
+        fact('Стран', p.builder ? formatCount(p.countries.length) : '—',
           p.countries.length ? p.countries.map(c => `${c.code || 'без страны'} ${formatCount(c.count)}`).join(' · ') : undefined),
         fact('Profile title', p.builder?.profile_title || 'Не задан'),
         fact('Support URL', p.builder?.support_url || 'Не задан'),
@@ -7400,7 +7274,7 @@ class AdminApp {
     let previewTimer = 0;
     let previewRequest = 0;
     const runPreview = async () => {
-      const { draft } = validateTrialForm(form, storedFor(), editable(), baseline.legacyNodeIds);
+      const { draft } = validateTrialForm(form, storedFor(), editable());
       if (!draft) { paintPreview({ kind: 'invalid' }); return; }
       const request = ++previewRequest;
       paintPreview({ kind: 'busy' });
@@ -7434,7 +7308,6 @@ class AdminApp {
       paintHeading();
       paintExpiry();
       paintBuilder();
-      paintLegacyNodes();
       paintCountries();
       paintExtra();
       paintActions();
@@ -7527,7 +7400,7 @@ class AdminApp {
       if (saving) return;
       read();
       clearErrors();
-      const { draft, errors } = validateTrialForm(form, storedFor(), editable(), baseline.legacyNodeIds);
+      const { draft, errors } = validateTrialForm(form, storedFor(), editable());
       if (!draft) {
         showErrors(errors);
         return;
@@ -7675,17 +7548,8 @@ class AdminApp {
 // Trial helpers
 
 const TRIAL_DESC = 'Как выдаётся пробная подписка по реферальной ссылке: срок, состав, страны и серверы, ограничения и карточка на странице приглашения.';
-const TRIAL_FIELD_ORDER: readonly TrialField[] = ['duration', 'title', 'description', 'features', 'badge', 'builderId', 'composition', 'legacyNodes', 'rateLimit'];
+const TRIAL_FIELD_ORDER: readonly TrialField[] = ['duration', 'title', 'description', 'features', 'badge', 'builderId', 'composition', 'rateLimit'];
 const TRIAL_SAMPLE = 8;
-// database.TrialLegacyNode: a row of the legacy `nodes` table linked to the
-// trial plan through plan_nodes. CreateTrial provisions the anonymous client on
-// the first one; the servers of the subscription come from the builder.
-const TRIAL_LEGACY_NOTE = 'Узел выдачи — служебная запись таблицы nodes (панель 3x-ui, proxman или fetch), на которой бот регистрирует клиента пробной подписки. '
-  + 'Это не сервер из каталога источника: состав VPN-подписки определяет построитель (его источники и правила). '
-  + 'Без построителя или при отключённом построителе подписка собирается из узлов тарифа «trial».';
-const TRIAL_LEGACY_ORIGIN = 'Новые узлы не появляются после синхронизации источников и в админке не создаются: '
-  + 'узел содержит адрес и токен панели, его добавляет администратор сервера, бот подключает его при перезапуске. '
-  + 'Чтобы изменить серверы подписки, добавьте источник в разделе «Источники» и выберите его в построителе.';
 const TRIAL_PREVIEW_DEBOUNCE_MS = 350;
 
 /** The rules the trial already follows (internal/web handleInvite, BindTrial, cleanup). */

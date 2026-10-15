@@ -29,11 +29,7 @@ func TestSubscriptionRenewal_ProviderLifecycle(t *testing.T) {
 			created, err := svc.Create(ctx, 81001, "renewal", "", terms)
 			require.NoError(t, err)
 			sub := created.Subscription
-			// Wire sync and real legacy plan nodes so accidental fallback is observable.
-			node := &database.Node{Name: "must-not-provision", Type: database.NodeTypeFetch, IsActive: true}
-			require.NoError(t, db.GetDB().Create(node).Error)
-			require.NoError(t, db.GetDB().Create(&database.PlanNode{PlanID: sub.PlanID, NodeID: node.ID}).Error)
-			svc.SetSyncService(NewSyncService(db, nil, nil))
+
 			expiry := time.Now().Add(tc.offset).In(time.FixedZone("customer", 5*3600))
 			sub.ExpiresAt = &expiry
 			sub.Status = tc.status
@@ -68,16 +64,6 @@ func TestSubscriptionRenewal_ProviderLifecycle(t *testing.T) {
 			count, err := db.CountAllSubscriptions(ctx)
 			require.NoError(t, err)
 			assert.Equal(t, int64(1), count)
-			nodes, err := db.GetBySubscriptionID(ctx, sub.ID)
-			require.NoError(t, err)
-			assert.Empty(t, nodes)
-			targets, err := db.GetActiveSubscriptionsWithTrafficLimit(ctx)
-			require.NoError(t, err)
-			assert.Empty(t, targets, "renewal must not enable legacy quota processing")
-			_, traffic, err := svc.GetWithTraffic(ctx, sub.TelegramID)
-			require.NoError(t, err)
-			assert.Zero(t, traffic.LimitGB)
-			assert.Zero(t, traffic.UsedGB)
 			// The service result is internal and cannot accidentally serialize IDs
 			// or bearer credentials as a future HTTP response.
 			encoded, err := json.Marshal(renewed)
@@ -228,7 +214,7 @@ func TestSubscriptionRenewal_Rollback(t *testing.T) {
 	assert.Equal(t, before, after)
 }
 
-func TestSubscriptionRenewal_LegacySamePlanPreservesQuotaAndFreeBehavior(t *testing.T) {
+func TestSubscriptionRenewal_LegacySamePlanAndFreeBehavior(t *testing.T) {
 	db, svc, terms := customerLifecycleFixture(t)
 	ctx := context.Background()
 	legacy, err := svc.Create(ctx, 81005, "legacy", "")
@@ -243,23 +229,12 @@ func TestSubscriptionRenewal_LegacySamePlanPreservesQuotaAndFreeBehavior(t *test
 	// The existing admin path selects the finite legacy plan explicitly.
 	sub, err := svc.AdminSetPlan(ctx, free.ID, terms.PlanID, 30)
 	require.NoError(t, err)
-	node := &database.Node{Name: "renewal-legacy", Type: database.NodeTypeFetch, IsActive: true}
-	require.NoError(t, db.GetDB().Create(node).Error)
-	require.NoError(t, db.GetDB().Create(&database.PlanNode{PlanID: sub.PlanID, NodeID: node.ID}).Error)
-	require.NoError(t, db.CreateSubscriptionNode(ctx, &database.SubscriptionNode{SubscriptionID: sub.ID, NodeID: node.ID, Status: database.SyncStatusActive}))
-	require.NoError(t, db.GetDB().Model(&database.Subscription{}).Where("id = ?", sub.ID).Update("traffic_reminders_sent", 3).Error)
-	svc.SetSyncService(NewSyncService(db, nil, nil))
-	nodesBefore, err := db.GetBySubscriptionID(ctx, sub.ID)
-	require.NoError(t, err)
 	renewed, err := svc.RenewSubscription(ctx, sub.ID, 7)
 	require.NoError(t, err)
 	assertRenewalIdentity(t, sub, renewed.Subscription)
 	assert.True(t, renewed.Subscription.ExpiresAt.Equal(sub.ExpiresAt.UTC().AddDate(0, 0, 7)))
 	assert.Nil(t, renewed.Subscription.ProviderSourceID)
-	assert.Equal(t, 3, renewed.Subscription.TrafficRemindersSent)
-	nodesAfter, err := db.GetBySubscriptionID(ctx, sub.ID)
-	require.NoError(t, err)
-	assert.Equal(t, nodesBefore, nodesAfter, "same-plan renewal must not enqueue updates that reset traffic")
+	assert.Equal(t, sub.PlanID, renewed.Subscription.PlanID, "renewal keeps the plan")
 	// Provider-only restrictions must not leak into legacy renewal.
 	require.NoError(t, db.GetDB().Model(&database.ProviderSource{}).Where("id = ?", terms.ProviderSourceID).Update("enabled", false).Error)
 	_, err = svc.RenewSubscription(ctx, sub.ID, 1)

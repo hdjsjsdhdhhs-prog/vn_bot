@@ -36,8 +36,6 @@ const (
 	MsgAdminDelUsage     MessageKey = "admin.del_usage"
 	MsgAdminDelInvalidID MessageKey = "admin.del_invalid_id"
 	MsgAdminDelNotFound  MessageKey = "admin.del_not_found"
-	MsgAdminDelXUIFailed MessageKey = "admin.del_xui_failed"
-	MsgAdminDelPartial   MessageKey = "admin.del_partial"
 	MsgAdminDelSuccess   MessageKey = "admin.del_success"
 
 	MsgAdminBroadcastUsage   MessageKey = "admin.broadcast_usage"
@@ -62,15 +60,7 @@ const (
 	MsgQRCodeCaption MessageKey = "qr.caption"
 	MsgQRCodeBack    MessageKey = "qr.back"
 
-	MsgErrConnection      MessageKey = "err.connection"
-	MsgErrAuth            MessageKey = "err.auth"
-	MsgErrRequestCanceled MessageKey = "err.request_canceled"
-	MsgErrDialTCP         MessageKey = "err.dial_tcp"
-	MsgErrTLS             MessageKey = "err.tls"
-	MsgErrInboundNotFound MessageKey = "err.inbound_not_found"
-	MsgErrClientExists    MessageKey = "err.client_exists"
-	MsgErrGeneric         MessageKey = "err.generic"
-	MsgErrPartialSave     MessageKey = "err.partial_save"
+	MsgErrGeneric MessageKey = "err.generic"
 )
 
 var messages = map[MessageKey]string{
@@ -84,7 +74,7 @@ var messages = map[MessageKey]string{
 	MsgSubNoActive:        "❌ У вас нет активной подписки.\n\nНажмите «Получить подписку» для создания.",
 	MsgSubTempError:       "❌ Временная ошибка. Попробуйте позже.",
 	MsgSubCreateError:     "❌ Ошибка при создании подписки.",
-	MsgSubCreatedSuccess:  "✅ Ваша подписка\n\n📊 Трафик: %d ГБ\n\n🔗 Ссылка\n`%s`",
+	MsgSubCreatedSuccess:  "✅ Ваша подписка\n\n🔗 Ссылка\n`%s`",
 	MsgPremiumOffer:       "💎 *Бесплатный апгрейд*\n\nСейчас у вас тариф *%s*.\n\nВы можете получить *%s* сразу после подтверждения.\nСтоимость сейчас: *%s*.\n\nПосле подтверждения тариф сменится автоматически.",
 	MsgPremiumBenefits:    "✨ *Преимущества Premium*\n\n" + service.PremiumBenefitsText + "\n\nВыберите тариф",
 	MsgPremiumBadge:       "Вы — 💎 Premium",
@@ -101,8 +91,6 @@ var messages = map[MessageKey]string{
 	MsgAdminDelUsage:     "❌ Использование: /del <id>\n\nПример: /del 5",
 	MsgAdminDelInvalidID: "❌ ID должен быть положительным числом",
 	MsgAdminDelNotFound:  "❌ Подписка с ID %d не найдена",
-	MsgAdminDelXUIFailed: "❌ Ошибка удаления клиента из панели 3x-ui",
-	MsgAdminDelPartial:   "⚠️ Клиент удален из панели, но ошибка удаления из базы",
 	MsgAdminDelSuccess:   "✅ Подписка успешно удалена!\n\n👤 Пользователь: %s\n🆔 Telegram ID: %d",
 
 	MsgAdminBroadcastUsage:   "❌ Использование: /broadcast <сообщение>\n\nПример: /broadcast Привет всем!",
@@ -127,15 +115,7 @@ var messages = map[MessageKey]string{
 	MsgQRCodeCaption: "📱 QR-код с подпиской\n\nНаведите камеру телефона на код, чтобы импортировать подписку",
 	MsgQRCodeBack:    "Назад",
 
-	MsgErrConnection:      "❌ Не удается подключиться к серверу. Попробуйте позже.",
-	MsgErrAuth:            "❌ Ошибка авторизации на сервере. Свяжитесь с администратором.",
-	MsgErrRequestCanceled: "❌ Запрос был прерван. Попробуйте снова.",
-	MsgErrDialTCP:         "❌ Ошибка подключения к серверу. Проверьте настройки DNS.",
-	MsgErrTLS:             "❌ Ошибка SSL/TLS сертификата. Свяжитесь с администратором.",
-	MsgErrInboundNotFound: "❌ Ошибка сервера при создании подписки",
-	MsgErrClientExists:    "❌ Ошибка сервера при создании подписки",
-	MsgErrGeneric:         "❌ Ошибка при создании подписки.",
-	MsgErrPartialSave:     "❌ Подписка создана в панели, но не сохранена в базе. Обратитесь к администратору.",
+	MsgErrGeneric: "❌ Ошибка при создании подписки.",
 }
 
 func msg(key MessageKey, a ...any) string {

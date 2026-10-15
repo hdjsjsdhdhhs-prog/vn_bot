@@ -39,14 +39,17 @@ func TestTrialSettingsMigration049_PopulatedUpDown(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, trialSettingsTableCount(t, f))
 
+	m, err := newMigration(sqlDB, false)
+	require.NoError(t, err)
+	// Start from 049 itself: rolling back later migrations (051 restores the
+	// legacy plan limit columns) must not leak into the 049 comparison.
+	require.NoError(t, m.Migrate(49))
+
 	plansBefore := tableRows(t, f.svc, "plans", "id", "")
 	buildersBefore := tableRows(t, f.svc, "subscription_builders", "id", "")
 	itemsBefore := tableRows(t, f.svc, "subscription_builder_items", "id", "")
 	sourcesBefore := tableRows(t, f.svc, "subscription_builder_sources", "builder_id, source_id", "")
 	auditBefore := tableRows(t, f.svc, "admin_audit_log", "id", "")
-
-	m, err := newMigration(sqlDB, false)
-	require.NoError(t, err)
 
 	// Rollback drops only trial_settings: the trial plan keeps its builder and
 	// the builder keeps its rules, so /sub serves the same composition and the
@@ -172,7 +175,7 @@ func TestTrial_ConcurrentSavesOfOneVersion(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				<-start
-				d := f.draft(nil, nil)
+				d := f.draft(uptr(f.builder.ID), nil)
 				d.DurationHours = 10*version + i + 1
 				_, err := f.svc.UpdateTrial(f.ctx, AdminConfigMeta{Actor: "admin", RequestKey: fmt.Sprintf("concurrent-trial-%d-%d", version, i)},
 					TrialUpdateInput{Version: version, Defaults: trialTestDefaults, TrialDraft: d})

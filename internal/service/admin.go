@@ -7,9 +7,6 @@ import (
 	"time"
 
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/logger"
-
-	"go.uber.org/zap"
 )
 
 // AdminRepository is the persistence seam of AdminService. *database.Service
@@ -28,18 +25,17 @@ var _ AdminRepository = (*database.Service)(nil)
 // authentication: callers must have authorized the actor (adminauth) before
 // invoking it. Mutations are atomic with their audit row in the repository;
 // this layer adds validation, safe read models and post-commit side effects
-// (cache invalidation, VPN node sync, metrics).
+// (cache invalidation, metrics).
 type AdminService struct {
 	repo AdminRepository
 	subs *SubscriptionService
-	sync *SyncService
 }
 
-// NewAdminService wires the admin boundary. subs and sync may be nil in tests;
-// production passes the shared SubscriptionService and SyncService so cache
-// invalidation and node provisioning follow the same paths as the bot.
-func NewAdminService(repo AdminRepository, subs *SubscriptionService, sync *SyncService) *AdminService {
-	return &AdminService{repo: repo, subs: subs, sync: sync}
+// NewAdminService wires the admin boundary. subs may be nil in tests;
+// production passes the shared SubscriptionService so cache invalidation
+// follows the same paths as the bot.
+func NewAdminService(repo AdminRepository, subs *SubscriptionService) *AdminService {
+	return &AdminService{repo: repo, subs: subs}
 }
 
 // AdminSubscriptionView is the browser-safe projection of a subscription. It
@@ -93,17 +89,14 @@ type AdminPlanView struct {
 	ID                    uint   `json:"id"`
 	Name                  string `json:"name"`
 	IsActive              bool   `json:"is_active"`
-	DevicesLimit          int    `json:"devices_limit"`
-	TrafficLimit          int64  `json:"traffic_limit"`
 	SubscriptionBuilderID *uint  `json:"subscription_builder_id"`
 }
 
 // AdminSubscriptionPage is the subscription detail response.
 type AdminSubscriptionPage struct {
-	Subscription AdminSubscriptionView            `json:"subscription"`
-	Plan         *AdminPlanView                   `json:"plan"`
-	Nodes        []database.AdminSubscriptionNode `json:"nodes"`
-	Audit        []database.AdminAuditLog         `json:"audit"`
+	Subscription AdminSubscriptionView    `json:"subscription"`
+	Plan         *AdminPlanView           `json:"plan"`
+	Audit        []database.AdminAuditLog `json:"audit"`
 }
 
 // AdminUsersPage is the paginated users list response.
@@ -169,9 +162,9 @@ func (s *AdminService) GetSubscription(ctx context.Context, id uint) (*AdminSubs
 	var plan *AdminPlanView
 	if detail.Plan != nil {
 		planName = detail.Plan.Name
-		plan = &AdminPlanView{ID: detail.Plan.ID, Name: detail.Plan.Name, IsActive: detail.Plan.IsActive, DevicesLimit: detail.Plan.DevicesLimit, TrafficLimit: detail.Plan.TrafficLimit, SubscriptionBuilderID: detail.Plan.SubscriptionBuilderID}
+		plan = &AdminPlanView{ID: detail.Plan.ID, Name: detail.Plan.Name, IsActive: detail.Plan.IsActive, SubscriptionBuilderID: detail.Plan.SubscriptionBuilderID}
 	}
-	return &AdminSubscriptionPage{Subscription: adminViewOf(&detail.Subscription, planName), Plan: plan, Nodes: detail.Nodes, Audit: detail.Audit}, nil
+	return &AdminSubscriptionPage{Subscription: adminViewOf(&detail.Subscription, planName), Plan: plan, Audit: detail.Audit}, nil
 }
 
 // ListAudit pages the audit log newest-first.
@@ -189,20 +182,13 @@ func (s *AdminService) ListAudit(ctx context.Context, f database.AdminAuditFilte
 //   - (outcome, nil): committed success or a replayed success;
 //   - (outcome, ErrAdmin*): the rejection was recorded (or replayed) in the
 //     audit log — the caller should surface both;
-//   - (outcome, other err): the mutation is committed and audited, but the
-//     post-commit node-sync setup failed; the admin should retry with the same
-//     request key (the replay re-runs the side effects without re-applying);
 //   - (nil, err): nothing was recorded — invalid request shape, unknown
 //     subscription, request-key conflict, or an infrastructure failure.
 //
-// After a successful commit (including replays, so an interrupted first attempt
-// can be retried with the same key) the service lines up VPN node work for the
-// subscription's current committed state (see scheduleNodeSync): paused or
-// provider-backed → all bindings pending_remove; otherwise plan membership is
-// reconciled (missing nodes pending_add, no traffic reset). The external sync itself is
-// best-effort and retried by the background worker. Caches are invalidated
-// after the node work, mirroring AdminSetPlan, so a concurrent feed request
-// cannot re-cache the pre-mutation node state.
+// After a successful commit (including replays) the caches of the
+// subscription are invalidated, so the next /sub request is served for the
+// committed state (status, expiry, plan builder). Access is local state only:
+// there is no external VPN work to line up.
 func (s *AdminService) Mutate(ctx context.Context, m database.AdminMutation) (*AdminMutationOutcome, error) {
 	// The repository validates too, but the service is the application
 	// boundary: a malformed request must never reach the persistence seam.
@@ -217,80 +203,24 @@ func (s *AdminService) Mutate(ctx context.Context, m database.AdminMutation) (*A
 	if err != nil {
 		return outcome, err
 	}
-	if syncErr := s.afterMutation(ctx, m.Action, result.Subscription); syncErr != nil {
-		return outcome, syncErr
-	}
+	s.afterMutation(ctx, result.Subscription)
 	return outcome, nil
 }
 
-func (s *AdminService) afterMutation(ctx context.Context, action database.AdminAction, sub *database.Subscription) error {
-	// The lifecycle change is already committed, so caches must be dropped on
-	// every exit path — including a failed node-sync setup or a cancelled
-	// request context. Deferring also orders the invalidation after the node
-	// work (see Mutate).
-	defer func() {
-		if s.subs == nil {
-			return
-		}
-		postCommit := context.WithoutCancel(ctx)
-		if sub.TelegramID > 0 {
-			s.subs.InvalidateSubscription(postCommit, sub.TelegramID)
-		}
-		if sub.SubscriptionID != "" {
-			s.subs.InvalidateBySubID(postCommit, sub.SubscriptionID)
-		}
-		s.subs.RefreshActiveSubscriptionsMetric(postCommit)
-	}()
-	if s.sync != nil {
-		// DB-setup phase: structural prerequisites for the background worker.
-		// The subscription row is already committed and audited; a failure here
-		// is reported so the admin can retry with the same request key.
-		if err := s.scheduleNodeSync(ctx, sub.ID); err != nil {
-			return fmt.Errorf("admin %s: schedule node sync: %w", action, err)
-		}
-		// External-sync phase is best-effort: SyncPendingNodes retries on failure.
-		if err := s.sync.SyncSubscription(ctx, sub.ID); err != nil {
-			logger.Warn("admin mutation: external sync failed; background will retry",
-				zap.String("action", string(action)),
-				zap.Uint("subscription_id", sub.ID),
-				zap.Error(err))
-		}
+// afterMutation drops the caches of a committed mutation. It runs detached
+// from the request context: the change is committed even if the client left.
+func (s *AdminService) afterMutation(ctx context.Context, sub *database.Subscription) {
+	if s.subs == nil || sub == nil {
+		return
 	}
-	return nil
-}
-
-// scheduleNodeSync lines up node bindings for the subscription's CURRENT
-// state, not for the action that triggered it. The row is re-read under the
-// per-subscription sync lock, so:
-//   - a replayed request (e.g. an old disable key retried after a later
-//     enable) cannot strip VPN access from a subscription that is active now;
-//   - two racing admin mutations converge: whichever node pass runs last sees
-//     the latest committed status.
-//
-// Without VPN access (paused/revoked/canceled) every binding goes to
-// pending_remove. Provider-backed subscriptions never get legacy nodes
-// provisioned, so any leftover legacy bindings are drained the same way.
-// Otherwise plan membership is reconciled: missing plan nodes (e.g. removed
-// by a previous disable) become pending_add, stale ones pending_remove, and
-// pending_remove leftovers of the plan are reactivated. Active bindings are
-// deliberately NOT marked pending_update: that path resets panel traffic
-// (processPendingUpdate → ResetTraffic), and an admin renew/expiry change must
-// not grant a fresh quota — same contract as RenewSubscription.
-func (s *AdminService) scheduleNodeSync(ctx context.Context, subscriptionID uint) error {
-	unlock, err := s.sync.lockSubscription(ctx, subscriptionID)
-	if err != nil {
-		return fmt.Errorf("acquire lock: %w", err)
+	postCommit := context.WithoutCancel(ctx)
+	if sub.TelegramID > 0 {
+		s.subs.InvalidateSubscription(postCommit, sub.TelegramID)
 	}
-	defer unlock()
-
-	current, err := s.sync.db.GetByID(ctx, subscriptionID)
-	if err != nil {
-		return fmt.Errorf("load subscription: %w", err)
+	if sub.SubscriptionID != "" {
+		s.subs.InvalidateBySubID(postCommit, sub.SubscriptionID)
 	}
-	if current.ProviderSourceID != nil || !subscriptionHasVPNAccess(current.Status) {
-		return s.sync.markAllForRemovalLocked(ctx, subscriptionID)
-	}
-	return s.sync.reconcilePlanNodesLocked(ctx, subscriptionID)
+	s.subs.RefreshActiveSubscriptionsMetric(postCommit)
 }
 
 func isKnownSubscriptionStatus(status string) bool {

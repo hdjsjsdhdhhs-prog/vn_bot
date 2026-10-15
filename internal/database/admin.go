@@ -566,27 +566,15 @@ func escapeLike(s string) string {
 	return replacer.Replace(s)
 }
 
-// AdminSubscriptionNode is a node binding with its display name.
-type AdminSubscriptionNode struct {
-	NodeID     uint       `json:"node_id"`
-	NodeName   string     `json:"node_name"`
-	Status     SyncStatus `json:"status"`
-	RetryCount int        `json:"retry_count"`
-	RetryAt    *time.Time `json:"retry_at"`
-	LastError  string     `json:"last_error"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-}
-
 // AdminSubscriptionDetail is everything the subscription page shows.
 type AdminSubscriptionDetail struct {
 	Subscription Subscription
 	Plan         *Plan
-	Nodes        []AdminSubscriptionNode
 	Audit        []AdminAuditLog
 }
 
-// GetAdminSubscription loads one subscription with plan, node bindings and the
-// most recent audit entries in one snapshot.
+// GetAdminSubscription loads one subscription with its plan and the most
+// recent audit entries in one snapshot.
 func (s *Service) GetAdminSubscription(ctx context.Context, id uint, auditLimit int) (*AdminSubscriptionDetail, error) {
 	if auditLimit <= 0 {
 		auditLimit = AdminDefaultPageSize
@@ -594,7 +582,7 @@ func (s *Service) GetAdminSubscription(ctx context.Context, id uint, auditLimit 
 	if auditLimit > AdminMaxPageSize {
 		auditLimit = AdminMaxPageSize
 	}
-	detail := &AdminSubscriptionDetail{Nodes: []AdminSubscriptionNode{}, Audit: []AdminAuditLog{}}
+	detail := &AdminSubscriptionDetail{Audit: []AdminAuditLog{}}
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.First(&detail.Subscription, id).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -609,27 +597,7 @@ func (s *Service) GetAdminSubscription(ctx context.Context, id uint, auditLimit 
 		case !errors.Is(err, gorm.ErrRecordNotFound):
 			return fmt.Errorf("load admin subscription plan: %w", err)
 		}
-		var nodes []struct {
-			SubscriptionNode
-			NodeName string
-		}
-		err := tx.Table("subscription_nodes").
-			Select("subscription_nodes.*, nodes.name AS node_name").
-			Joins("LEFT JOIN nodes ON nodes.id = subscription_nodes.node_id").
-			Where("subscription_nodes.subscription_id = ?", id).
-			Order("subscription_nodes.node_id ASC").
-			Scan(&nodes).Error
-		if err != nil {
-			return fmt.Errorf("load admin subscription nodes: %w", err)
-		}
-		for _, n := range nodes {
-			item := AdminSubscriptionNode{NodeID: n.NodeID, NodeName: n.NodeName, Status: n.Status, RetryCount: n.RetryCount, RetryAt: n.RetryAt, UpdatedAt: n.UpdatedAt}
-			if n.LastError != nil {
-				item.LastError = *n.LastError
-			}
-			detail.Nodes = append(detail.Nodes, item)
-		}
-		err = tx.Where("subscription_id = ?", id).Order("id DESC").Limit(auditLimit).Find(&detail.Audit).Error
+		err := tx.Where("subscription_id = ?", id).Order("id DESC").Limit(auditLimit).Find(&detail.Audit).Error
 		if err != nil {
 			return fmt.Errorf("load admin subscription audit: %w", err)
 		}

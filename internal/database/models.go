@@ -21,8 +21,6 @@ var (
 	ErrOrderNotFound              = errors.New("order not found")
 	ErrProductNotFound            = errors.New("product not found")
 	ErrProductImmutable           = errors.New("product immutable after order")
-	ErrSubscriptionNodeNotFound   = errors.New("subscription node not found")
-	ErrNodeNotFound               = errors.New("node not found")
 	ErrProviderSourceNotFound     = errors.New("provider source not found")
 	ErrTrialAlreadyActivated      = errors.New("trial already activated")
 	ErrBroadcastNotFound          = errors.New("broadcast not found")
@@ -33,14 +31,6 @@ var (
 const (
 	TrialPlanName = "trial"
 	FreePlanName  = "free"
-)
-
-type NodeType string
-
-const (
-	NodeType3xUI    NodeType = "3x-ui"
-	NodeTypeProxman NodeType = "proxman"
-	NodeTypeFetch   NodeType = "fetch"
 )
 
 // SubscriptionStatus represents the lifecycle state of a subscription.
@@ -105,15 +95,11 @@ type Subscription struct {
 	CreatedAt     time.Time  `gorm:"autoCreateTime"`
 	UpdatedAt     time.Time  `gorm:"autoUpdateTime"`
 	RemindersSent int        `gorm:"not null;default:0"` // bitmask: 1<<0=3d, 1<<1=1d, 1<<2=3h
-	// TrafficRemindersSent — битовая маска отправленных уведомлений о трафике:
-	// 1<<0=90% израсходовано, 1<<1=превышен лимит/отключён, 1<<2=сброшен+включён.
-	TrafficRemindersSent int `gorm:"not null;default:0"`
 
-	Plan           *Plan              `gorm:"foreignKey:PlanID"`
-	Product        *Product           `gorm:"foreignKey:ProductID"`
-	ProviderSource *ProviderSource    `gorm:"foreignKey:ProviderSourceID;references:ID"`
-	Orders         []Order            `gorm:"foreignKey:SubscriptionID"`
-	Nodes          []SubscriptionNode `gorm:"foreignKey:SubscriptionID"`
+	Plan           *Plan           `gorm:"foreignKey:PlanID"`
+	Product        *Product        `gorm:"foreignKey:ProductID"`
+	ProviderSource *ProviderSource `gorm:"foreignKey:ProviderSourceID;references:ID"`
+	Orders         []Order         `gorm:"foreignKey:SubscriptionID"`
 }
 
 // BeforeCreate ensures every GORM creation path receives a public token. The
@@ -137,25 +123,34 @@ func (s *Subscription) BeforeCreate(_ *gorm.DB) error {
 	return nil
 }
 
-// Node represents a configured 3x-ui panel source.
-type Node struct {
-	ID              uint      `gorm:"primaryKey;column:id"`
-	Name            string    `gorm:"size:255;column:name"`
-	IsActive        bool      `gorm:"default:true;column:is_active"`
-	Host            string    `gorm:"size:255;column:host"`
-	APIToken        string    `gorm:"size:255;column:api_token"`
-	InboundIDs      string    `gorm:"type:text;not null;default:'[]';column:inbound_ids"`
-	SubscriptionURL string    `gorm:"size:512;column:subscription_url"`
-	Type            NodeType  `gorm:"type:varchar(10);not null;default:3x-ui;column:type" json:"type"`
-	CreatedAt       time.Time `gorm:"autoCreateTime;column:created_at"`
-	UpdatedAt       time.Time `gorm:"autoUpdateTime;column:updated_at"`
+// BeforeSave stores the subscription timestamps in UTC. SQLite compares the
+// text-encoded times lexically, so a value written in a non-UTC local zone
+// would be mis-ordered against the UTC bounds used by expiry queries.
+func (s *Subscription) BeforeSave(_ *gorm.DB) error {
+	s.ExpiresAt = utcTimePtr(s.ExpiresAt)
+	s.StartedAt = utcTimePtr(s.StartedAt)
+	s.LastRequest = utcTimePtr(s.LastRequest)
+	if !s.CreatedAt.IsZero() {
+		s.CreatedAt = s.CreatedAt.UTC()
+	}
 
-	PlanNodes []PlanNode `gorm:"foreignKey:NodeID"`
+	return nil
 }
 
-// ProviderSource represents an external VPN provider subscription feed.
-// It is intentionally independent from Node until the provider aggregation
-// lifecycle is integrated into the runtime.
+func utcTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+
+	u := t.UTC()
+
+	return &u
+}
+
+// ProviderSource represents an external VPN provider subscription feed: a
+// ready-made subscription URL fetched server-side. Builders select and order
+// entries of one or more sources; a subscription may also be linked to a single
+// source directly (customer lifecycle).
 type ProviderSource struct {
 	ID              uint      `gorm:"primaryKey;column:id"`
 	Name            string    `gorm:"size:255;not null;column:name"`
@@ -266,30 +261,20 @@ const (
 	BuilderItemKindNode    = "node"
 )
 
-// Plan represents a subscription plan.
+// Plan represents a subscription plan. Its content is served by the plan's
+// default SubscriptionBuilder. Traffic and device limits are not enforced
+// locally (upstream providers report their own quota in subscription-userinfo),
+// so the plan carries no limit fields (migration 051).
 type Plan struct {
-	ID           uint   `gorm:"primaryKey;column:id"`
-	Name         string `gorm:"size:50;uniqueIndex;column:name"`
-	IsActive     bool   `gorm:"not null;default:true;column:is_active"`
-	DevicesLimit int    `gorm:"default:1;column:devices_limit"`
-	// TrafficLimit — лимит трафика в байтах. 0 = безлимит.
-	TrafficLimit int64 `gorm:"default:0;column:traffic_limit"`
+	ID       uint   `gorm:"primaryKey;column:id"`
+	Name     string `gorm:"size:50;uniqueIndex;column:name"`
+	IsActive bool   `gorm:"not null;default:true;column:is_active"`
 	// SubscriptionBuilderID is the plan's default builder (migration 045).
 	SubscriptionBuilderID *uint     `gorm:"column:subscription_builder_id"`
 	CreatedAt             time.Time `gorm:"autoCreateTime;column:created_at"`
 	UpdatedAt             time.Time `gorm:"autoUpdateTime;column:updated_at"`
 
-	Products  []Product  `gorm:"foreignKey:PlanID"`
-	PlanNodes []PlanNode `gorm:"foreignKey:PlanID"`
-}
-
-// PlanNode is the join model for M2M between Plan and Node.
-type PlanNode struct {
-	PlanID uint `gorm:"primaryKey;column:plan_id"`
-	NodeID uint `gorm:"primaryKey;column:node_id"`
-
-	Plan *Plan `gorm:"foreignKey:PlanID"`
-	Node *Node `gorm:"foreignKey:NodeID"`
+	Products []Product `gorm:"foreignKey:PlanID"`
 }
 
 // Product represents a purchasable subscription product bound to a plan.
@@ -481,62 +466,11 @@ const (
 	BroadcastRecipientFailed      BroadcastRecipientStatus = "failed"
 )
 
-// SyncStatus represents the synchronization status of a subscription on a VPN node.
-// Statuses: active | pending_add | pending_remove | pending_update.
-//
-// Values:
-//   - active — нода добавлена и последняя синхронизация прошла успешно.
-//   - pending_add — запрошено добавление ноды, операция ещё не выполнена на панели.
-//   - pending_remove — запрошено удаление ноды, операция ещё не выполнена на панели.
-//   - pending_update — запрошено обновление конфигурации ноды (например, смена тарифа).
-//
-// State machine:
-//   - pending_add -> active after successful create or successful fallback update
-//   - pending_update -> active after successful update
-//   - pending_remove -> row deletion after successful delete or idempotent not-found
-//   - any pending_* state stays pending and gets retry metadata on transient failures
-type SyncStatus string
-
-const (
-	SyncStatusActive        SyncStatus = "active"
-	SyncStatusPendingAdd    SyncStatus = "pending_add"
-	SyncStatusPendingRemove SyncStatus = "pending_remove"
-	SyncStatusPendingUpdate SyncStatus = "pending_update"
-)
-
-// SubscriptionNode represents the actual synchronization state of a specific
-// subscription with a specific VPN node (not plan-level, but concrete pair).
-type SubscriptionNode struct {
-	SubscriptionID uint       `gorm:"primaryKey;column:subscription_id"`
-	NodeID         uint       `gorm:"primaryKey;column:node_id"`
-	Status         SyncStatus `gorm:"not null;size:16;column:status"`
-	RetryCount     int        `gorm:"not null;default:0;column:retry_count"`
-	RetryAt        *time.Time `gorm:"column:retry_at"`
-	LastError      *string    `gorm:"type:text;column:last_error"`
-	UpdatedAt      time.Time  `gorm:"not null;autoUpdateTime;column:updated_at"`
-}
-
 // TrialRequest tracks trial requests for rate limiting.
 type TrialRequest struct {
 	ID        uint      `gorm:"primaryKey"`
 	IP        string    `gorm:"size:45;index"`
 	CreatedAt time.Time `gorm:"autoCreateTime"`
-}
-
-// SubscriptionFull holds a subscription together with its plan and active nodes.
-type SubscriptionFull struct {
-	Subscription Subscription
-	Plan         Plan
-	Nodes        []Node
-}
-
-// SubscriptionTrafficTarget pairs an active subscription with its plan's
-// traffic limit in bytes. TrafficLimit is guaranteed to be > 0; subscriptions
-// on unlimited plans (traffic_limit = 0) are excluded.
-type SubscriptionTrafficTarget struct {
-	Subscription
-
-	TrafficLimit int64
 }
 
 // PoolStats contains database connection pool statistics.
@@ -550,20 +484,12 @@ type PoolStats struct {
 	MaxIdleClosed int64
 }
 
-func (PlanNode) TableName() string {
-	return "plan_nodes"
-}
-
 func (Product) TableName() string {
 	return "products"
 }
 
 func (Order) TableName() string {
 	return "orders"
-}
-
-func (Node) TableName() string {
-	return "nodes"
 }
 
 func (ProviderSource) TableName() string {
@@ -584,10 +510,6 @@ func (Invite) TableName() string {
 
 func (TrialRequest) TableName() string {
 	return "trial_requests"
-}
-
-func (SubscriptionNode) TableName() string {
-	return "subscription_nodes"
 }
 
 func (Broadcast) TableName() string {
@@ -746,56 +668,4 @@ func (c *Broadcast) SetDeliveryReport(report *BroadcastDeliveryReport) error {
 	c.DeliveryReport = string(data)
 
 	return nil
-}
-
-func (n *Node) ParseInboundIDs() ([]int, error) {
-	if n.InboundIDs == "" {
-		return []int{}, nil
-	}
-
-	var ids []int
-
-	err := json.Unmarshal([]byte(n.InboundIDs), &ids)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal inbound_ids: %w", err)
-	}
-
-	return ids, nil
-}
-
-func (n *Node) SetInboundIDs(ids []int) error {
-	if len(ids) == 0 {
-		n.InboundIDs = "[]"
-		return nil
-	}
-
-	data, err := json.Marshal(ids)
-	if err != nil {
-		return fmt.Errorf("failed to marshal inbound_ids: %w", err)
-	}
-
-	n.InboundIDs = string(data)
-
-	return nil
-}
-
-// DefaultInboundIDs is used when a node has no inbound IDs configured.
-// Changing this value in one place updates all fallback paths.
-var DefaultInboundIDs = []int{1}
-
-// ResolveInboundIDs returns the node's inbound IDs, falling back to DefaultInboundIDs
-// when the stored list is empty or malformed. Callers must not repeat this fallback.
-func (n *Node) ResolveInboundIDs() []int {
-	ids, err := n.ParseInboundIDs()
-	if err != nil || len(ids) == 0 {
-		out := make([]int, len(DefaultInboundIDs))
-		copy(out, DefaultInboundIDs)
-
-		return out
-	}
-
-	out := make([]int, len(ids))
-	copy(out, ids)
-
-	return out
 }

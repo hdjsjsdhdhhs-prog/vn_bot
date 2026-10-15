@@ -258,56 +258,22 @@ func TestGetHelpText(t *testing.T) {
 	cfg := &config.Config{}
 	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
 
-	text := handler.getHelpText(100, "http://localhost/sub/test")
+	text := handler.getHelpText("http://localhost/sub/test")
 	assert.NotEmpty(t, text, "Help text should not be empty")
 }
 
-func TestGetHelpText_DifferentTrafficLimits(t *testing.T) {
+func TestHandler_GetHelpText_NoTrafficQuota(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{}
 	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
 
-	tests := []struct {
-		name         string
-		trafficLimit int
-	}{
-		{"50 GB", 50},
-		{"100 GB", 100},
-		{"200 GB", 200},
-	}
+	text := handler.getHelpText("http://test.url/sub")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			text := handler.getHelpText(tt.trafficLimit, "http://test.url/sub")
-			assert.NotEmpty(t, text, "text should not be empty")
-		})
-	}
-}
-
-func TestHandler_GetHelpText_ZeroTraffic(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{}
-	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
-
-	text := handler.getHelpText(0, "http://test.url/sub")
-
-	assert.Contains(t, text, "0Гб", "Should contain 0 GB")
+	// The bot does not meter traffic, so the help text must not promise a quota.
+	assert.NotContains(t, text, "Трафик", "Should not mention a traffic quota")
+	assert.NotContains(t, text, "Гб", "Should not mention a traffic quota")
 	assert.Contains(t, text, "http://test.url/sub", "Should contain subscription URL")
-}
-
-func TestHandler_GetHelpText_LargeTraffic(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{}
-	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
-
-	text := handler.getHelpText(1000, "http://test.url/sub")
-
-	assert.Contains(t, text, "1000Гб", "Should contain 1000 GB")
 }
 
 func TestHandler_GetHelpText_SpecialCharacters(t *testing.T) {
@@ -317,7 +283,7 @@ func TestHandler_GetHelpText_SpecialCharacters(t *testing.T) {
 	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
 
 	subURL := "http://test.url/sub/abc123?param=value&other=test"
-	text := handler.getHelpText(100, subURL)
+	text := handler.getHelpText(subURL)
 
 	assert.Contains(t, text, subURL, "Should contain full subscription URL")
 }

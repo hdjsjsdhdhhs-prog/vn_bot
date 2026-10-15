@@ -16,9 +16,10 @@ import (
 )
 
 // Pin the complete Mini App/Purchase/Stars/Admin-audit/Subscription Builder/
-// Tariff catalogue/Journal/network monitor/trial settings/customer warm-up
-// schema; future-schema fixtures must remain strictly newer than this version.
-const expectedLatestMigrationVersion = 50
+// Tariff catalogue/Journal/network monitor/trial settings/customer warm-up/
+// legacy-node removal schema; future-schema fixtures must remain strictly newer
+// than this version.
+const expectedLatestMigrationVersion = 51
 
 func TestLatestEmbeddedMigrationVersion(t *testing.T) {
 	t.Parallel()
@@ -81,6 +82,8 @@ func TestRunMigrationsRefusesToRepairIncompleteNoTxMigration(t *testing.T) {
 
 	sqlDB, err := db.db.DB()
 	require.NoError(t, err)
+	// subscription_nodes is dropped by 051; recreate the schema of version 27.
+	require.NoError(t, migrateTo(sqlDB, 27, true))
 	_, err = sqlDB.Exec(`CREATE TABLE subscription_nodes_old AS
 		SELECT subscription_id, node_id, status, retry_count, retry_at, last_error, updated_at
 		FROM subscription_nodes`)
@@ -496,6 +499,9 @@ func TestMigration_032_EnforcesRetryInvariant(t *testing.T) {
 
 	sqlDB, err := db.db.DB()
 	require.NoError(t, err)
+	// nodes/subscription_nodes are dropped by 051; step back to the last
+	// schema that still has them.
+	require.NoError(t, migrateTo(sqlDB, 50, false))
 
 	// FK enforcement is enabled on the pool (DSN _foreign_keys=on), so the
 	// subscription_nodes rows below need real parent rows.

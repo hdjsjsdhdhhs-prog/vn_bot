@@ -20,8 +20,9 @@ interface Row {
   previous_id: number | null; orders: number; subscriptions: number; created_at: string; updated_at: string;
 }
 
+/** service.TariffPlanView source: a plan has no device or traffic limits. */
 interface Plan {
-  id: number; name: string; is_active: boolean; devices_limit: number; traffic_limit: number; builder: number | null; selectable: boolean;
+  id: number; name: string; is_active: boolean; builder: number | null; selectable: boolean;
   /** database.ListAdminPlans: subscriptions of the plan in every status. */
   subscriptions: number;
 }
@@ -58,9 +59,9 @@ async function backend(page: Page, options: Options = {}) {
     { id: 3, name: 'Звёзды', currency: 'XTR', price_cents: 150, sort_order: 2, is_active: false },
   ]).map(item => row(item as Partial<Row> & { id: number }));
   const plans: Plan[] = [
-    { id: 3, name: 'Стандарт', is_active: true, devices_limit: 3, traffic_limit: 0, builder: 2, selectable: true, subscriptions: 21 },
-    { id: 4, name: 'Премиум', is_active: true, devices_limit: 5, traffic_limit: 0, builder: null, selectable: true, subscriptions: 0 },
-    { id: 1, name: 'Trial', is_active: true, devices_limit: 1, traffic_limit: 0, builder: null, selectable: false, subscriptions: 5 },
+    { id: 3, name: 'Стандарт', is_active: true, builder: 2, selectable: true, subscriptions: 21 },
+    { id: 4, name: 'Премиум', is_active: true, builder: null, selectable: true, subscriptions: 0 },
+    { id: 1, name: 'Trial', is_active: true, builder: null, selectable: false, subscriptions: 5 },
   ];
   let nextId = Math.max(0, ...rows.map(item => item.id)) + 1;
   let auditId = 0;
@@ -85,7 +86,7 @@ async function backend(page: Page, options: Options = {}) {
   };
   const ordered = () => [...rows].sort((a, b) => a.sort_order - b.sort_order || a.price_cents - b.price_cents || a.id - b.id);
   const planView = (plan: Plan) => ({
-    id: plan.id, name: plan.name, is_active: plan.is_active, devices_limit: plan.devices_limit, traffic_limit: plan.traffic_limit,
+    id: plan.id, name: plan.name, is_active: plan.is_active,
     subscription_builder_id: plan.builder, builder_name: BUILDERS.find(b => b.id === plan.builder)?.name ?? '',
     tariffs: rows.filter(item => item.plan_id === plan.id).length, subscriptions: plan.subscriptions, selectable: plan.selectable,
   });
@@ -203,8 +204,8 @@ async function backend(page: Page, options: Options = {}) {
             plan_name: plan.name, provider_source_id: null, product_id: 1, is_paid: true, price_paid_cents: 19900, currency: 'RUB',
             referred_by: null, started_at: T0, last_request: T0, created_at: T0, updated_at: T0, reminders_sent: 0, devices: 1, ips: 1,
           },
-          plan: { id: plan.id, name: plan.name, is_active: plan.is_active, devices_limit: plan.devices_limit, traffic_limit: plan.traffic_limit, subscription_builder_id: plan.builder },
-          nodes: [], audit: [],
+          plan: { id: plan.id, name: plan.name, is_active: plan.is_active, subscription_builder_id: plan.builder },
+          audit: [],
         });
       }
       problems.push(`unexpected GET ${pathname}`);
@@ -629,6 +630,8 @@ test('plan builder is assigned to the plan from the editor', async ({ page }) =>
   const plan = page.getByRole('region', { name: 'План и построитель' });
   await expect(plan).toContainText('Стандарт');
   await expect(plan).toContainText('Основной');
+  // service.TariffPlanView carries no limits: the panel shows plan and builder only.
+  await expect(plan.locator('dt')).toHaveText(['План', 'Построитель']);
   await plan.getByRole('button', { name: 'Изменить построитель' }).click();
   const dialog = page.getByRole('dialog', { name: 'Построитель плана' });
   // Explicit warning with the plan's subscription count (TariffPlan.subscriptions).

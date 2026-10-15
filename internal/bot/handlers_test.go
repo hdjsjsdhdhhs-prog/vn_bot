@@ -379,23 +379,20 @@ func TestHandler_SubscriptionCreationLock(t *testing.T) {
 func TestHandleCreateError_AllErrorTypes(t *testing.T) {
 	t.Parallel()
 
+	// Subscription creation is a local DB operation, so errors are no longer
+	// classified: every failure, including former panel-style errors, shows the
+	// generic message.
 	tests := []struct {
 		name        string
 		err         error
 		wantContain string
 	}{
-		{"connection refused", fmt.Errorf("connection refused"), "Не удается подключиться к серверу"},
-		{"request timeout", fmt.Errorf("request timeout"), "Не удается подключиться к серверу"},
-		{"authentication failed", fmt.Errorf("authentication failed"), "Ошибка авторизации на сервере"},
-		{"unauthorized access", fmt.Errorf("unauthorized access"), "Ошибка авторизации на сервере"},
-		{"context canceled", fmt.Errorf("context canceled"), "Запрос был прерван"},
-		{"no such host", fmt.Errorf("no such host"), "Ошибка подключения к серверу"},
-		{"dial tcp", fmt.Errorf("dial tcp 127.0.0.1:2053"), "Ошибка подключения к серверу"},
-		{"certificate verify", fmt.Errorf("certificate verify failed"), "Ошибка SSL/TLS сертификата"},
-		{"TLS handshake", fmt.Errorf("TLS handshake failed"), "Ошибка SSL/TLS сертификата"},
-		{"inbound not found", fmt.Errorf("inbound not found"), "Ошибка сервера при создании подписки"},
-		{"client already exists", fmt.Errorf("client already exists"), "Ошибка сервера при создании подписки"},
-		{"generic error", fmt.Errorf("some unknown error"), "Ошибка при создании подписки"},
+		{"connection refused", fmt.Errorf("connection refused"), msg(MsgErrGeneric)},
+		{"request timeout", fmt.Errorf("request timeout"), msg(MsgErrGeneric)},
+		{"authentication failed", fmt.Errorf("authentication failed"), msg(MsgErrGeneric)},
+		{"context canceled", fmt.Errorf("context canceled"), msg(MsgErrGeneric)},
+		{"TLS handshake", fmt.Errorf("TLS handshake failed"), msg(MsgErrGeneric)},
+		{"generic error", fmt.Errorf("some unknown error"), msg(MsgErrGeneric)},
 	}
 
 	for _, tt := range tests {

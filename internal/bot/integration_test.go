@@ -2,140 +2,26 @@ package bot
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/testutil"
 	"github.com/kereal/rs8kvn_bot/internal/utils"
-	"github.com/kereal/rs8kvn_bot/internal/xui"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 type IntegrationTestFixture struct {
 	DB          *database.Service
-	XUIServer   *MockXUIServer
-	XUIClient   *xui.Client
 	Handler     *Handler
 	Cfg         *config.Config
 	Ctx         context.Context
 	Cancel      context.CancelFunc
 	AdminChatID int64
 	UserChatID  int64
-}
-
-type MockXUIServer struct {
-	Server       *httptest.Server
-	Client       *xui.Client
-	AddClientErr error
-	DeleteErr    error
-	TrafficResp  *xui.ClientTraffic
-}
-
-func NewMockXUIServer(t *testing.T) *MockXUIServer {
-	t.Helper()
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-
-	client, err := xui.NewClient(server.URL, "test-api-token")
-	if err != nil {
-		t.Fatalf("Failed to create XUI client: %v", err)
-	}
-
-	expectedToken := "Bearer test-api-token"
-	requireAuth := func(w http.ResponseWriter, r *http.Request) bool {
-		if r.Header.Get("Authorization") != expectedToken {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"success":false,"msg":"unauthorized"}`))
-
-			return false
-		}
-
-		return true
-	}
-
-	mock := &MockXUIServer{
-		Server: server,
-		Client: client,
-		TrafficResp: &xui.ClientTraffic{
-			Up:   1024 * 1024 * 100,
-			Down: 1024 * 1024 * 200,
-		},
-	}
-
-	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"success": true})
-	})
-
-	mux.HandleFunc("/panel/api/clients/add", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAuth(w, r) {
-			return
-		}
-
-		if mock.AddClientErr != nil {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{
-				"success": false,
-				"msg":     mock.AddClientErr.Error(),
-			})
-
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"obj":     map[string]any{"id": "test-client-id"},
-		})
-	})
-
-	mux.HandleFunc("/panel/api/clients/traffic/", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAuth(w, r) {
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"obj":     mock.TrafficResp,
-		})
-	})
-
-	mux.HandleFunc("/panel/api/clients/del/", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAuth(w, r) {
-			return
-		}
-
-		if mock.DeleteErr != nil {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{
-				"success": false,
-				"msg":     mock.DeleteErr.Error(),
-			})
-
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"success": true})
-	})
-
-	return mock
-}
-
-func (m *MockXUIServer) Close() {
-	m.Server.Close()
 }
 
 func NewTestFixture(t *testing.T) *IntegrationTestFixture {
@@ -148,8 +34,6 @@ func NewTestFixture(t *testing.T) *IntegrationTestFixture {
 		t.Fatalf("Failed to create in-memory database: %v", err)
 	}
 
-	mockXUI := NewMockXUIServer(t)
-
 	cfg := &config.Config{
 		TelegramAdminID:  123456789,
 		TelegramBotToken: "test_token",
@@ -159,16 +43,12 @@ func NewTestFixture(t *testing.T) *IntegrationTestFixture {
 	}
 
 	handler := NewHandler(testutil.NewBotAPI(), cfg, dbService, NewTestBotConfig(), nil, "")
-	mockXUIClients := map[uint]interfaces.XUIClient{1: mockXUI.Client}
-	nodes := []database.Node{{ID: 1, Name: "main", IsActive: true, Host: mockXUI.Server.URL, APIToken: "test-api-token", InboundIDs: "[1]"}}
-	subService := service.NewSubscriptionService(dbService, mockXUIClients, nil, nodes, cfg)
+	subService := service.NewSubscriptionService(dbService, cfg)
 	handler.subscriptionService = subService
 	handler.subscriptionService.SetInvalidateFunc(handler.cache.Invalidate)
 
 	return &IntegrationTestFixture{
 		DB:          dbService,
-		XUIServer:   mockXUI,
-		XUIClient:   mockXUI.Client,
 		Handler:     handler,
 		Cfg:         cfg,
 		Ctx:         ctx,
@@ -183,10 +63,6 @@ func (f *IntegrationTestFixture) Close() {
 
 	if f.DB != nil {
 		_ = f.DB.Close()
-	}
-
-	if f.XUIServer != nil {
-		f.XUIServer.Close()
 	}
 }
 
@@ -442,8 +318,8 @@ func TestHandler_GetHelpText(t *testing.T) {
 	f := NewTestFixture(t)
 	defer f.Close()
 
-	text := f.Handler.getHelpText(100, "https://example.com/sub")
-	assert.Contains(t, text, "100")
+	text := f.Handler.getHelpText("https://example.com/sub")
+	assert.Contains(t, text, "https://example.com/sub")
 	assert.Contains(t, text, "Happ")
 }
 
@@ -473,127 +349,6 @@ func TestHandler_GetUsername(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
-}
-
-func TestMockXUIServer_Endpoints(t *testing.T) {
-	mock := NewMockXUIServer(t)
-	defer mock.Close()
-
-	authHeader := "Bearer test-api-token"
-
-	t.Run("login", func(t *testing.T) {
-		resp, err := http.Get(mock.Server.URL + "/login")
-		require.NoError(t, err)
-
-		defer func() { _ = resp.Body.Close() }()
-
-		var result map[string]any
-
-		err = json.NewDecoder(resp.Body).Decode(&result)
-		require.NoError(t, err)
-		assert.True(t, result["success"].(bool))
-	})
-
-	t.Run("addClient", func(t *testing.T) {
-		req, err := http.NewRequest("POST", mock.Server.URL+"/panel/api/clients/add", nil)
-		require.NoError(t, err)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", authHeader)
-		resp, err := http.DefaultClient.Do(req)
-		require.NoError(t, err)
-
-		defer func() { _ = resp.Body.Close() }()
-
-		var result map[string]any
-
-		err = json.NewDecoder(resp.Body).Decode(&result)
-		require.NoError(t, err)
-		assert.True(t, result["success"].(bool))
-	})
-
-	t.Run("getClientTraffic", func(t *testing.T) {
-		req, err := http.NewRequest("GET", mock.Server.URL+"/panel/api/clients/traffic/testuser", nil)
-		require.NoError(t, err)
-		req.Header.Set("Authorization", authHeader)
-		resp, err := http.DefaultClient.Do(req)
-		require.NoError(t, err)
-
-		defer func() { _ = resp.Body.Close() }()
-
-		var result map[string]any
-
-		err = json.NewDecoder(resp.Body).Decode(&result)
-		require.NoError(t, err)
-		assert.True(t, result["success"].(bool))
-
-		obj := result["obj"].(map[string]any)
-		assert.Equal(t, float64(1024*1024*100), obj["up"])
-		assert.Equal(t, float64(1024*1024*200), obj["down"])
-	})
-
-	t.Run("delClient", func(t *testing.T) {
-		req, err := http.NewRequest("POST", mock.Server.URL+"/panel/api/clients/del/test-id", nil)
-		require.NoError(t, err)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", authHeader)
-		resp, err := http.DefaultClient.Do(req)
-		require.NoError(t, err)
-
-		defer resp.Body.Close()
-
-		var result map[string]any
-
-		err = json.NewDecoder(resp.Body).Decode(&result)
-		require.NoError(t, err)
-		assert.True(t, result["success"].(bool))
-	})
-}
-
-func TestMockXUIServer_ErrorResponses(t *testing.T) {
-	mock := NewMockXUIServer(t)
-	defer mock.Close()
-
-	authHeader := "Bearer test-api-token"
-
-	t.Run("addClient error", func(t *testing.T) {
-		mock.AddClientErr = assert.AnError
-
-		req, err := http.NewRequest("POST", mock.Server.URL+"/panel/api/clients/add", nil)
-		require.NoError(t, err)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", authHeader)
-		resp, err := http.DefaultClient.Do(req)
-		require.NoError(t, err)
-
-		defer resp.Body.Close()
-
-		var result map[string]any
-
-		err = json.NewDecoder(resp.Body).Decode(&result)
-		require.NoError(t, err)
-		assert.False(t, result["success"].(bool))
-		assert.Equal(t, assert.AnError.Error(), result["msg"])
-	})
-
-	t.Run("delClient error", func(t *testing.T) {
-		mock.DeleteErr = assert.AnError
-
-		req, err := http.NewRequest("POST", mock.Server.URL+"/panel/api/clients/del/test-id", nil)
-		require.NoError(t, err)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", authHeader)
-		resp, err := http.DefaultClient.Do(req)
-		require.NoError(t, err)
-
-		defer resp.Body.Close()
-
-		var result map[string]any
-
-		err = json.NewDecoder(resp.Body).Decode(&result)
-		require.NoError(t, err)
-		assert.False(t, result["success"].(bool))
-		assert.Equal(t, assert.AnError.Error(), result["msg"])
-	})
 }
 
 func resetBotAPI(m *testutil.BotAPI) {

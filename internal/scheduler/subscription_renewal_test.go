@@ -29,7 +29,7 @@ func (r *renewAfterExpiryScan) GetExpiredPaidSubscriptions(ctx context.Context, 
 }
 
 func TestSubscriptionRenewal_ExpiryWorkerStaleScan(t *testing.T) {
-	for _, name := range []string{"provider", "legacy without sync", "legacy with sync"} {
+	for _, name := range []string{"provider", "no provider source"} {
 		t.Run(name, func(t *testing.T) {
 			db, err := testutil.NewTestDatabaseService(t)
 			require.NoError(t, err)
@@ -44,10 +44,7 @@ func TestSubscriptionRenewal_ExpiryWorkerStaleScan(t *testing.T) {
 				sub.ProviderSourceID = &source.ID
 			}
 			require.NoError(t, db.CreateSubscription(ctx, sub, ""))
-			svc := service.NewSubscriptionService(db, nil, nil, nil, &config.Config{GlobalSubURL: "https://customer.example/sub/"})
-			if name == "legacy with sync" {
-				svc.SetSyncService(service.NewSyncService(db, nil, nil))
-			}
+			svc := service.NewSubscriptionService(db, &config.Config{GlobalSubURL: "https://customer.example/sub/"})
 			var renewed *service.RenewalResult
 			repo := &renewAfterExpiryScan{Service: db, afterScan: func(queued []database.Subscription) {
 				require.Len(t, queued, 1)

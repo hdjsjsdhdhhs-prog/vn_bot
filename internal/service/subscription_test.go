@@ -5,16 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/testutil"
-	"github.com/kereal/rs8kvn_bot/internal/vpn"
-	"github.com/kereal/rs8kvn_bot/internal/xui"
+	"github.com/kereal/rs8kvn_bot/internal/utils"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,23 +34,15 @@ func TestSubscriptionService_Create_Success(t *testing.T) {
 
 	db := &testutil.DatabaseService{
 		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: database.FreePlanName, TrafficLimit: 1073741824}, nil
+			return &database.Plan{ID: 1, Name: database.FreePlanName}, nil
 		},
 		CreateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription, inviteCode string) error {
 			sub.ID = 1
 			return nil
 		},
-		GetNodesByPlanIDFunc: func(ctx context.Context, planID uint) ([]database.Node, error) {
-			return nil, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			return nil, nil
-		},
 	}
-	sources := []database.Node{}
-	xuiClients := map[uint]interfaces.XUIClient{}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	result, err := svc.Create(context.Background(), 123456, "testuser", "")
 
 	assert.NoError(t, err)
@@ -65,37 +54,6 @@ func TestSubscriptionService_Create_Success(t *testing.T) {
 	assert.Equal(t, "testuser", result.Subscription.Username)
 }
 
-func TestSubscriptionService_Create_XUIError(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{}
-
-	db := &testutil.DatabaseService{
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: database.FreePlanName, TrafficLimit: 1073741824}, nil
-		},
-		CreateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription, inviteCode string) error {
-			sub.ID = 1
-			return nil
-		},
-		GetNodesByPlanIDFunc: func(ctx context.Context, planID uint) ([]database.Node, error) {
-			return nil, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			return nil, nil
-		},
-	}
-	sources := []database.Node{}
-	xuiClients := map[uint]interfaces.XUIClient{}
-
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
-	result, err := svc.Create(context.Background(), 123456, "testuser", "")
-
-	// DB-first: Create succeeds even if XUI is unavailable
-	assert.NoError(t, err)
-	assert.NotNil(t, result)
-}
-
 func TestSubscriptionService_Create_DBError_RollbackSuccess(t *testing.T) {
 	t.Parallel()
 
@@ -103,40 +61,14 @@ func TestSubscriptionService_Create_DBError_RollbackSuccess(t *testing.T) {
 
 	db := &testutil.DatabaseService{
 		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: database.FreePlanName, TrafficLimit: 1073741824}, nil
+			return &database.Plan{ID: 1, Name: database.FreePlanName}, nil
 		},
 		CreateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription, inviteCode string) error {
 			return errors.New("database error")
 		},
 	}
-	sources := []database.Node{}
-	xuiClients := map[uint]interfaces.XUIClient{}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
-	result, err := svc.Create(context.Background(), 123456, "testuser", "")
-
-	assert.Error(t, err)
-	assert.Nil(t, result)
-	assert.Contains(t, err.Error(), "create subscription")
-}
-
-func TestSubscriptionService_Create_DBError_RollbackFailed(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{}
-
-	db := &testutil.DatabaseService{
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: database.FreePlanName, TrafficLimit: 1073741824}, nil
-		},
-		CreateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription, inviteCode string) error {
-			return errors.New("database error")
-		},
-	}
-	sources := []database.Node{}
-	xuiClients := map[uint]interfaces.XUIClient{}
-
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	result, err := svc.Create(context.Background(), 123456, "testuser", "")
 
 	assert.Error(t, err)
@@ -156,7 +88,7 @@ func TestSubscriptionService_Create_PropagatesInviteCodeToDB(t *testing.T) {
 
 	db := &testutil.DatabaseService{
 		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: database.FreePlanName, TrafficLimit: 1073741824}, nil
+			return &database.Plan{ID: 1, Name: database.FreePlanName}, nil
 		},
 		CreateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription, inviteCode string) error {
 			gotSub = sub
@@ -165,17 +97,9 @@ func TestSubscriptionService_Create_PropagatesInviteCodeToDB(t *testing.T) {
 
 			return nil
 		},
-		GetNodesByPlanIDFunc: func(ctx context.Context, planID uint) ([]database.Node, error) {
-			return nil, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			return nil, nil
-		},
 	}
-	sources := []database.Node{}
-	xuiClients := map[uint]interfaces.XUIClient{}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	result, err := svc.Create(context.Background(), 123456, "testuser", "INV-ABC")
 
 	assert.NoError(t, err)
@@ -197,7 +121,7 @@ func TestSubscriptionService_Create_EmptyInviteCodeIsNoop(t *testing.T) {
 
 	db := &testutil.DatabaseService{
 		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: database.FreePlanName, TrafficLimit: 1073741824}, nil
+			return &database.Plan{ID: 1, Name: database.FreePlanName}, nil
 		},
 		CreateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription, inviteCode string) error {
 			gotInviteCode = inviteCode
@@ -205,17 +129,9 @@ func TestSubscriptionService_Create_EmptyInviteCodeIsNoop(t *testing.T) {
 
 			return nil
 		},
-		GetNodesByPlanIDFunc: func(ctx context.Context, planID uint) ([]database.Node, error) {
-			return nil, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			return nil, nil
-		},
 	}
-	sources := []database.Node{}
-	xuiClients := map[uint]interfaces.XUIClient{}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	result, err := svc.Create(context.Background(), 123456, "testuser", "")
 
 	assert.NoError(t, err)
@@ -233,7 +149,7 @@ func TestSubscriptionService_Create_FillsFallbackUsername(t *testing.T) {
 
 	db := &testutil.DatabaseService{
 		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: database.FreePlanName, TrafficLimit: 1073741824}, nil
+			return &database.Plan{ID: 1, Name: database.FreePlanName}, nil
 		},
 		CreateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription, inviteCode string) error {
 			gotSub = sub
@@ -241,15 +157,9 @@ func TestSubscriptionService_Create_FillsFallbackUsername(t *testing.T) {
 
 			return nil
 		},
-		GetNodesByPlanIDFunc: func(ctx context.Context, planID uint) ([]database.Node, error) {
-			return nil, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			return nil, nil
-		},
 	}
 
-	svc := NewSubscriptionService(db, nil, nil, nil, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	result, err := svc.Create(context.Background(), 123456, "", "")
 
 	assert.NoError(t, err)
@@ -258,847 +168,174 @@ func TestSubscriptionService_Create_FillsFallbackUsername(t *testing.T) {
 	assert.Equal(t, "tgId_123456", result.Subscription.Username)
 }
 
-func TestSubscriptionService_GetWithTraffic_Success(t *testing.T) {
+func TestSubscriptionService_GetWithDetails_PlanNameAndDates(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.Config{}
-
-	sub := &database.Subscription{
-		TelegramID: 123456,
-		Username:   "testuser",
-		PlanID:     1,
-		CreatedAt:  time.Now(),
-		ExpiresAt:  testutil.PtrTime(time.Now().Add(7 * 24 * time.Hour)),
-	}
+	created := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
+	expires := created.Add(7 * 24 * time.Hour)
+	sub := &database.Subscription{TelegramID: 123456, Username: "testuser", PlanID: 1, CreatedAt: created, ExpiresAt: &expires}
 
 	db := &testutil.DatabaseService{
 		GetByTelegramIDFunc: func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
 			return sub, nil
 		},
 		GetPlanByIDFunc: func(ctx context.Context, planID uint) (*database.Plan, error) {
-			return &database.Plan{ID: 1, TrafficLimit: 100 * 1024 * 1024 * 1024}, nil
+			return &database.Plan{ID: 1, Name: "Free"}, nil
 		},
 	}
 
-	xuiClient := &testutil.XUIClient{
-		GetClientTrafficFunc: func(ctx context.Context, username string) (*xui.ClientTraffic, error) {
-			return &xui.ClientTraffic{Up: 1024 * 1024 * 1024, Down: 2 * 1024 * 1024 * 1024}, nil
-		},
-	}
-	sources := []database.Node{
-		{ID: 1, IsActive: true, Host: "http://localhost:2053", InboundIDs: "[1]"},
-	}
-	xuiClients := map[uint]interfaces.XUIClient{1: xuiClient}
+	svc := NewSubscriptionService(db, &config.Config{})
+	resultSub, details, err := svc.GetWithDetails(context.Background(), 123456)
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
-	resultSub, traffic, err := svc.GetWithTraffic(context.Background(), 123456)
-
-	assert.NoError(t, err)
-	assert.NotNil(t, resultSub)
-	assert.NotNil(t, traffic)
-	assert.Equal(t, 100, traffic.LimitGB)
+	require.NoError(t, err)
+	assert.Same(t, sub, resultSub)
+	require.NotNil(t, details)
+	assert.Equal(t, "Free", details.PlanName)
+	assert.Equal(t, utils.FormatDateRu(created), details.CreatedAtFormatted)
+	assert.Equal(t, utils.FormatDateRu(expires), details.ExpiresAtFormatted)
 }
 
-func TestSubscriptionService_GetWithTraffic_XUIErrorFallback(t *testing.T) {
+func TestSubscriptionService_GetWithDetails_ProductNameAndPerpetual(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.Config{}
-
-	sub := &database.Subscription{
-		TelegramID: 123456,
-		Username:   "testuser",
-		CreatedAt:  time.Now(),
-	}
+	productID := uint(7)
+	sub := &database.Subscription{TelegramID: 1, PlanID: 2, ProductID: &productID, CreatedAt: time.Now()}
 
 	db := &testutil.DatabaseService{
 		GetByTelegramIDFunc: func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
 			return sub, nil
 		},
-	}
-
-	xuiClient := &testutil.XUIClient{
-		GetClientTrafficFunc: func(ctx context.Context, username string) (*xui.ClientTraffic, error) {
-			return nil, errors.New("connection refused")
+		GetPlanByIDFunc: func(ctx context.Context, planID uint) (*database.Plan, error) {
+			return &database.Plan{ID: 2, Name: "premium"}, nil
+		},
+		GetProductByIDFunc: func(ctx context.Context, id uint) (*database.Product, error) {
+			return &database.Product{ID: id, Name: "Premium 30 дней"}, nil
 		},
 	}
-	sources := []database.Node{
-		{ID: 1, IsActive: true, Host: "http://localhost:2053", InboundIDs: "[1]"},
+
+	svc := NewSubscriptionService(db, &config.Config{})
+	_, details, err := svc.GetWithDetails(context.Background(), 1)
+
+	require.NoError(t, err)
+	assert.Equal(t, "Premium 30 дней", details.PlanName, "the purchased product name wins over the plan name")
+	assert.Equal(t, "бессрочно", details.ExpiresAtFormatted)
+}
+
+func TestSubscriptionService_GetWithDetails_NotFound(t *testing.T) {
+	t.Parallel()
+
+	db := &testutil.DatabaseService{
+		GetByTelegramIDFunc: func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
+			return nil, database.ErrSubscriptionNotFound
+		},
 	}
-	xuiClients := map[uint]interfaces.XUIClient{1: xuiClient}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
-	resultSub, traffic, err := svc.GetWithTraffic(context.Background(), 123456)
+	svc := NewSubscriptionService(db, &config.Config{})
+	sub, details, err := svc.GetWithDetails(context.Background(), 1)
 
-	assert.NoError(t, err)
-	assert.NotNil(t, resultSub)
-	assert.NotNil(t, traffic)
-	assert.Equal(t, float64(0), traffic.UsedGB)
+	require.ErrorIs(t, err, database.ErrSubscriptionNotFound)
+	assert.Nil(t, sub)
+	assert.Nil(t, details)
 }
 
 func TestSubscriptionService_CreateTrial_Success(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.Config{
-		TrialDurationHours: 3,
-	}
+	cfg := &config.Config{TrialDurationHours: 3, GlobalSubURL: "https://trial.example/sub/"}
+
+	var (
+		gotInvite string
+		gotExpiry time.Time
+	)
 
 	db := &testutil.DatabaseService{
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: name, TrafficLimit: 1073741824}, nil
+		CreateTrialSubscriptionFunc: func(ctx context.Context, inviteCode, subscriptionID, clientID string, expiryTime time.Time) (*database.Subscription, error) {
+			gotInvite, gotExpiry = inviteCode, expiryTime
+			return &database.Subscription{ID: 1, SubscriptionID: subscriptionID, ClientID: clientID, Token: "trial-token", ExpiresAt: &expiryTime}, nil
 		},
 	}
 
-	var gotResetDays = -1
-
-	xuiClient := &testutil.XUIClient{
-		AddClientWithIDFunc: func(ctx context.Context, req xui.ClientRequest) (*xui.ClientConfig, error) {
-			gotResetDays = req.ResetDays
-			return &xui.ClientConfig{ID: req.ClientID, SubID: req.SubID}, nil
-		},
-	}
-	sources := []database.Node{
-		{ID: 1, IsActive: true, Host: "http://localhost:2053", InboundIDs: "[1]"},
-	}
-	xuiClients := map[uint]interfaces.XUIClient{1: xuiClient}
-	vpnClients := map[uint]vpn.Client{1: vpn.NewThreeXUIClient(xuiClient, []int{1})}
-
-	svc := NewSubscriptionService(db, xuiClients, vpnClients, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	result, err := svc.CreateTrial(context.Background(), "testcode")
 
-	assert.NoError(t, err)
-	assert.NotNil(t, result)
+	require.NoError(t, err)
+	require.NotNil(t, result)
 	assert.NotEmpty(t, result.SubID)
 	assert.NotEmpty(t, result.ClientID)
-	assert.Equal(t, 0, gotResetDays, "trial must not auto-renew (resetDays=0)")
-}
-
-func TestSubscriptionService_CreateTrial_XUIError(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{
-		TrialDurationHours: 3,
-	}
-
-	db := &testutil.DatabaseService{
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: "trial", TrafficLimit: 1073741824}, nil
-		},
-		GetNodesByPlanNameFunc: func(ctx context.Context, planName string) ([]database.Node, error) {
-			return []database.Node{{ID: 1, IsActive: true, Host: "http://localhost:2053", InboundIDs: "[1]"}}, nil
-		},
-		CreateTrialSubscriptionFunc: func(ctx context.Context, inviteCode, subscriptionID, clientID string, expiryTime time.Time) (*database.Subscription, error) {
-			inviteVal := inviteCode
-			return &database.Subscription{InviteCode: &inviteVal, SubscriptionID: subscriptionID, ClientID: clientID}, nil
-		},
-	}
-	xuiClient := &testutil.XUIClient{
-		AddClientWithIDFunc: func(ctx context.Context, req xui.ClientRequest) (*xui.ClientConfig, error) {
-			return nil, errors.New("xui error")
-		},
-	}
-	sources := []database.Node{
-		{ID: 1, IsActive: true, Host: "http://localhost:2053", InboundIDs: "[1]"},
-	}
-	xuiClients := map[uint]interfaces.XUIClient{1: xuiClient}
-	vpnClients := map[uint]vpn.Client{1: vpn.NewThreeXUIClient(xuiClient, []int{1})}
-
-	svc := NewSubscriptionService(db, xuiClients, vpnClients, sources, cfg)
-	result, err := svc.CreateTrial(context.Background(), "testcode")
-
-	assert.Error(t, err)
-	assert.Nil(t, result)
-	assert.Contains(t, err.Error(), "xui error")
+	assert.Equal(t, result.SubID, result.Subscription.SubscriptionID)
+	assert.Equal(t, cfg.SubURL("trial-token"), result.SubscriptionURL)
+	assert.Equal(t, "testcode", gotInvite)
+	assert.WithinDuration(t, time.Now().UTC().Add(3*time.Hour), gotExpiry, time.Minute)
 }
 
 func TestSubscriptionService_CreateTrial_DBError(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.Config{
-		TrialDurationHours: 3,
-	}
-
-	deleteCalled := false
 	db := &testutil.DatabaseService{
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: name, TrafficLimit: 1073741824}, nil
-		},
 		CreateTrialSubscriptionFunc: func(ctx context.Context, inviteCode, subscriptionID, clientID string, expiryTime time.Time) (*database.Subscription, error) {
 			return nil, errors.New("db error")
 		},
 	}
-	xuiClient := &testutil.XUIClient{
-		AddClientWithIDFunc: func(ctx context.Context, req xui.ClientRequest) (*xui.ClientConfig, error) {
-			return &xui.ClientConfig{ID: req.ClientID, SubID: req.SubID}, nil
-		},
-		DeleteClientFunc: func(ctx context.Context, email string) error {
-			deleteCalled = true
 
-			assert.True(t, strings.HasPrefix(email, "trial_"), "trial rollback must use trial_ email")
-
-			return nil
-		},
-	}
-	sources := []database.Node{
-		{ID: 1, IsActive: true, Host: "http://localhost:2053", InboundIDs: "[1]"},
-	}
-	xuiClients := map[uint]interfaces.XUIClient{1: xuiClient}
-	vpnClients := map[uint]vpn.Client{1: vpn.NewThreeXUIClient(xuiClient, []int{1})}
-
-	svc := NewSubscriptionService(db, xuiClients, vpnClients, sources, cfg)
+	svc := NewSubscriptionService(db, &config.Config{TrialDurationHours: 3})
 	result, err := svc.CreateTrial(context.Background(), "testcode")
 
-	assert.Error(t, err)
-	assert.Nil(t, result)
-	assert.True(t, deleteCalled)
-}
-
-func TestSubscriptionService_CreateTrial_NoTrialNodes(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{
-		TrialDurationHours: 3,
-	}
-
-	db := &testutil.DatabaseService{
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: name, TrafficLimit: 1073741824}, nil
-		},
-		GetNodesByPlanNameFunc: func(ctx context.Context, planName string) ([]database.Node, error) {
-			return nil, nil
-		},
-	}
-	xuiClient := &testutil.XUIClient{
-		AddClientWithIDFunc: func(ctx context.Context, req xui.ClientRequest) (*xui.ClientConfig, error) {
-			return &xui.ClientConfig{ID: req.ClientID, SubID: req.SubID}, nil
-		},
-	}
-	sources := []database.Node{
-		{ID: 1, IsActive: true, Host: "http://localhost:2053", InboundIDs: "[1]"},
-	}
-	xuiClients := map[uint]interfaces.XUIClient{1: xuiClient}
-	vpnClients := map[uint]vpn.Client{1: vpn.NewThreeXUIClient(xuiClient, []int{1})}
-
-	svc := NewSubscriptionService(db, xuiClients, vpnClients, sources, cfg)
-	result, err := svc.CreateTrial(context.Background(), "testcode")
-
-	assert.Error(t, err)
-	assert.Nil(t, result)
-	assert.Contains(t, err.Error(), "no linked nodes")
-}
-
-// TestSubscriptionService_ReconcileOrphanedClients_RevokesFullyDeprovisioned verifies
-// a subscription with only pending_remove node bindings (deprovisioning that did
-// not complete in the delete flow) is REVOKED (policy: subscriptions are never
-// deleted except via admin /del), while:
-//   - a subscription with a live (active) binding is kept,
-//   - a subscription with NO subscription_nodes (e.g. a trial) is kept.
-func TestSubscriptionService_ReconcileOrphanedClients_RevokesFullyDeprovisioned(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{}
-
-	withLive := &database.Subscription{ID: 10, TelegramID: 100, Username: "liveuser", Status: "active"}
-	orphan := &database.Subscription{ID: 20, TelegramID: 200, Username: "orphanuser", Status: "active"}
-	trial := &database.Subscription{ID: 30, TelegramID: 0, SubscriptionID: "trial123", Status: "active"}
-	inactive := &database.Subscription{ID: 40, TelegramID: 400, Username: "bad", Status: "revoked"}
-
-	updated := make(map[uint]string)
-	db := &testutil.DatabaseService{
-		GetAllSubscriptionsFunc: func(ctx context.Context) ([]database.Subscription, error) {
-			return []database.Subscription{*withLive, *orphan, *trial, *inactive}, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			switch subscriptionID {
-			case withLive.ID:
-				return []database.SubscriptionNode{
-					{SubscriptionID: withLive.ID, NodeID: 1, Status: database.SyncStatusActive},
-				}, nil
-			case orphan.ID:
-				return []database.SubscriptionNode{
-					{SubscriptionID: orphan.ID, NodeID: 1, Status: database.SyncStatusPendingRemove},
-					{SubscriptionID: orphan.ID, NodeID: 2, Status: database.SyncStatusPendingRemove},
-				}, nil
-			default:
-				// trial (no subscription_nodes) and others.
-				return nil, nil
-			}
-		},
-		UpdateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription) error {
-			updated[sub.ID] = sub.Status
-			return nil
-		},
-	}
-	svc := NewSubscriptionService(db, nil, nil, nil, cfg)
-
-	invoked := []int64{}
-
-	svc.SetInvalidateFunc(func(id int64) { invoked = append(invoked, id) })
-
-	count, err := svc.ReconcileOrphanedClients(context.Background())
-
-	assert.NoError(t, err)
-	assert.Equal(t, 1, count)
-	assert.Equal(t, string(database.SubscriptionStatusRevoked), updated[orphan.ID])
-	assert.NotContains(t, updated, withLive.ID)
-	assert.NotContains(t, updated, trial.ID)
-	assert.Equal(t, []int64{orphan.TelegramID}, invoked)
-}
-
-// TestSubscriptionService_ReconcileOrphanedClients_NoActive verifies that an
-// all-revoked set produces no revocations and no error.
-func TestSubscriptionService_ReconcileOrphanedClients_NoActive(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{}
-	db := &testutil.DatabaseService{
-		GetAllSubscriptionsFunc: func(ctx context.Context) ([]database.Subscription, error) {
-			return []database.Subscription{{ID: 1, Status: "revoked"}}, nil
-		},
-	}
-	svc := NewSubscriptionService(db, nil, nil, nil, cfg)
-
-	count, err := svc.ReconcileOrphanedClients(context.Background())
-	assert.NoError(t, err)
-	assert.Equal(t, 0, count)
-}
-
-// TestSubscriptionService_ReconcileOrphanedClients_UpdateError verifies that a
-// failed status update on an orphaned subscription is logged and skipped (the
-// row stays active for the next run), while the scan continues with the
-// remaining subscriptions.
-func TestSubscriptionService_ReconcileOrphanedClients_UpdateError(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{}
-
-	orphan := &database.Subscription{ID: 20, TelegramID: 200, Username: "orphanuser", Status: "active"}
-	withLive := &database.Subscription{ID: 10, TelegramID: 100, Username: "liveuser", Status: "active"}
-
-	db := &testutil.DatabaseService{
-		GetAllSubscriptionsFunc: func(ctx context.Context) ([]database.Subscription, error) {
-			return []database.Subscription{*orphan, *withLive}, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			switch subscriptionID {
-			case orphan.ID:
-				return []database.SubscriptionNode{
-					{SubscriptionID: orphan.ID, NodeID: 1, Status: database.SyncStatusPendingRemove},
-				}, nil
-			case withLive.ID:
-				return []database.SubscriptionNode{
-					{SubscriptionID: withLive.ID, NodeID: 1, Status: database.SyncStatusActive},
-				}, nil
-			default:
-				return nil, nil
-			}
-		},
-		UpdateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription) error {
-			return errors.New("db write failed")
-		},
-	}
-	svc := NewSubscriptionService(db, nil, nil, nil, cfg)
-
-	count, err := svc.ReconcileOrphanedClients(context.Background())
-	assert.NoError(t, err)
-	assert.Equal(t, 0, count, "failed revoke must not count as processed")
-}
-
-// TestSubscriptionService_ReconcileOrphanedClients_InvalidatesBySubID verifies
-// that a successfully revoked orphan also invalidates the subserver cache keyed
-// by subscription_id (so the stale config is dropped and /sub/:id serves 404).
-func TestSubscriptionService_ReconcileOrphanedClients_InvalidatesBySubID(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{}
-
-	orphan := &database.Subscription{ID: 20, TelegramID: 200, Username: "orphanuser", SubscriptionID: "sub-orphan", Status: "active"}
-
-	db := &testutil.DatabaseService{
-		GetAllSubscriptionsFunc: func(ctx context.Context) ([]database.Subscription, error) {
-			return []database.Subscription{*orphan}, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			return []database.SubscriptionNode{
-				{SubscriptionID: orphan.ID, NodeID: 1, Status: database.SyncStatusPendingRemove},
-			}, nil
-		},
-		UpdateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription) error {
-			assert.Equal(t, string(database.SubscriptionStatusRevoked), sub.Status)
-			return nil
-		},
-	}
-	svc := NewSubscriptionService(db, nil, nil, nil, cfg)
-
-	invokedSubIDs := []string{}
-
-	svc.SetInvalidateBySubIDFunc(func(subID string) { invokedSubIDs = append(invokedSubIDs, subID) })
-
-	count, err := svc.ReconcileOrphanedClients(context.Background())
-	assert.NoError(t, err)
-	assert.Equal(t, 1, count)
-	assert.Equal(t, []string{"sub-orphan"}, invokedSubIDs)
-}
-
-// TestSubscriptionService_BindTrial_SingleNode_ErrorPropagated verifies the
-// single-node trial contract: BindTrial only touches nodes[0] (the node where
-// CreateTrial provisioned the client). A failure on that node must be returned
-// to the caller, not swallowed, and other trial nodes must not be contacted.
-func TestSubscriptionService_BindTrial_SingleNode_ErrorPropagated(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{TrialDurationHours: 3}
-
-	bound := &database.Subscription{
-		ID:             42,
-		TelegramID:     123456,
-		Username:       "testuser",
-		ClientID:       "client-xyz",
-		SubscriptionID: "trial-sub-1",
-		Status:         "active",
-		PlanID:         2,
-	}
-
-	db := &testutil.DatabaseService{
-		GetTrialSubscriptionBySubIDFunc: func(ctx context.Context, subscriptionID string) (*database.Subscription, error) {
-			return bound, nil
-		},
-		BindTrialSubscriptionFunc: func(ctx context.Context, subscriptionID string, telegramID int64, username string) (*database.Subscription, error) {
-			return bound, nil
-		},
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 2, Name: database.FreePlanName, TrafficLimit: 1024 * 1024 * 1024}, nil
-		},
-		GetNodesByPlanNameFunc: func(ctx context.Context, planName string) ([]database.Node, error) {
-			if planName == database.TrialPlanName {
-				return []database.Node{
-					{ID: 1, IsActive: true, Host: "http://x1", InboundIDs: "[1]"},
-					{ID: 2, IsActive: true, Host: "http://x2", InboundIDs: "[1]"},
-				}, nil
-			}
-
-			return nil, nil
-		},
-	}
-
-	xui1Calls := 0
-	xui2Calls := 0
-
-	var gotReq vpn.SubscriptionProvision
-
-	xui1 := &testutil.XUIClient{
-		UpdateClientFunc: func(ctx context.Context, req xui.ClientRequest) error {
-			xui1Calls++
-			gotReq = vpn.SubscriptionProvision{
-				ClientID:     req.ClientID,
-				CurrentEmail: req.CurrentEmail,
-				Username:     req.Email,
-				SubID:        req.SubID,
-				TrafficBytes: req.TrafficBytes,
-				ExpiryTime:   req.ExpiryTime,
-				ResetDays:    req.ResetDays,
-				TgID:         req.TgID,
-				Comment:      req.Comment,
-			}
-
-			return errors.New("source 1 unreachable")
-		},
-	}
-	xui2 := &testutil.XUIClient{
-		UpdateClientFunc: func(ctx context.Context, req xui.ClientRequest) error {
-			xui2Calls++
-			return nil
-		},
-	}
-
-	xuiClients := map[uint]interfaces.XUIClient{1: xui1, 2: xui2}
-	vpnClients := map[uint]vpn.Client{
-		1: vpn.NewThreeXUIClient(xui1, []int{1}),
-		2: vpn.NewThreeXUIClient(xui2, []int{1}),
-	}
-	sources := []database.Node{
-		{ID: 1, IsActive: true, Host: "http://x1", InboundIDs: "[1]"},
-		{ID: 2, IsActive: true, Host: "http://x2", InboundIDs: "[1]"},
-	}
-
-	svc := NewSubscriptionService(db, xuiClients, vpnClients, sources, cfg)
-
-	got, err := svc.BindTrial(context.Background(), "trial-sub-1", 123456, "testuser")
-	require.Error(t, err, "BindTrial must propagate UpdateClient failure on nodes[0]")
-	assert.Contains(t, err.Error(), "update trial client on node 1")
-	// The DB binding has not happened because panel sync failed first.
-	assert.Nil(t, got)
-	assert.Equal(t, 1, xui1Calls, "only nodes[0] must be contacted")
-	assert.Equal(t, 0, xui2Calls, "nodes[1] must not be contacted (single-node trial contract)")
-	assert.Equal(t, "trial_trial-sub-1", gotReq.CurrentEmail, "CurrentEmail must be trial_ + subscriptionID")
-	assert.Equal(t, "testuser", gotReq.Username, "Username must be the resolved XUIEmail (username)")
-}
-
-func TestSubscriptionService_BindTrial_ReferrerErrorStopsProvisioning(t *testing.T) {
-	t.Parallel()
-
-	bound := &database.Subscription{
-		ID:             42,
-		TelegramID:     123456,
-		Username:       "testuser",
-		ClientID:       "client-xyz",
-		SubscriptionID: "trial-sub-1",
-		Status:         "active",
-		PlanID:         2,
-		InviteCode:     testutil.PtrString("REFER123"),
-	}
-	updateCalls := 0
-	bindCalls := 0
-
-	db := &testutil.DatabaseService{
-		GetTrialSubscriptionBySubIDFunc: func(ctx context.Context, subscriptionID string) (*database.Subscription, error) {
-			return bound, nil
-		},
-		BindTrialSubscriptionFunc: func(ctx context.Context, subscriptionID string, telegramID int64, username string) (*database.Subscription, error) {
-			bindCalls++
-			return bound, nil
-		},
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 2, Name: database.FreePlanName, TrafficLimit: 1024}, nil
-		},
-		GetInviteByCodeFunc: func(ctx context.Context, code string) (*database.Invite, error) {
-			return nil, context.Canceled
-		},
-	}
-
-	client := &testutil.XUIClient{
-		UpdateClientFunc: func(ctx context.Context, req xui.ClientRequest) error {
-			updateCalls++
-			return nil
-		},
-	}
-	node := database.Node{ID: 1, IsActive: true, Host: "http://x1", InboundIDs: "[1]"}
-	svc := NewSubscriptionService(db, nil, map[uint]vpn.Client{1: vpn.NewThreeXUIClient(client, []int{1})}, []database.Node{node}, &config.Config{})
-
-	got, err := svc.BindTrial(context.Background(), "trial-sub-1", 123456, "testuser")
 	require.Error(t, err)
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.Nil(t, got)
-	assert.Zero(t, bindCalls, "referrer lookup errors must not commit the trial binding")
-	assert.Zero(t, updateCalls, "referrer lookup errors must not send an empty Comment to the panel")
+	assert.Contains(t, err.Error(), "create trial subscription")
+	assert.Nil(t, result)
 }
 
-// TestSubscriptionService_BindTrial_SingleNode_Success verifies the happy path
-// of the single-node trial contract: exactly one UpdateClient on nodes[0].
-func TestSubscriptionService_BindTrial_SingleNode_Success(t *testing.T) {
+// TestSubscriptionService_BindTrial_Success: binding is the DB operation
+// itself; the bound row is returned and the trial's /sub cache is dropped.
+func TestSubscriptionService_BindTrial_Success(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.Config{TrialDurationHours: 3}
+	bound := &database.Subscription{ID: 42, TelegramID: 123456, Username: "testuser", ClientID: "client-xyz", SubscriptionID: "trial-sub-1", Status: "active", PlanID: 2}
 
-	bound := &database.Subscription{
-		ID:             42,
-		TelegramID:     123456,
-		Username:       "testuser",
-		ClientID:       "client-xyz",
-		SubscriptionID: "trial-sub-1",
-		Status:         "active",
-		PlanID:         2,
-	}
+	var (
+		gotSubID    string
+		gotTG       int64
+		gotUsername string
+	)
 
 	db := &testutil.DatabaseService{
-		GetTrialSubscriptionBySubIDFunc: func(ctx context.Context, subscriptionID string) (*database.Subscription, error) {
-			return bound, nil
-		},
 		BindTrialSubscriptionFunc: func(ctx context.Context, subscriptionID string, telegramID int64, username string) (*database.Subscription, error) {
+			gotSubID, gotTG, gotUsername = subscriptionID, telegramID, username
 			return bound, nil
 		},
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 2, Name: database.FreePlanName, TrafficLimit: 1024 * 1024 * 1024}, nil
-		},
-		GetNodesByPlanNameFunc: func(ctx context.Context, planName string) ([]database.Node, error) {
-			if planName == database.TrialPlanName {
-				return []database.Node{
-					{ID: 1, IsActive: true, Host: "http://x1", InboundIDs: "[1]"},
-					{ID: 2, IsActive: true, Host: "http://x2", InboundIDs: "[1]"},
-				}, nil
-			}
-
-			return nil, nil
-		},
 	}
 
-	xui1Calls := 0
-	xui2Calls := 0
+	svc := NewSubscriptionService(db, &config.Config{TrialDurationHours: 3})
 
-	var gotReq vpn.SubscriptionProvision
+	var invalidated []string
+	svc.SetInvalidateBySubIDFunc(func(id string) { invalidated = append(invalidated, id) })
 
-	xui1 := &testutil.XUIClient{
-		UpdateClientFunc: func(ctx context.Context, req xui.ClientRequest) error {
-			xui1Calls++
-			gotReq = vpn.SubscriptionProvision{
-				ClientID:     req.ClientID,
-				CurrentEmail: req.CurrentEmail,
-				Username:     req.Email,
-				SubID:        req.SubID,
-				TrafficBytes: req.TrafficBytes,
-				ExpiryTime:   req.ExpiryTime,
-				ResetDays:    req.ResetDays,
-				TgID:         req.TgID,
-				Comment:      req.Comment,
-			}
-
-			return nil
-		},
-	}
-	xui2 := &testutil.XUIClient{
-		UpdateClientFunc: func(ctx context.Context, req xui.ClientRequest) error {
-			xui2Calls++
-			return nil
-		},
-	}
-
-	xuiClients := map[uint]interfaces.XUIClient{1: xui1, 2: xui2}
-	vpnClients := map[uint]vpn.Client{
-		1: vpn.NewThreeXUIClient(xui1, []int{1}),
-		2: vpn.NewThreeXUIClient(xui2, []int{1}),
-	}
-	sources := []database.Node{
-		{ID: 1, IsActive: true, Host: "http://x1", InboundIDs: "[1]"},
-		{ID: 2, IsActive: true, Host: "http://x2", InboundIDs: "[1]"},
-	}
-
-	svc := NewSubscriptionService(db, xuiClients, vpnClients, sources, cfg)
-
-	got, err := svc.BindTrial(context.Background(), "trial-sub-1", 123456, "testuser")
+	got, err := svc.BindTrial(context.Background(), "trial-sub-1", 123456, "")
 	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, uint(42), got.ID)
-	assert.Equal(t, 1, xui1Calls, "exactly one UpdateClient on nodes[0]")
-	assert.Equal(t, 0, xui2Calls, "nodes[1] must not be contacted")
-	assert.Equal(t, "trial_trial-sub-1", gotReq.CurrentEmail, "CurrentEmail must be trial_ + subscriptionID")
-	assert.Equal(t, "testuser", gotReq.Username, "Username must be the resolved XUIEmail (username)")
+	assert.Same(t, bound, got)
+	assert.Equal(t, "trial-sub-1", gotSubID)
+	assert.Equal(t, int64(123456), gotTG)
+	assert.Equal(t, "tgId_123456", gotUsername, "an empty Telegram username falls back to tgId_<id>")
+	assert.Equal(t, []string{"trial-sub-1"}, invalidated)
 }
 
-// TestSubscriptionService_BindTrial_DBBindFailureRollsBack verifies the
-// two-phase contract: after the panel update succeeds, a failed DB bind rolls
-// the panel client back to its anonymous trial identity when the row is still
-// unbound (TelegramID < 0).
-func TestSubscriptionService_BindTrial_DBBindFailureRollsBack(t *testing.T) {
+func TestSubscriptionService_BindTrial_DBErrorPropagated(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.Config{TrialDurationHours: 3}
-
-	trialExpiresAt := time.Now().UTC().Add(3 * time.Hour)
-	unboundTrial := &database.Subscription{
-		ID:             42,
-		TelegramID:     -5,
-		ClientID:       "client-xyz",
-		SubscriptionID: "trial-sub-1",
-		Status:         "active",
-		PlanID:         2,
-		ExpiresAt:      &trialExpiresAt,
-	}
-
-	lookupCalls := 0
 	db := &testutil.DatabaseService{
-		GetTrialSubscriptionBySubIDFunc: func(ctx context.Context, subscriptionID string) (*database.Subscription, error) {
-			lookupCalls++
-			// First call: load the trial. Second call: verify it is still unbound.
-			return unboundTrial, nil
-		},
 		BindTrialSubscriptionFunc: func(ctx context.Context, subscriptionID string, telegramID int64, username string) (*database.Subscription, error) {
-			return nil, errors.New("bind race lost")
-		},
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			switch name {
-			case database.TrialPlanName:
-				return &database.Plan{ID: 1, Name: database.TrialPlanName, TrafficLimit: 512 * 1024 * 1024}, nil
-			default:
-				return &database.Plan{ID: 2, Name: database.FreePlanName, TrafficLimit: 1024 * 1024 * 1024}, nil
-			}
-		},
-		GetNodesByPlanNameFunc: func(ctx context.Context, planName string) ([]database.Node, error) {
-			if planName == database.TrialPlanName {
-				return []database.Node{{ID: 1, IsActive: true, Host: "http://x1", InboundIDs: "[1]"}}, nil
-			}
-			return nil, nil
+			return nil, database.ErrTrialAlreadyActivated
 		},
 	}
 
-	var provisions []vpn.SubscriptionProvision
-	xui1 := &testutil.XUIClient{
-		UpdateClientFunc: func(ctx context.Context, req xui.ClientRequest) error {
-			provisions = append(provisions, vpn.SubscriptionProvision{
-				ClientID:     req.ClientID,
-				CurrentEmail: req.CurrentEmail,
-				Username:     req.Email,
-				SubID:        req.SubID,
-				TrafficBytes: req.TrafficBytes,
-				ExpiryTime:   req.ExpiryTime,
-				ResetDays:    req.ResetDays,
-				TgID:         req.TgID,
-				Comment:      req.Comment,
-			})
-			return nil
-		},
-	}
-	vpnClients := map[uint]vpn.Client{1: vpn.NewThreeXUIClient(xui1, []int{1})}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x1", InboundIDs: "[1]"}}
-
-	svc := NewSubscriptionService(db, nil, vpnClients, sources, cfg)
+	svc := NewSubscriptionService(db, &config.Config{})
+	invalidated := false
+	svc.SetInvalidateBySubIDFunc(func(string) { invalidated = true })
 
 	got, err := svc.BindTrial(context.Background(), "trial-sub-1", 123456, "testuser")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "bind trial subscription")
+	require.ErrorIs(t, err, database.ErrTrialAlreadyActivated)
 	assert.Nil(t, got)
-	assert.Equal(t, 2, lookupCalls, "trial must be re-read after the bind failure to check state")
-	require.Len(t, provisions, 2, "bound update plus rollback update")
-	assert.Equal(t, "trial_trial-sub-1", provisions[0].CurrentEmail, "first call binds the user identity")
-	assert.Equal(t, "testuser", provisions[0].Username)
-	assert.Equal(t, "testuser", provisions[1].CurrentEmail, "rollback renames the bound email back to the anonymous trial identity")
-	assert.Equal(t, "trial_trial-sub-1", provisions[1].Username)
-	assert.Equal(t, int64(512*1024*1024), provisions[1].TrafficBytes, "rollback must restore the trial plan traffic limit")
-	assert.Equal(t, trialExpiresAt, provisions[1].ExpiryTime, "rollback must restore the original trial expiry")
-}
-
-// TestSubscriptionService_BindTrial_DBBindFailureCheckErrorSkipsRollback verifies
-// the conservative branch: when the post-failure state check itself fails, the
-// panel update is left intact (another binder may have won the race) and no
-// rollback is attempted.
-func TestSubscriptionService_BindTrial_DBBindFailureCheckErrorSkipsRollback(t *testing.T) {
-	t.Parallel()
-
-	cfg := &config.Config{TrialDurationHours: 3}
-
-	trial := &database.Subscription{
-		ID:             42,
-		TelegramID:     -5,
-		ClientID:       "client-xyz",
-		SubscriptionID: "trial-sub-1",
-		Status:         "active",
-		PlanID:         2,
-	}
-
-	lookupCalls := 0
-	db := &testutil.DatabaseService{
-		GetTrialSubscriptionBySubIDFunc: func(ctx context.Context, subscriptionID string) (*database.Subscription, error) {
-			lookupCalls++
-			if lookupCalls > 1 {
-				return nil, errors.New("db unreachable")
-			}
-			return trial, nil
-		},
-		BindTrialSubscriptionFunc: func(ctx context.Context, subscriptionID string, telegramID int64, username string) (*database.Subscription, error) {
-			return nil, errors.New("bind race lost")
-		},
-		GetPlanByNameFunc: func(ctx context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 2, Name: database.FreePlanName, TrafficLimit: 1024 * 1024 * 1024}, nil
-		},
-		GetNodesByPlanNameFunc: func(ctx context.Context, planName string) ([]database.Node, error) {
-			if planName == database.TrialPlanName {
-				return []database.Node{{ID: 1, IsActive: true, Host: "http://x1", InboundIDs: "[1]"}}, nil
-			}
-			return nil, nil
-		},
-	}
-
-	updateCalls := 0
-	xui1 := &testutil.XUIClient{
-		UpdateClientFunc: func(ctx context.Context, req xui.ClientRequest) error {
-			updateCalls++
-			return nil
-		},
-	}
-	vpnClients := map[uint]vpn.Client{1: vpn.NewThreeXUIClient(xui1, []int{1})}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x1", InboundIDs: "[1]"}}
-
-	svc := NewSubscriptionService(db, nil, vpnClients, sources, cfg)
-
-	got, err := svc.BindTrial(context.Background(), "trial-sub-1", 123456, "testuser")
-	require.Error(t, err)
-	assert.Nil(t, got)
-	assert.Equal(t, 1, updateCalls, "no rollback when the state check fails: do not undo another binder's work")
-}
-
-func TestReferrerComment(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-
-	t.Run("no invite code returns empty", func(t *testing.T) {
-		db := &testutil.DatabaseService{}
-		comment, err := referrerComment(ctx, db, &database.Subscription{})
-		require.NoError(t, err)
-		assert.Empty(t, comment)
-	})
-
-	t.Run("unknown invite returns empty without error", func(t *testing.T) {
-		db := &testutil.DatabaseService{
-			GetInviteByCodeFunc: func(ctx context.Context, code string) (*database.Invite, error) {
-				return nil, database.ErrInviteNotFound
-			},
-		}
-		sub := &database.Subscription{InviteCode: testutil.PtrString("REFER123")}
-		comment, err := referrerComment(ctx, db, sub)
-		require.NoError(t, err)
-		assert.Empty(t, comment)
-	})
-
-	t.Run("unknown referrer returns empty without error", func(t *testing.T) {
-		db := &testutil.DatabaseService{
-			GetInviteByCodeFunc: func(ctx context.Context, code string) (*database.Invite, error) {
-				return &database.Invite{Code: code, ReferrerTGID: 555}, nil
-			},
-			GetByTelegramIDFunc: func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
-				return nil, database.ErrSubscriptionNotFound
-			},
-		}
-		sub := &database.Subscription{InviteCode: testutil.PtrString("REFER123")}
-		comment, err := referrerComment(ctx, db, sub)
-		require.NoError(t, err)
-		assert.Empty(t, comment)
-	})
-
-	t.Run("context error is wrapped", func(t *testing.T) {
-		db := &testutil.DatabaseService{
-			GetInviteByCodeFunc: func(ctx context.Context, code string) (*database.Invite, error) {
-				return nil, context.DeadlineExceeded
-			},
-		}
-		sub := &database.Subscription{InviteCode: testutil.PtrString("REFER123")}
-		comment, err := referrerComment(ctx, db, sub)
-		assert.Empty(t, comment)
-		require.Error(t, err)
-		assert.ErrorIs(t, err, context.DeadlineExceeded)
-		assert.Contains(t, err.Error(), "load invite by code")
-	})
-
-	t.Run("referrer error is wrapped", func(t *testing.T) {
-		loadErr := errors.New("database unavailable")
-		db := &testutil.DatabaseService{
-			GetInviteByCodeFunc: func(ctx context.Context, code string) (*database.Invite, error) {
-				return &database.Invite{Code: code, ReferrerTGID: 555}, nil
-			},
-			GetByTelegramIDFunc: func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
-				return nil, loadErr
-			},
-		}
-		sub := &database.Subscription{InviteCode: testutil.PtrString("REFER123")}
-		comment, err := referrerComment(ctx, db, sub)
-		assert.Empty(t, comment)
-		require.Error(t, err)
-		assert.ErrorIs(t, err, loadErr)
-		assert.Contains(t, err.Error(), "load referrer subscription")
-	})
-
-	t.Run("referrer found formats comment", func(t *testing.T) {
-		db := &testutil.DatabaseService{
-			GetInviteByCodeFunc: func(ctx context.Context, code string) (*database.Invite, error) {
-				return &database.Invite{Code: code, ReferrerTGID: 555}, nil
-			},
-			GetByTelegramIDFunc: func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
-				return &database.Subscription{TelegramID: telegramID, Username: "referrer"}, nil
-			},
-		}
-		sub := &database.Subscription{InviteCode: testutil.PtrString("REFER123")}
-		comment, err := referrerComment(ctx, db, sub)
-		require.NoError(t, err)
-		assert.Equal(t, "from: @referrer", comment)
-	})
+	assert.False(t, invalidated, "a failed bind changes nothing to invalidate")
 }
 
 // ==================== DeleteByID Tests ====================
@@ -1116,16 +353,8 @@ func TestSubscriptionService_DeleteByID_Success(t *testing.T) {
 			return &database.Subscription{ID: 7, TelegramID: 42, Username: "u", ClientID: "c1", SubscriptionID: "s1"}, nil
 		},
 	}
-	xuiClient := &testutil.XUIClient{
-		DeleteClientFunc: func(ctx context.Context, email string) error {
-			assert.NotEmpty(t, email)
-			return nil
-		},
-	}
-	xuiClients := map[uint]interfaces.XUIClient{1: xuiClient}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	deleted, err := svc.DeleteByID(context.Background(), 7)
 
 	assert.NoError(t, err)
@@ -1142,10 +371,8 @@ func TestSubscriptionService_DeleteByID_GetError(t *testing.T) {
 			return nil, errors.New("not found")
 		},
 	}
-	xuiClients := map[uint]interfaces.XUIClient{1: &testutil.XUIClient{}}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	deleted, err := svc.DeleteByID(context.Background(), 1)
 
 	assert.Error(t, err)
@@ -1165,10 +392,8 @@ func TestSubscriptionService_DeleteByID_DBError(t *testing.T) {
 			return nil, errors.New("db fail")
 		},
 	}
-	xuiClients := map[uint]interfaces.XUIClient{1: &testutil.XUIClient{}}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	deleted, err := svc.DeleteByID(context.Background(), 1)
 
 	assert.Error(t, err)
@@ -1210,10 +435,8 @@ func TestSubscriptionService_DeleteByID_MarkRevokedBeforeDBDelete(t *testing.T) 
 			return nil, errors.New("db delete failed")
 		},
 	}
-	xuiClients := map[uint]interfaces.XUIClient{1: &testutil.XUIClient{}}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	_, err := svc.DeleteByID(context.Background(), 1)
 
 	// DB delete failed → error returned to caller.
@@ -1225,72 +448,14 @@ func TestSubscriptionService_DeleteByID_MarkRevokedBeforeDBDelete(t *testing.T) 
 	assert.Equal(t, "revoked", updatedStatus, "subscription must be marked revoked before deprovision/delete")
 }
 
-// TestSubscriptionService_DeleteByID_SyncFailureKeepsRetryQueue verifies that
-// a failed external deprovision leaves the revoked subscription and its
-// pending_remove row for the background worker instead of destroying the retry
-// queue with a physical delete.
-func TestSubscriptionService_DeleteByID_SyncFailureKeepsRetryQueue(t *testing.T) {
-	t.Parallel()
-
-	var deleteByIDCalled bool
-	// Node binding used by MarkAllForRemoval / SyncSubscription.
-	nodes := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
-	db := &testutil.DatabaseService{
-		GetByIDFunc: func(ctx context.Context, id uint) (*database.Subscription, error) {
-			return &database.Subscription{ID: 1, ClientID: "c", SubscriptionID: "s", TelegramID: 1, Username: "u", Status: "active"}, nil
-		},
-		// An existing active node binding so MarkAllForRemoval flips it to
-		// pending_remove, and the subsequent SyncSubscription reaches the VPN
-		// client's DeleteSubscription call.
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			return []database.SubscriptionNode{
-				{SubscriptionID: subscriptionID, NodeID: 1, Status: database.SyncStatusActive},
-			}, nil
-		},
-		// SyncSubscription reads the pending_remove node and dispatches the
-		// delete to the VPN client (which fails below).
-		GetPendingBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			return []database.SubscriptionNode{
-				{SubscriptionID: subscriptionID, NodeID: 1, Status: database.SyncStatusPendingRemove},
-			}, nil
-		},
-		UpdateSubscriptionFunc: func(ctx context.Context, sub *database.Subscription) error {
-			return nil
-		},
-		DeleteSubscriptionByIDFunc: func(ctx context.Context, id uint) (*database.Subscription, error) {
-			deleteByIDCalled = true
-			return &database.Subscription{ID: id, ClientID: "c", SubscriptionID: "s"}, nil
-		},
-	}
-
-	// XUI client is unused by the teardown path (syncService owns deprovision).
-	xuiClients := map[uint]interfaces.XUIClient{1: &testutil.XUIClient{}}
-	// VPN client fails on delete → SyncSubscription reaches DeleteSubscription
-	// and receives the configured "vpn delete failed" error (best-effort).
-	vpnClients := map[uint]vpn.Client{1: &mockVPNClient{deleteError: errors.New("vpn delete failed")}}
-
-	svc := NewSubscriptionService(db, xuiClients, vpnClients, nodes, &config.Config{})
-	svc.SetSyncService(NewSyncService(db, vpnClients, nodes))
-
-	deleted, err := svc.DeleteByID(context.Background(), 1)
-
-	// Physical delete must not run while the pending_remove retry row remains.
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "deprovision incomplete")
-	assert.False(t, deleteByIDCalled, "physical delete must wait for successful deprovision")
-	assert.Nil(t, deleted)
-}
-
 // ==================== InvalidateSubscription Tests ====================
 
 func TestSubscriptionService_InvalidateSubscription_CallsCallback(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{}
-	xuiClients := map[uint]interfaces.XUIClient{1: &testutil.XUIClient{}}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
 
-	svc := NewSubscriptionService(&testutil.DatabaseService{}, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(&testutil.DatabaseService{}, cfg)
 
 	var captured int64
 
@@ -1305,10 +470,7 @@ func TestSubscriptionService_InvalidateSubscription_CallsCallback(t *testing.T) 
 func TestSubscriptionService_InvalidateSubscription_NoCallback(t *testing.T) {
 	t.Parallel()
 
-	xuiClients := map[uint]interfaces.XUIClient{1: &testutil.XUIClient{}}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
-
-	svc := NewSubscriptionService(&testutil.DatabaseService{}, xuiClients, nil, sources, &config.Config{})
+	svc := NewSubscriptionService(&testutil.DatabaseService{}, &config.Config{})
 
 	assert.NotPanics(t, func() {
 		svc.InvalidateSubscription(context.Background(), 1)
@@ -1331,17 +493,8 @@ func TestSubscriptionService_CleanupExpiredTrials_Success(t *testing.T) {
 			return expired, nil
 		},
 	}
-	xuiClient := &testutil.XUIClient{
-		DeleteClientFunc: func(ctx context.Context, email string) error {
-			assert.True(t, strings.HasPrefix(email, "trial_"))
-			return nil
-		},
-	}
-	xuiClients := map[uint]interfaces.XUIClient{1: xuiClient}
-	vpnClients := map[uint]vpn.Client{1: vpn.NewThreeXUIClient(xuiClient, []int{1})}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
 
-	svc := NewSubscriptionService(db, xuiClients, vpnClients, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	n, err := svc.CleanupExpiredTrials(context.Background())
 
 	assert.NoError(t, err)
@@ -1357,155 +510,60 @@ func TestSubscriptionService_CleanupExpiredTrials_DBError(t *testing.T) {
 			return nil, errors.New("db fail")
 		},
 	}
-	xuiClients := map[uint]interfaces.XUIClient{1: &testutil.XUIClient{}}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
 
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 	n, err := svc.CleanupExpiredTrials(context.Background())
 
 	assert.Error(t, err)
 	assert.Equal(t, int64(0), n)
 }
 
-// TestSubscriptionService_CleanupExpiredTrials_DeprovisionFailureKeepsRow
-// verifies the two-phase cleanup: when external deprovision fails, the claimed
-// trial row is NOT deleted and the failure is surfaced as an aggregate error so
-// the scheduler retries on the next pass.
-func TestSubscriptionService_CleanupExpiredTrials_DeprovisionFailureKeepsRow(t *testing.T) {
+// TestSubscriptionService_CleanupExpiredTrials_DeleteFailureIsSurfaced: a
+// failed delete leaves the claimed trial row for the next run and is returned
+// as an aggregate error; other claimed trials are still deleted.
+func TestSubscriptionService_CleanupExpiredTrials_DeleteFailureIsSurfaced(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{TrialDurationHours: 24}
 	expired := []database.Subscription{
-		{ID: 1, ClientID: "c1", SubscriptionID: "exp1", TelegramID: 0},
+		{ID: 1, ClientID: "c1", SubscriptionID: "exp1"},
+		{ID: 2, ClientID: "c2", SubscriptionID: "exp2"},
 	}
-	deleteCalled := false
+	var deleted []uint
 	db := &testutil.DatabaseService{
 		ClaimExpiredTrialsFunc: func(ctx context.Context, hours int) ([]database.Subscription, error) {
 			return expired, nil
 		},
 		DeleteClaimedTrialFunc: func(ctx context.Context, id uint) error {
-			deleteCalled = true
+			if id == 1 {
+				return errors.New("database is locked")
+			}
+			deleted = append(deleted, id)
 			return nil
 		},
 	}
 
-	xuiClient := &testutil.XUIClient{
-		DeleteClientFunc: func(ctx context.Context, email string) error {
-			return errors.New("panel unreachable")
-		},
-	}
-	vpnClients := map[uint]vpn.Client{1: vpn.NewThreeXUIClient(xuiClient, []int{1})}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
-
-	svc := NewSubscriptionService(db, nil, vpnClients, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
+	var invalidated []string
+	svc.SetInvalidateBySubIDFunc(func(id string) { invalidated = append(invalidated, id) })
 	n, err := svc.CleanupExpiredTrials(context.Background())
 
-	assert.Error(t, err, "deprovision failure must be surfaced")
-	assert.Contains(t, err.Error(), "cleanup trial exp1")
-	assert.Equal(t, int64(0), n)
-	assert.False(t, deleteCalled, "the row must stay claimed for the next retry")
+	require.Error(t, err, "delete failure must be surfaced")
+	assert.Contains(t, err.Error(), "delete expired trial exp1")
+	assert.Equal(t, int64(1), n)
+	assert.Equal(t, []uint{2}, deleted)
+	assert.Equal(t, []string{"exp2"}, invalidated, "only the deleted trial's cache is dropped")
 }
 
-// TestSubscriptionService_ReconcileOrphanedClients_RecreatesMissingQueue
-// verifies the recovery branch: an active non-trial subscription without any
-// node bindings gets its pending_add queue recreated instead of being revoked.
-func TestSubscriptionService_ReconcileOrphanedClients_RecreatesMissingQueue(t *testing.T) {
+// ==================== SubscriptionUsername Tests ====================// ==================== XUIEmail Tests ====================
+
+func TestSubscriptionUsername_RealUsername(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.Config{}
-
-	sub := &database.Subscription{ID: 10, TelegramID: 100, Username: "paiduser", SubscriptionID: "sub-paid", Status: "active", PlanID: 5}
-
-	upserted := make([]database.SubscriptionNode, 0)
-	updated := make(map[uint]string)
-
-	db := &testutil.DatabaseService{
-		GetAllSubscriptionsFunc: func(ctx context.Context) ([]database.Subscription, error) {
-			return []database.Subscription{*sub}, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			return nil, nil // queue was lost
-		},
-		GetPlanByIDFunc: func(ctx context.Context, planID uint) (*database.Plan, error) {
-			return &database.Plan{ID: 5, Name: "paid-plan"}, nil
-		},
-		GetNodesByPlanIDFunc: func(ctx context.Context, planID uint) ([]database.Node, error) {
-			return []database.Node{{ID: 1, IsActive: true, Host: "http://n1", InboundIDs: "[1]"}}, nil
-		},
-		UpsertSubscriptionNodeFunc: func(ctx context.Context, sn *database.SubscriptionNode) error {
-			upserted = append(upserted, *sn)
-			return nil
-		},
-		UpdateSubscriptionFunc: func(ctx context.Context, s *database.Subscription) error {
-			updated[s.ID] = s.Status
-			return nil
-		},
-	}
-	svc := NewSubscriptionService(db, nil, nil, nil, cfg)
-
-	count, err := svc.ReconcileOrphanedClients(context.Background())
-	assert.NoError(t, err)
-	assert.Equal(t, 0, count, "a recoverable subscription must not be revoked")
-	require.Len(t, upserted, 1)
-	assert.Equal(t, database.SyncStatusPendingAdd, upserted[0].Status)
-	assert.Equal(t, sub.ID, upserted[0].SubscriptionID)
-	assert.Empty(t, updated, "the subscription status must not change")
+	assert.Equal(t, "alice", SubscriptionUsername("alice", 42))
 }
 
-func TestSubscriptionService_GetOrCreateSubscription_RepairsExistingSubscriptionNodes(t *testing.T) {
-	t.Parallel()
-
-	existing := &database.Subscription{ID: 42, TelegramID: 4242, Username: "repairuser", PlanID: 9, Status: "active"}
-	planNodes := []database.Node{
-		{ID: 1, IsActive: true},
-		{ID: 2, IsActive: true},
-		{ID: 3, IsActive: false},
-	}
-	existingNodes := []database.SubscriptionNode{{SubscriptionID: existing.ID, NodeID: 1, Status: database.SyncStatusActive}}
-
-	upserted := make([]database.SubscriptionNode, 0)
-	db := &testutil.DatabaseService{
-		GetByTelegramIDFunc: func(ctx context.Context, telegramID int64) (*database.Subscription, error) {
-			assert.Equal(t, int64(4242), telegramID)
-			return existing, nil
-		},
-		GetNodesByPlanIDFunc: func(ctx context.Context, planID uint) ([]database.Node, error) {
-			assert.Equal(t, existing.PlanID, planID)
-			return planNodes, nil
-		},
-		GetBySubscriptionIDFunc: func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-			assert.Equal(t, existing.ID, subscriptionID)
-			return existingNodes, nil
-		},
-		UpsertSubscriptionNodeFunc: func(ctx context.Context, sn *database.SubscriptionNode) error {
-			upserted = append(upserted, *sn)
-			return nil
-		},
-	}
-
-	xuiClients := map[uint]interfaces.XUIClient{1: &testutil.XUIClient{}}
-	sources := []database.Node{{ID: 1, IsActive: true, Host: "http://x", InboundIDs: "[1]"}}
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, &config.Config{})
-
-	got, err := svc.GetOrCreateSubscription(context.Background(), 4242, "repairuser", "")
-
-	assert.NoError(t, err)
-	assert.Equal(t, existing, got)
-	require.Len(t, upserted, 1)
-	assert.Equal(t, existing.ID, upserted[0].SubscriptionID)
-	assert.Equal(t, uint(2), upserted[0].NodeID)
-	assert.Equal(t, database.SyncStatusPendingAdd, upserted[0].Status)
-}
-
-// ==================== XUIEmail Tests ====================
-
-func TestXUIEmail_RealUsername(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, "alice", XUIEmail("alice", 42))
-}
-
-func TestXUIEmail_FallbackToTgID(t *testing.T) {
+func TestSubscriptionUsername_FallbackToTgID(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -1520,118 +578,9 @@ func TestXUIEmail_FallbackToTgID(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, XUIEmail(tt.username, tt.chatID))
+			assert.Equal(t, tt.want, SubscriptionUsername(tt.username, tt.chatID))
 		})
 	}
-}
-
-func TestSubscriptionService_Create_ReanimatesRevoked_ReturnsCleanupError(t *testing.T) {
-	t.Parallel()
-
-	cleanupErr := errors.New("subscription nodes database unavailable")
-	existing := &database.Subscription{
-		ID:             42,
-		TelegramID:     777778,
-		ClientID:       "client-revoked-error",
-		SubscriptionID: "sub-revoked-error",
-		PlanID:         1,
-		Status:         string(database.SubscriptionStatusRevoked),
-	}
-	updateCalled := false
-
-	db := &testutil.DatabaseService{
-		GetByTelegramIDFunc: func(context.Context, int64) (*database.Subscription, error) {
-			return nil, database.ErrSubscriptionNotFound
-		},
-		GetAnyByTelegramIDFunc: func(context.Context, int64) (*database.Subscription, error) {
-			return existing, nil
-		},
-		GetPlanByNameFunc: func(context.Context, string) (*database.Plan, error) {
-			return &database.Plan{ID: 2, Name: database.FreePlanName}, nil
-		},
-		DeleteSubscriptionNodesBySubscriptionIDFunc: func(context.Context, uint) error {
-			return cleanupErr
-		},
-		UpdateSubscriptionFunc: func(context.Context, *database.Subscription) error {
-			updateCalled = true
-			return nil
-		},
-	}
-
-	svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{})
-	result, err := svc.Create(context.Background(), existing.TelegramID, "", "")
-
-	require.Error(t, err)
-	assert.ErrorIs(t, err, cleanupErr)
-	assert.Nil(t, result)
-	assert.False(t, updateCalled, "failed cleanup must not activate the subscription")
-}
-
-func TestSubscriptionService_DeleteByID_KeepsRetryQueueOnDeprovisionFailure(t *testing.T) {
-	t.Parallel()
-
-	const (
-		subscriptionID uint = 77
-		nodeID         uint = 9
-	)
-	deprovisionErr := errors.New("vpn node unavailable")
-	sub := &database.Subscription{
-		ID:             subscriptionID,
-		TelegramID:     777779,
-		Username:       "delete-retry-user",
-		ClientID:       "delete-retry-client",
-		SubscriptionID: "delete-retry-sub",
-		Status:         string(database.SubscriptionStatusActive),
-	}
-	pending := []database.SubscriptionNode{{
-		SubscriptionID: subscriptionID,
-		NodeID:         nodeID,
-		Status:         database.SyncStatusPendingRemove,
-	}}
-	deleteClient := &mockVPNClient{deleteError: deprovisionErr}
-	hardDeleteCalled := false
-
-	db := &testutil.DatabaseService{
-		GetByIDFunc: func(context.Context, uint) (*database.Subscription, error) {
-			return sub, nil
-		},
-		GetNodeByIDFunc: func(context.Context, uint) (*database.Node, error) {
-			return &database.Node{ID: nodeID, IsActive: true}, nil
-		},
-		UpdateSubscriptionFunc: func(_ context.Context, updated *database.Subscription) error {
-			assert.Equal(t, database.SubscriptionStatusRevoked, database.SubscriptionStatus(updated.Status))
-			return nil
-		},
-		GetBySubscriptionIDFunc: func(context.Context, uint) ([]database.SubscriptionNode, error) {
-			return pending, nil
-		},
-		GetPendingBySubscriptionIDFunc: func(context.Context, uint) ([]database.SubscriptionNode, error) {
-			return pending, nil
-		},
-		UpdateRetryFunc: func(context.Context, uint, uint, int, *time.Time, *string) error {
-			return nil
-		},
-		DeleteSubscriptionByIDFunc: func(context.Context, uint) (*database.Subscription, error) {
-			hardDeleteCalled = true
-			return sub, nil
-		},
-	}
-
-	syncSvc := NewSyncService(db, map[uint]vpn.Client{nodeID: deleteClient}, []database.Node{{
-		ID:       nodeID,
-		Type:     database.NodeType3xUI,
-		IsActive: true,
-	}})
-	svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{})
-	svc.SetSyncService(syncSvc)
-
-	deleted, err := svc.DeleteByID(context.Background(), subscriptionID)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "deprovision incomplete")
-	assert.Nil(t, deleted)
-	assert.True(t, deleteClient.deleteCalled)
-	assert.False(t, hardDeleteCalled, "subscription must remain for background retry")
 }
 
 // TestSubscriptionService_Create_ReanimatesRevoked verifies the bug fix: when a
@@ -1647,8 +596,7 @@ func TestSubscriptionService_Create_ReanimatesRevoked(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Simulate a partially-failed delete: a row left in "revoked" with a
-	// stale subscription node binding (pending_remove from the failed deprovision).
+	// Simulate a partially-failed delete: a row left in "revoked".
 	revoked := &database.Subscription{
 		TelegramID:     777777,
 		Username:       "revoked_user",
@@ -1659,20 +607,8 @@ func TestSubscriptionService_Create_ReanimatesRevoked(t *testing.T) {
 	}
 	require.NoError(t, db.CreateSubscription(ctx, revoked, ""))
 
-	// The test DSN enables SQLite foreign-key enforcement, so the stale binding
-	// below must reference an existing node row.
-	staleNode := &database.Node{ID: 1, Name: "stale-node", Host: "http://stale", APIToken: "token", InboundIDs: `[1]`}
-	require.NoError(t, db.GetDB().WithContext(ctx).Create(staleNode).Error)
-	require.NoError(t, db.CreateSubscriptionNode(ctx, &database.SubscriptionNode{
-		SubscriptionID: revoked.ID,
-		NodeID:         staleNode.ID,
-		Status:         database.SyncStatusPendingRemove,
-	}))
-
 	cfg := &config.Config{}
-	sources := []database.Node{}
-	xuiClients := map[uint]interfaces.XUIClient{}
-	svc := NewSubscriptionService(db, xuiClients, nil, sources, cfg)
+	svc := NewSubscriptionService(db, cfg)
 
 	result, err := svc.Create(ctx, 777777, "revoked_user", "")
 	require.NoError(t, err)
@@ -1698,14 +634,10 @@ func TestSubscriptionService_Create_ReanimatesRevoked(t *testing.T) {
 	assert.Equal(t, freePlan.ID, matching[0].PlanID)
 	assert.Nil(t, matching[0].ExpiresAt)
 	assert.Equal(t, revoked.ID, matching[0].ID, "same row reanimated, not a new one")
-
-	// Stale node bindings were wiped so re-provision starts clean.
-	nodes, err := db.GetBySubscriptionID(ctx, revoked.ID)
-	require.NoError(t, err)
-	assert.Empty(t, nodes, "stale pending_remove node must be cleared")
+	assert.Equal(t, revoked.Token, matching[0].Token, "the subscription link survives reanimation")
 }
 
-func TestSubscriptionService_AdminSetPlan_ReconcilesNodesAndInvalidatesCache(t *testing.T) {
+func TestSubscriptionService_AdminSetPlan_ChangesPlanAndInvalidatesCache(t *testing.T) {
 	t.Parallel()
 
 	db, err := testutil.NewTestDatabaseService(t)
@@ -1716,23 +648,8 @@ func TestSubscriptionService_AdminSetPlan_ReconcilesNodesAndInvalidatesCache(t *
 	// The free plan is seeded by migrations; the premium plan is created here.
 	freePlan, err := db.GetPlanByName(ctx, database.FreePlanName)
 	require.NoError(t, err)
-	premiumPlan := &database.Plan{Name: "premium-admin-setplan", DevicesLimit: 2, TrafficLimit: 1024}
+	premiumPlan := &database.Plan{Name: "premium-admin-setplan"}
 	require.NoError(t, db.GetDB().WithContext(ctx).Create(premiumPlan).Error)
-
-	nodeA := &database.Node{Name: "setplan-a", Host: "http://a", APIToken: "a", InboundIDs: `[1]`, Type: database.NodeType3xUI}
-	nodeB := &database.Node{Name: "setplan-b", Host: "http://b", APIToken: "b", InboundIDs: `[1]`, Type: database.NodeType3xUI}
-	nodeC := &database.Node{Name: "setplan-c", Host: "http://c", APIToken: "c", InboundIDs: `[1]`, Type: database.NodeType3xUI}
-	require.NoError(t, db.GetDB().WithContext(ctx).Create(nodeA).Error)
-	require.NoError(t, db.GetDB().WithContext(ctx).Create(nodeB).Error)
-	require.NoError(t, db.GetDB().WithContext(ctx).Create(nodeC).Error)
-
-	// Old (free) plan → nodeA + nodeC; new (premium) plan → nodeA + nodeB.
-	// nodeA is shared (must be pending_update), nodeB is new (pending_add),
-	// nodeC leaves the plan (pending_remove).
-	require.NoError(t, db.GetDB().WithContext(ctx).Create(&database.PlanNode{PlanID: freePlan.ID, NodeID: nodeA.ID}).Error)
-	require.NoError(t, db.GetDB().WithContext(ctx).Create(&database.PlanNode{PlanID: freePlan.ID, NodeID: nodeC.ID}).Error)
-	require.NoError(t, db.GetDB().WithContext(ctx).Create(&database.PlanNode{PlanID: premiumPlan.ID, NodeID: nodeA.ID}).Error)
-	require.NoError(t, db.GetDB().WithContext(ctx).Create(&database.PlanNode{PlanID: premiumPlan.ID, NodeID: nodeB.ID}).Error)
 
 	sub := &database.Subscription{
 		TelegramID:     999802,
@@ -1744,18 +661,12 @@ func TestSubscriptionService_AdminSetPlan_ReconcilesNodesAndInvalidatesCache(t *
 		ExpiresAt:      testutil.PtrTime(time.Now().Add(5 * 24 * time.Hour)),
 	}
 	require.NoError(t, db.CreateSubscription(ctx, sub, ""))
-	require.NoError(t, db.CreateSubscriptionNode(ctx, &database.SubscriptionNode{SubscriptionID: sub.ID, NodeID: nodeA.ID, Status: database.SyncStatusActive}))
-	require.NoError(t, db.CreateSubscriptionNode(ctx, &database.SubscriptionNode{SubscriptionID: sub.ID, NodeID: nodeC.ID, Status: database.SyncStatusActive}))
-
 	var invalidatedTGIDs []int64
 	var invalidatedSubIDs []string
 
-	svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{})
+	svc := NewSubscriptionService(db, &config.Config{})
 	svc.SetInvalidateFunc(func(id int64) { invalidatedTGIDs = append(invalidatedTGIDs, id) })
 	svc.SetInvalidateBySubIDFunc(func(id string) { invalidatedSubIDs = append(invalidatedSubIDs, id) })
-	// No VPN clients wired: SyncSubscription treats nodes as unavailable and
-	// keeps them pending (best-effort), leaving the reconciled state visible.
-	svc.SetSyncService(NewSyncService(db, map[uint]vpn.Client{}, nil))
 
 	updated, err := svc.AdminSetPlan(ctx, sub.ID, premiumPlan.ID, 30)
 	require.NoError(t, err)
@@ -1769,20 +680,11 @@ func TestSubscriptionService_AdminSetPlan_ReconcilesNodesAndInvalidatesCache(t *
 	assert.Contains(t, invalidatedTGIDs, sub.TelegramID)
 	assert.Contains(t, invalidatedSubIDs, sub.SubscriptionID)
 
-	// Bindings reconciled per plan membership.
-	rows, err := db.GetBySubscriptionID(ctx, sub.ID)
+	stored, err := db.GetByID(ctx, sub.ID)
 	require.NoError(t, err)
-	require.Len(t, rows, 3)
-
-	byNode := make(map[uint]database.SyncStatus, len(rows))
-	for _, r := range rows {
-		byNode[r.NodeID] = r.Status
-	}
-	assert.Equal(t, database.SyncStatusPendingUpdate, byNode[nodeA.ID], "shared node must get pending_update")
-	assert.Equal(t, database.SyncStatusPendingAdd, byNode[nodeB.ID], "new plan node must get pending_add")
-	assert.Equal(t, database.SyncStatusPendingRemove, byNode[nodeC.ID], "leaving node must get pending_remove")
+	assert.Equal(t, premiumPlan.ID, stored.PlanID, "the new plan (and its builder) serves the next /sub request")
+	assert.Equal(t, sub.Token, stored.Token)
 }
-
 func TestSubscriptionService_AdminSetPlan_ExpirySemantics(t *testing.T) {
 	t.Parallel()
 
@@ -1834,7 +736,7 @@ func TestSubscriptionService_AdminSetPlan_ExpirySemantics(t *testing.T) {
 				},
 			}
 
-			svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{})
+			svc := NewSubscriptionService(db, &config.Config{})
 
 			updated, err := svc.AdminSetPlan(context.Background(), sub.ID, 2, tt.days)
 			require.NoError(t, err)
@@ -1876,7 +778,7 @@ func TestSubscriptionService_AdminSetPlan_Errors(t *testing.T) {
 				return nil, database.ErrSubscriptionNotFound
 			},
 		}
-		svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{})
+		svc := NewSubscriptionService(db, &config.Config{})
 
 		_, err := svc.AdminSetPlan(context.Background(), 42, 2, 30)
 		require.Error(t, err)
@@ -1893,7 +795,7 @@ func TestSubscriptionService_AdminSetPlan_Errors(t *testing.T) {
 				return nil, database.ErrPlanNotFound
 			},
 		}
-		svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{})
+		svc := NewSubscriptionService(db, &config.Config{})
 
 		_, err := svc.AdminSetPlan(context.Background(), 42, 2, 30)
 		require.Error(t, err)
@@ -1901,8 +803,8 @@ func TestSubscriptionService_AdminSetPlan_Errors(t *testing.T) {
 		assert.Contains(t, err.Error(), "load plan")
 	})
 
-	t.Run("apply plan failure surfaces to caller", func(t *testing.T) {
-		applyErr := errors.New("reconcile plan nodes database unavailable")
+	t.Run("update failure surfaces to caller", func(t *testing.T) {
+		updateErr := errors.New("database unavailable")
 
 		db := &testutil.DatabaseService{
 			GetByIDFunc: func(context.Context, uint) (*database.Subscription, error) {
@@ -1912,19 +814,15 @@ func TestSubscriptionService_AdminSetPlan_Errors(t *testing.T) {
 				return &database.Plan{ID: 2, Name: "premium-errors"}, nil
 			},
 			UpdateSubscriptionFunc: func(context.Context, *database.Subscription) error {
-				return nil
-			},
-			GetNodesByPlanIDFunc: func(context.Context, uint) ([]database.Node, error) {
-				return nil, applyErr
+				return updateErr
 			},
 		}
 
-		svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{})
-		svc.SetSyncService(NewSyncService(db, nil, nil))
+		svc := NewSubscriptionService(db, &config.Config{})
 
 		_, err := svc.AdminSetPlan(context.Background(), 42, 2, 30)
 		require.Error(t, err)
-		assert.ErrorIs(t, err, applyErr, "DB-setup phase failure must surface, not be swallowed")
+		assert.ErrorIs(t, err, updateErr, "a persistence failure must surface, not be swallowed")
 	})
 }
 
@@ -1966,7 +864,7 @@ func TestSubscriptionService_AdminSetPlan_FreePlanClearsPaidState(t *testing.T) 
 		},
 	}
 
-	svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{})
+	svc := NewSubscriptionService(db, &config.Config{})
 
 	updated, err := svc.AdminSetPlan(context.Background(), sub.ID, 2, 30)
 	require.NoError(t, err)
@@ -2009,7 +907,7 @@ func TestSubscriptionService_AdminSetPlan_DaysTooLarge(t *testing.T) {
 		},
 	}
 
-	svc := NewSubscriptionService(db, nil, nil, nil, &config.Config{})
+	svc := NewSubscriptionService(db, &config.Config{})
 
 	_, err := svc.AdminSetPlan(context.Background(), sub.ID, 2, AdminSetPlanMaxDays+1)
 	require.Error(t, err)

@@ -27,7 +27,7 @@ func TestBuildPaidUserNotification_MissingSubscriptionServiceReturnsError(t *tes
 			return &database.Subscription{ID: 1, TelegramID: 42}, nil
 		},
 	}
-	o := NewOrderService(db, nil, nil, fakePaymentProvider{}, "", &config.Config{})
+	o := NewOrderService(db, nil, fakePaymentProvider{}, "", &config.Config{})
 
 	_, _, err := o.BuildPaidUserNotification(context.Background(), &database.Order{ID: 1, SubscriptionID: 1, ProviderPaymentID: providerID.String()})
 	require.Error(t, err)

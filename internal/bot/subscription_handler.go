@@ -76,12 +76,7 @@ func (sh *SubscriptionHandler) handleCreateSubscription(ctx context.Context, cha
 			return fmt.Errorf("check subscription: %w", err)
 		}
 	} else if sub != nil {
-		trafficLimit := 0
-		if sh.h.subscriptionService != nil {
-			trafficLimit = sh.h.subscriptionService.PlanTrafficLimitGB(ctx, chatID)
-		}
-
-		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, msg(MsgSubCreatedSuccess, trafficLimit, sh.h.cfg.SubURL(sub.Token)))
+		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, msg(MsgSubCreatedSuccess, sh.h.cfg.SubURL(sub.Token)))
 		editMsg.ParseMode = "Markdown"
 		editMsg.DisableWebPagePreview = true
 		kb := sh.h.getQRKeyboard()
@@ -104,7 +99,7 @@ func (sh *SubscriptionHandler) handleMySubscription(ctx context.Context, chatID 
 		return nil
 	}
 
-	sub, traffic, err := sh.h.subscriptionService.GetWithTraffic(ctx, chatID)
+	sub, details, err := sh.h.subscriptionService.GetWithDetails(ctx, chatID)
 	if err != nil {
 		if errors.Is(err, database.ErrSubscriptionNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
 			editMsg := tgbotapi.NewEditMessageText(chatID, messageID, msg(MsgSubNoActive))
@@ -136,7 +131,7 @@ func (sh *SubscriptionHandler) handleMySubscription(ctx context.Context, chatID 
 	messageText := service.FormatSubscriptionMessage(
 		"📋 *Ваша подписка*",
 		statusText,
-		traffic,
+		details,
 		service.SubscriptionURL(sh.h.cfg, sub.Token),
 	)
 
@@ -286,7 +281,8 @@ func (sh *SubscriptionHandler) handleBackToInvite(_ context.Context, chatID int6
 	return nil
 }
 
-// createSubscription creates a new subscription (atomic with rollback).
+// createSubscription creates a new free-plan subscription. It is a single DB
+// operation: the plan builder serves the subscription on /sub.
 func (sh *SubscriptionHandler) createSubscription(ctx context.Context, chatID int64, username string, messageID int) error {
 	messageID = sh.h.showLoadingMessage(chatID, messageID)
 	if messageID == 0 {
@@ -294,8 +290,7 @@ func (sh *SubscriptionHandler) createSubscription(ctx context.Context, chatID in
 		return fmt.Errorf("failed to show loading message")
 	}
 
-	// Capture the pending invite code under a brief lock, then release it
-	// before the (potentially slow) HTTP call into the XUI panel.
+	// Capture the pending invite code under a brief lock.
 	sh.h.pendingMu.Lock()
 
 	var inviteCode string
@@ -306,7 +301,7 @@ func (sh *SubscriptionHandler) createSubscription(ctx context.Context, chatID in
 
 	result, err := sh.h.subscriptionService.Create(ctx, chatID, username, inviteCode)
 	if err != nil {
-		sh.handleCreateError(ctx, chatID, messageID, username, err)
+		sh.handleCreateError(chatID, messageID, err)
 		return fmt.Errorf("create subscription: %w", err)
 	}
 
@@ -333,12 +328,7 @@ func (sh *SubscriptionHandler) createSubscription(ctx context.Context, chatID in
 		),
 	)
 
-	trafficLimit := 0
-	if sh.h.subscriptionService != nil {
-		trafficLimit = sh.h.subscriptionService.PlanTrafficLimitGB(ctx, result.Subscription.TelegramID)
-	}
-
-	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, sh.h.getHelpText(trafficLimit, result.SubscriptionURL))
+	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, sh.h.getHelpText(result.SubscriptionURL))
 	editMsg.ParseMode = "Markdown"
 	editMsg.DisableWebPagePreview = true
 	editMsg.ReplyMarkup = &backKeyboard
@@ -351,34 +341,13 @@ func (sh *SubscriptionHandler) createSubscription(ctx context.Context, chatID in
 	return nil
 }
 
-// handleCreateError handles errors from createSubscription.
-func (sh *SubscriptionHandler) handleCreateError(ctx context.Context, chatID int64, messageID int, username string, err error) {
+// handleCreateError reports a failed subscription creation to the user. The
+// creation is a local DB operation, so there is nothing to classify: the user
+// gets the generic message and the error is logged for the operator.
+func (sh *SubscriptionHandler) handleCreateError(chatID int64, messageID int, err error) {
 	logger.Error("Failed to create subscription", zap.Error(err))
 
-	classified := classifyXUIError(err)
-
-	errMsg := msg(MsgErrGeneric)
-
-	switch {
-	case errors.Is(classified, ErrXUIConnection):
-		errMsg = msg(MsgErrConnection)
-	case errors.Is(classified, ErrXUIAuth):
-		errMsg = msg(MsgErrAuth)
-	case errors.Is(classified, ErrXUIContextCanceled):
-		errMsg = msg(MsgErrRequestCanceled)
-	case errors.Is(classified, ErrXUIDNS):
-		errMsg = msg(MsgErrDialTCP)
-	case errors.Is(classified, ErrXUITLS):
-		errMsg = msg(MsgErrTLS)
-	case errors.Is(classified, ErrXUIServer):
-		errMsg = msg(MsgErrInboundNotFound)
-	case errors.Is(classified, ErrXUIRollbackFailed):
-		errMsg = msg(MsgErrPartialSave)
-
-		sh.h.notifyAdminError(ctx, fmt.Sprintf("⚠️ ORPHAN CLIENT WARNING: %v", err))
-	}
-
-	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, errMsg)
+	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, msg(MsgErrGeneric))
 	editMsg.DisableWebPagePreview = true
 	sh.h.safeSend(editMsg)
 }

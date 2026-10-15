@@ -3,7 +3,7 @@
 ## Requirements
 
 - **Docker & Docker Compose** (recommended) OR **Go 1.25+**
-- **3x-ui panel** (https://github.com/MHSanaei/3x-ui) — up and running
+- **Provider subscription sources** - one or more upstream subscription URLs (added later in the admin UI as ProviderSources); no VPN panel is required
 - **Telegram Bot Token** from @BotFather
 - **Minimum resources:** 1 CPU core, 128MB RAM, 1GB disk (for up to 10k users)
 
@@ -11,15 +11,17 @@
 
 Send a message to [@userinfobot](https://t.me/userinfobot) on Telegram to get your ID.
 
-## Configure 3x-ui Panel
+## Configure subscription sources
 
-1. Create a **VLESS+Reality+Vision** inbound in your 3x-ui panel
-2. Note the **inbound ID** (shown in the inbounds list, usually `1`)
-3. Make sure the panel API is accessible from the bot host:
-   ```bash
-   curl -H "Authorization: Bearer <api_token>" http://your-panel-ip:2053/panel/api/server/status
-   ```
-   Should return JSON with `success: true`. The `<api_token>` is the panel API token generated in 3x-ui Security settings; in production it is stored in the `nodes` table (`nodes.api_token`).
+The bot does not register clients on any VPN panel. A subscription is a local record; its content is assembled on every `/sub` request by a **Subscription Builder** from **ProviderSource** catalogues (upstream subscription feeds).
+
+After the first start, open the admin UI (`/admin-ui/`) and:
+
+1. Add one or more **ProviderSources** (upstream subscription URL and format).
+2. Create a **Builder**, link the sources and (optionally) add country/node rules.
+3. Assign the Builder to a plan (or to a single subscription as an override).
+
+Without a Builder the plan serves no content, so do this before issuing subscriptions.
 
 ## Installation
 
@@ -47,7 +49,7 @@ TELEGRAM_ADMIN_ID=123456789
 GLOBAL_SUB_URL=https://vpn.example.com/sub/
 ```
 
-Node configuration (panel host, API token, inbound IDs) is stored in the `nodes` DB table — see [Adding Nodes via SQL](#adding-nodes-via-sql) below.
+ProviderSources and Builders are configured in the admin UI and stored in the database; no panel credentials are needed in `.env`.
 
 #### 3. Create data directory
 
@@ -239,44 +241,6 @@ Air will automatically rebuild and restart the bot when you save changes to Go f
 | `DONATE_ENABLED` | Show "☕ Донат" button in main menu | `true` | ❌ | `true` / `false`; when false the "💎 Premium" button is lifted directly under "📋 Подписка" |
 
 
-### 3x-ui v3.7.0 free-subscription settings
-
-For free clients, the bot sends and preserves the following panel fields:
-
-```json
-{"reset":30,"resetDay":0,"resetMax":0,"trafficReset":"monthly","trafficResetDay":1}
-```
-
-This keeps renewal rolling every 30 days (`resetDay=0`), allows unlimited renewals (`resetMax=0`), and resets traffic on the first day of each month. Trials are sent with `reset=0` and are not renewed. Existing clients do not need to be recreated; update their settings once in the panel. The bot retains a fallback that repairs an expired free-client expiry during synchronization.
-
-### Adding Nodes via SQL
-
-Nodes are managed through the `nodes` table. To add a new node, insert a row and link it to a plan:
-
-```sql
--- Add a 3x-ui node
-INSERT INTO nodes (name, is_active, host, api_token, inbound_ids, subscription_url, type)
-VALUES ('main', 1, 'http://panel:2053', 'your-token', '[1]', 'http://panel:2053/sub/', '3x-ui');
-
--- Add a proxman node
-INSERT INTO nodes (name, is_active, host, api_token, inbound_ids, subscription_url, type)
-VALUES ('proxman1', 1, 'http://proxman:8080', 'your-token', '[]', 'http://proxman:8080/sub/', 'proxman');
-
--- Add a fetch node (read-only HTTP source, no API token needed)
-INSERT INTO nodes (name, is_active, host, api_token, inbound_ids, subscription_url, type)
-VALUES ('external', 1, '', '', '[]', 'https://external-source.com/raw-proxy', 'fetch');
-
--- Link node to a plan (replace IDs as needed)
-INSERT INTO plan_nodes (plan_id, node_id) VALUES (1, <node_id>);
-```
-
-**Node types:**
-|Type|Host|API Token|Subscription URL|Description|
-|---|---|---|---|---|
-|`3x-ui`|Required|Required|`http://panel/sub/`|Full CRUD via 3x-ui API|
-|`proxman`|Required|Required|`http://proxman/sub/`|Webhook create/delete|
-|`fetch`|Empty|Empty|`https://source/raw`|Read-only HTTP fetch, URL used as-is|
-
 ### Security Notes
 
 - **`GLOBAL_SUB_URL`** must use **HTTPS** in production — subscription links are distributed to users and must not leak over plain HTTP. The URL is validated to be a well-formed `http` or `https` URL.
@@ -313,7 +277,7 @@ Set `TELEGRAM_ADMIN_ID` in `.env` to your Telegram user ID.
 Admin-only commands:
 - `/lastreg` — last 10 subscribers
 - `/del <id>` — delete subscription by DB ID
-- `/setplan <subscription_id> <plan_id> [days]` — change subscription plan (reconciles VPN nodes; if `days` omitted, keeps a future expiry or applies a 30-day default)
+- `/setplan <subscription_id> <plan_id> [days]` — change subscription plan (if `days` omitted, keeps a future expiry or applies a 30-day default)
 - `/broadcast <msg>` — message all users
 - `/send <id|@username> <msg>` — private message
 - `/refstats` — referral statistics
@@ -321,6 +285,13 @@ Admin-only commands:
 ---
 
 ## Upgrade from Older Version
+
+### Removal of the legacy VPN-node subsystem (migration 051)
+
+1. Backup the database: `cp data/rs8kvn.db data/rs8kvn.db.backup` (keep the previous binary/image too).
+2. Make sure every plan that must serve content has a Builder with at least one enabled ProviderSource: there is no fallback to nodes any more.
+3. Start the new version. Migration `051_remove_legacy_nodes` drops `nodes`, `plan_nodes`, `subscription_nodes`, `subscriptions.traffic_reminders_sent`, `plans.devices_limit` and `plans.traffic_limit`. ProviderSources, their catalogue, Builders and rules, tariffs, orders and payments are not touched.
+4. Rollback: the down migration only recreates the empty legacy tables and columns (node data is not restored). To roll back, restore the pre-migration database backup together with the old binary.
 
 ### From v2.x → v2.3.0
 
@@ -330,7 +301,7 @@ Admin-only commands:
    - **New required:** `GLOBAL_SUB_URL` (base URL for subscription links)
    - **New optional:** `SUBSERVER_ACCESS_LOG` (subscription access log)
    - **Removed:** `SUB_EXTRA_SERVERS_ENABLED`, `SUB_EXTRA_SERVERS_FILE` (no longer used)
-4. Restart bot. Node configuration lives in the `nodes` table — add nodes via SQL (see [Adding Nodes via SQL](#adding-nodes-via-sql)).
+4. Restart bot. (Historical note: node configuration was removed in migration 051, see the section above.)
 
 **Breaking changes:**
 - `GLOBAL_SUB_URL` is now **required**. Without it the bot will not start.
@@ -372,7 +343,7 @@ rm .env
 **Before reporting:**
 1. Check logs: `docker logs rs8kvn_bot`
 2. Verify `.env` settings (especially `GLOBAL_SUB_URL`)
-3. Test 3x-ui connectivity: `curl -H "Authorization: Bearer <api_token>" http://your-panel-ip:2053/panel/api/server/status`
+3. Check that the ProviderSource URLs used by your Builders are reachable
 4. Include the bot version shown in the startup logs
 
 ---

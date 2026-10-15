@@ -10,14 +10,12 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/bot"
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/logger"
 	"github.com/kereal/rs8kvn_bot/internal/metrics"
 	"github.com/kereal/rs8kvn_bot/internal/netmon"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/service/payment/platega"
 	"github.com/kereal/rs8kvn_bot/internal/subserver"
-	"github.com/kereal/rs8kvn_bot/internal/vpn"
 
 	"github.com/getsentry/sentry-go"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -64,53 +62,17 @@ func initLogger(cfg *config.Config) (*logger.Service, error) {
 	return logService, nil
 }
 
-// runtimeDeps holds the initialized runtime node clients.
-type runtimeDeps struct {
-	nodes      []database.Node
-	xuiClients map[uint]interfaces.XUIClient
-	vpnClients map[uint]vpn.Client
-}
-
-// initDatabase initializes the database service and loads runtime node clients.
-// Returns the DB service and runtime dependencies.
-func initDatabase(cfg *config.Config) (dbService *database.Service, deps *runtimeDeps, err error) {
-	dbService, err = database.NewService(cfg.DatabasePath)
+// initDatabase initializes the database service. Startup needs no VPN nodes:
+// subscriptions are served by builders from provider sources.
+func initDatabase(cfg *config.Config) (*database.Service, error) {
+	dbService, err := database.NewService(cfg.DatabasePath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("initialize database: %w", err)
+		return nil, fmt.Errorf("initialize database: %w", err)
 	}
 
 	metrics.RegisterDBMetrics(dbService.GetDB())
 
-	nodes, err := dbService.ListNodes(context.Background())
-	if err != nil {
-		_ = dbService.Close()
-		return nil, nil, fmt.Errorf("list nodes: %w", err)
-	}
-
-	if len(nodes) == 0 {
-		_ = dbService.Close()
-		return nil, nil, fmt.Errorf("no nodes configured")
-	}
-
-	for _, node := range nodes {
-		logger.RegisterSecrets(node.APIToken)
-	}
-
-	runtimeNodes, xuiClients, vpnClients, err := buildRuntimeNodeClients(nodes, defaultOptions())
-	if err != nil {
-		_ = dbService.Close()
-		return nil, nil, fmt.Errorf("initialize node clients: %w", err)
-	}
-
-	if len(xuiClients) == 0 {
-		logger.Warn("No active 3x-ui node found — /ping xui health check will report not configured")
-	}
-
-	return dbService, &runtimeDeps{
-		nodes:      runtimeNodes,
-		xuiClients: xuiClients,
-		vpnClients: vpnClients,
-	}, nil
+	return dbService, nil
 }
 
 type appServices struct {
@@ -118,7 +80,6 @@ type appServices struct {
 	subServer      *subserver.Service
 	handler        *bot.Handler
 	orderService   *service.OrderService
-	syncService    *service.SyncService
 	adminService   *service.AdminService
 	builderService *service.BuilderService
 	netMonitor     *netmon.Service
@@ -145,11 +106,9 @@ func newNetworkMonitor(cfg *config.Config, dbService *database.Service) *netmon.
 
 // initServices wires the subscription service, subserver, bot handler,
 // and cache invalidation composition.
-func initServices(cfg *config.Config, dbService *database.Service, deps *runtimeDeps, botAPI *tgbotapi.BotAPI, botConfig *bot.BotConfig) *appServices {
-	syncSvc := service.NewSyncService(dbService, deps.vpnClients, deps.nodes)
-	subService := service.NewSubscriptionService(dbService, deps.xuiClients, deps.vpnClients, deps.nodes, cfg)
+func initServices(cfg *config.Config, dbService *database.Service, botAPI *tgbotapi.BotAPI, botConfig *bot.BotConfig) *appServices {
+	subService := service.NewSubscriptionService(dbService, cfg)
 	subService.SetBot(botAPI)
-	subService.SetSyncService(syncSvc)
 	// Admin-editable trial (Admin → «Тарифы» → «Пробная подписка»); without a
 	// stored configuration the environment trial values keep applying.
 	subService.SetTrialPolicy(dbService)
@@ -168,9 +127,9 @@ func initServices(cfg *config.Config, dbService *database.Service, deps *runtime
 		payment = platega.New(platega.Config{MerchantID: cfg.PlategaMerchantID, Secret: cfg.PlategaSecret})
 	}
 
-	orderService := service.NewOrderService(dbService, subService, syncSvc, payment, "", cfg)
+	orderService := service.NewOrderService(dbService, subService, payment, "", cfg)
 	handler.SetOrderService(orderService)
-	adminService := service.NewAdminService(dbService, subService, syncSvc)
+	adminService := service.NewAdminService(dbService, subService)
 	builderService := service.NewBuilderService(dbService)
 	// Source catalogue sync fetches and parses on the server with the /sub parser.
 	builderService.SetCatalogueFetcher(func(ctx context.Context, src database.ProviderSource) (*service.FetchedCatalogue, error) {
@@ -182,7 +141,7 @@ func initServices(cfg *config.Config, dbService *database.Service, deps *runtime
 	})
 
 	return &appServices{
-		subService: subService, subServer: subServer, handler: handler, orderService: orderService, syncService: syncSvc,
+		subService: subService, subServer: subServer, handler: handler, orderService: orderService,
 		adminService: adminService, builderService: builderService, netMonitor: newNetworkMonitor(cfg, dbService),
 	}
 }

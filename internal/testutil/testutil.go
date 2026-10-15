@@ -16,7 +16,6 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/database"
 	"github.com/kereal/rs8kvn_bot/internal/logger"
 	"github.com/kereal/rs8kvn_bot/internal/utils"
-	"github.com/kereal/rs8kvn_bot/internal/xui"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"gorm.io/gorm"
@@ -87,96 +86,77 @@ type DatabaseService struct {
 	Orders            map[uint]*database.Order
 	Broadcasts        map[uint]*database.Broadcast
 
-	PingFunc                                    func(ctx context.Context) error
-	GetByTelegramIDFunc                         func(ctx context.Context, telegramID int64) (*database.Subscription, error)
-	GetAnyByTelegramIDFunc                      func(ctx context.Context, telegramID int64) (*database.Subscription, error)
-	CreateSubscriptionFunc                      func(ctx context.Context, sub *database.Subscription, inviteCode string) error
-	UpdateSubscriptionFunc                      func(ctx context.Context, sub *database.Subscription) error
-	GetLatestSubscriptionsFunc                  func(ctx context.Context, limit int) ([]database.Subscription, error)
-	GetAllSubscriptionsFunc                     func(ctx context.Context) ([]database.Subscription, error)
-	CountAllSubscriptionsFunc                   func(ctx context.Context) (int64, error)
-	CountActiveSubscriptionsFunc                func(ctx context.Context) (int64, error)
-	CountPremiumSubscriptionsFunc               func(ctx context.Context) (int64, error)
-	CountFreeSubscriptionsFunc                  func(ctx context.Context) (int64, error)
-	CountTrialSubscriptionsFunc                 func(ctx context.Context) (int64, error)
-	GetByIDFunc                                 func(ctx context.Context, id uint) (*database.Subscription, error)
-	GetByTokenFunc                              func(ctx context.Context, token string) (*database.Subscription, error)
-	GetTelegramIDByUsernameFunc                 func(ctx context.Context, username string) (int64, error)
-	DeleteSubscriptionByIDFunc                  func(ctx context.Context, id uint) (*database.Subscription, error)
-	GetTelegramIDsBatchFunc                     func(ctx context.Context, offset, limit int) ([]int64, error)
-	GetTotalTelegramIDCountFunc                 func(ctx context.Context) (int64, error)
-	GetFilteredTelegramIDCountFunc              func(ctx context.Context, filter database.BroadcastFilter) (int64, error)
-	GetOrCreateInviteFunc                       func(ctx context.Context, referrerTGID int64, code string) (*database.Invite, error)
-	GetInviteByReferrerFunc                     func(ctx context.Context, referrerTGID int64) (*database.Invite, error)
-	GetInviteByCodeFunc                         func(ctx context.Context, code string) (*database.Invite, error)
-	GetReferralCountFunc                        func(ctx context.Context, referrerTGID int64) (int64, error)
-	GetAllReferralCountsFunc                    func(ctx context.Context) (map[int64]int64, error)
-	CreateTrialSubscriptionFunc                 func(ctx context.Context, inviteCode, subscriptionID, clientID string, expiryTime time.Time) (*database.Subscription, error)
-	ListNodesFunc                               func(ctx context.Context) ([]database.Node, error)
-	GetNodesByPlanNameFunc                      func(ctx context.Context, planName string) ([]database.Node, error)
-	GetPlansBySourceIDFunc                      func(ctx context.Context, sourceID uint) ([]database.Plan, error)
-	GetPlanByNameFunc                           func(ctx context.Context, name string) (*database.Plan, error)
-	GetPlanByIDFunc                             func(ctx context.Context, planID uint) (*database.Plan, error)
-	GetAllPlansFunc                             func(ctx context.Context) ([]database.Plan, error)
-	CreatePlanFunc                              func(ctx context.Context, plan *database.Plan) error
-	UpdatePlanFunc                              func(ctx context.Context, plan *database.Plan) error
-	DeletePlanFunc                              func(ctx context.Context, planID uint) error
-	AddSourceToPlanFunc                         func(ctx context.Context, planID, sourceID uint) error
-	RemoveSourceFromPlanFunc                    func(ctx context.Context, planID, sourceID uint) error
-	SeedDefaultDataFunc                         func(ctx context.Context) error
-	ListActiveProductsFunc                      func(ctx context.Context) ([]database.Product, error)
-	GetProductByIDFunc                          func(ctx context.Context, id uint) (*database.Product, error)
-	UpdateProductGuardedFunc                    func(ctx context.Context, product *database.Product) error
-	GetNodeByIDFunc                             func(ctx context.Context, id uint) (*database.Node, error)
-	ListEnabledFunc                             func(ctx context.Context) ([]database.Node, error)
-	GetNodesByPlanIDFunc                        func(ctx context.Context, planID uint) ([]database.Node, error)
-	CreateSubscriptionNodeFunc                  func(ctx context.Context, sn *database.SubscriptionNode) error
-	UpdateSubscriptionNodeStatusFunc            func(ctx context.Context, subID, nodeID uint, status database.SyncStatus) error
-	UpsertSubscriptionNodeFunc                  func(ctx context.Context, sn *database.SubscriptionNode) error
-	DeleteSubscriptionNodeFunc                  func(ctx context.Context, subID, nodeID uint) error
-	DeleteSubscriptionNodesBySubscriptionIDFunc func(ctx context.Context, subID uint) error
-	MarkActiveNodesPendingUpdateFunc            func(ctx context.Context, subID uint, targetNodeIDs []uint) error
-	UpdateRetryFunc                             func(ctx context.Context, subID, nodeID uint, retryCount int, retryAt *time.Time, lastErr *string) error
-	GetBySubscriptionIDFunc                     func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error)
-	GetPendingSyncFunc                          func(ctx context.Context) ([]database.SubscriptionNode, error)
-	GetPendingBySubscriptionIDFunc              func(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error)
-	GetOrderByIDFunc                            func(ctx context.Context, id uint) (*database.Order, error)
-	GetOrderByProviderPaymentIDFunc             func(ctx context.Context, provider string, providerPaymentID uuid.UUID) (*database.Order, error)
-	FindPendingPaymentOrderFunc                 func(ctx context.Context, subscriptionID, productID uint, now time.Time) (*database.Order, error)
-	FindOrCreatePendingPaymentOrderFunc         func(ctx context.Context, subscriptionID, productID uint, amountCents int64, currency string, now time.Time) (*database.Order, error)
-	MarkPaymentCreationUncertainFunc            func(ctx context.Context, orderID uint, uncertain bool) (bool, error)
-	SavePaymentDetailsFunc                      func(ctx context.Context, orderID uint, providerPaymentID uuid.UUID, paymentURL string, paymentExpiresAt time.Time) error
-	SaveOrderPaymentAmountsFunc                 func(ctx context.Context, orderID uint, callbackAmountCents int64, providerFeeCents *int64) error
-	GetPaidOrdersWithoutProviderFeeFunc         func(ctx context.Context, limit int) ([]database.Order, error)
-	GetPaidOrdersWithoutProviderFeeAfterIDFunc  func(ctx context.Context, afterID uint, limit int) ([]database.Order, error)
-	ConfirmOrderPaidCASFunc                     func(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *database.Subscription, product *database.Product, applyPlan database.ApplyPlanInTxFn, callbackAmountCents int64) (bool, error)
-	CancelOrderCASFunc                          func(ctx context.Context, provider string, providerPaymentID uuid.UUID, fromStatuses []database.OrderStatus) (bool, error)
-	CancelPaidOrderAndDowngradeCASFunc          func(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint, applyPlan database.ChargebackPlanInTxFn) (*database.ChargebackResult, error)
-	TransactionFunc                             func(ctx context.Context, fn func(*gorm.DB) error) error
-	GetSubscriptionFunc                         func(ctx context.Context, subscriptionID string) (*database.Subscription, error)
-	GetTrialSubscriptionBySubIDFunc             func(ctx context.Context, subscriptionID string) (*database.Subscription, error)
-	BindTrialSubscriptionFunc                   func(ctx context.Context, subscriptionID string, telegramID int64, username string) (*database.Subscription, error)
-	CountTrialRequestsByIPLastHourFunc          func(ctx context.Context, ip string) (int, error)
-	CreateTrialRequestFunc                      func(ctx context.Context, ip string) error
-	CleanupExpiredTrialsFunc                    func(ctx context.Context, hours int) ([]database.Subscription, error)
-	ClaimExpiredTrialsFunc                      func(ctx context.Context, hours int) ([]database.Subscription, error)
-	DeleteClaimedTrialFunc                      func(ctx context.Context, id uint) error
-	GetPoolStatsFunc                            func() (*database.PoolStats, error)
-	GetSubscriptionWithProviderSourceFunc       func(ctx context.Context, subscriptionID string) (*database.Subscription, error)
-	GetWithPlanAndNodesFunc                     func(ctx context.Context, subscriptionID string) (*database.SubscriptionFull, error)
-	ResolveSubscriptionBuilderFunc              func(ctx context.Context, sub *database.Subscription) (*database.ResolvedBuilder, error)
-	GetSourceEntriesFunc                        func(ctx context.Context, sourceID uint, countryCode string) ([]database.ProviderSourceEntry, error)
-	GetSubscriptionStatusFunc                   func(ctx context.Context, subscriptionID string) (string, time.Time, error)
-	UpdateDevicesFunc                           func(ctx context.Context, id uint, devicesJSON string) error
-	UpdateIPsFunc                               func(ctx context.Context, id uint, ipsJSON string) error
-	UpdateLastRequestFunc                       func(ctx context.Context, subscriptionID string) error
+	PingFunc                                   func(ctx context.Context) error
+	GetByTelegramIDFunc                        func(ctx context.Context, telegramID int64) (*database.Subscription, error)
+	GetAnyByTelegramIDFunc                     func(ctx context.Context, telegramID int64) (*database.Subscription, error)
+	CreateSubscriptionFunc                     func(ctx context.Context, sub *database.Subscription, inviteCode string) error
+	UpdateSubscriptionFunc                     func(ctx context.Context, sub *database.Subscription) error
+	GetLatestSubscriptionsFunc                 func(ctx context.Context, limit int) ([]database.Subscription, error)
+	GetAllSubscriptionsFunc                    func(ctx context.Context) ([]database.Subscription, error)
+	CountAllSubscriptionsFunc                  func(ctx context.Context) (int64, error)
+	CountActiveSubscriptionsFunc               func(ctx context.Context) (int64, error)
+	CountPremiumSubscriptionsFunc              func(ctx context.Context) (int64, error)
+	CountFreeSubscriptionsFunc                 func(ctx context.Context) (int64, error)
+	CountTrialSubscriptionsFunc                func(ctx context.Context) (int64, error)
+	GetByIDFunc                                func(ctx context.Context, id uint) (*database.Subscription, error)
+	GetByTokenFunc                             func(ctx context.Context, token string) (*database.Subscription, error)
+	GetTelegramIDByUsernameFunc                func(ctx context.Context, username string) (int64, error)
+	DeleteSubscriptionByIDFunc                 func(ctx context.Context, id uint) (*database.Subscription, error)
+	GetTelegramIDsBatchFunc                    func(ctx context.Context, offset, limit int) ([]int64, error)
+	GetTotalTelegramIDCountFunc                func(ctx context.Context) (int64, error)
+	GetFilteredTelegramIDCountFunc             func(ctx context.Context, filter database.BroadcastFilter) (int64, error)
+	GetOrCreateInviteFunc                      func(ctx context.Context, referrerTGID int64, code string) (*database.Invite, error)
+	GetInviteByReferrerFunc                    func(ctx context.Context, referrerTGID int64) (*database.Invite, error)
+	GetInviteByCodeFunc                        func(ctx context.Context, code string) (*database.Invite, error)
+	GetReferralCountFunc                       func(ctx context.Context, referrerTGID int64) (int64, error)
+	GetAllReferralCountsFunc                   func(ctx context.Context) (map[int64]int64, error)
+	CreateTrialSubscriptionFunc                func(ctx context.Context, inviteCode, subscriptionID, clientID string, expiryTime time.Time) (*database.Subscription, error)
+	GetPlansBySourceIDFunc                     func(ctx context.Context, sourceID uint) ([]database.Plan, error)
+	GetPlanByNameFunc                          func(ctx context.Context, name string) (*database.Plan, error)
+	GetPlanByIDFunc                            func(ctx context.Context, planID uint) (*database.Plan, error)
+	GetAllPlansFunc                            func(ctx context.Context) ([]database.Plan, error)
+	CreatePlanFunc                             func(ctx context.Context, plan *database.Plan) error
+	UpdatePlanFunc                             func(ctx context.Context, plan *database.Plan) error
+	DeletePlanFunc                             func(ctx context.Context, planID uint) error
+	AddSourceToPlanFunc                        func(ctx context.Context, planID, sourceID uint) error
+	RemoveSourceFromPlanFunc                   func(ctx context.Context, planID, sourceID uint) error
+	SeedDefaultDataFunc                        func(ctx context.Context) error
+	ListActiveProductsFunc                     func(ctx context.Context) ([]database.Product, error)
+	GetProductByIDFunc                         func(ctx context.Context, id uint) (*database.Product, error)
+	UpdateProductGuardedFunc                   func(ctx context.Context, product *database.Product) error
+	GetOrderByIDFunc                           func(ctx context.Context, id uint) (*database.Order, error)
+	GetOrderByProviderPaymentIDFunc            func(ctx context.Context, provider string, providerPaymentID uuid.UUID) (*database.Order, error)
+	FindPendingPaymentOrderFunc                func(ctx context.Context, subscriptionID, productID uint, now time.Time) (*database.Order, error)
+	FindOrCreatePendingPaymentOrderFunc        func(ctx context.Context, subscriptionID, productID uint, amountCents int64, currency string, now time.Time) (*database.Order, error)
+	MarkPaymentCreationUncertainFunc           func(ctx context.Context, orderID uint, uncertain bool) (bool, error)
+	SavePaymentDetailsFunc                     func(ctx context.Context, orderID uint, providerPaymentID uuid.UUID, paymentURL string, paymentExpiresAt time.Time) error
+	SaveOrderPaymentAmountsFunc                func(ctx context.Context, orderID uint, callbackAmountCents int64, providerFeeCents *int64) error
+	GetPaidOrdersWithoutProviderFeeFunc        func(ctx context.Context, limit int) ([]database.Order, error)
+	GetPaidOrdersWithoutProviderFeeAfterIDFunc func(ctx context.Context, afterID uint, limit int) ([]database.Order, error)
+	ConfirmOrderPaidCASFunc                    func(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *database.Subscription, product *database.Product, callbackAmountCents int64) (bool, error)
+	CancelOrderCASFunc                         func(ctx context.Context, provider string, providerPaymentID uuid.UUID, fromStatuses []database.OrderStatus) (bool, error)
+	CancelPaidOrderAndDowngradeCASFunc         func(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint) (*database.ChargebackResult, error)
+	TransactionFunc                            func(ctx context.Context, fn func(*gorm.DB) error) error
+	GetSubscriptionFunc                        func(ctx context.Context, subscriptionID string) (*database.Subscription, error)
+	GetTrialSubscriptionBySubIDFunc            func(ctx context.Context, subscriptionID string) (*database.Subscription, error)
+	BindTrialSubscriptionFunc                  func(ctx context.Context, subscriptionID string, telegramID int64, username string) (*database.Subscription, error)
+	CountTrialRequestsByIPLastHourFunc         func(ctx context.Context, ip string) (int, error)
+	CreateTrialRequestFunc                     func(ctx context.Context, ip string) error
+	CleanupExpiredTrialsFunc                   func(ctx context.Context, hours int) ([]database.Subscription, error)
+	ClaimExpiredTrialsFunc                     func(ctx context.Context, hours int) ([]database.Subscription, error)
+	DeleteClaimedTrialFunc                     func(ctx context.Context, id uint) error
+	GetPoolStatsFunc                           func() (*database.PoolStats, error)
+	GetSubscriptionWithProviderSourceFunc      func(ctx context.Context, subscriptionID string) (*database.Subscription, error)
+	ResolveSubscriptionBuilderFunc             func(ctx context.Context, sub *database.Subscription) (*database.ResolvedBuilder, error)
+	GetSourceEntriesFunc                       func(ctx context.Context, sourceID uint, countryCode string) ([]database.ProviderSourceEntry, error)
+	GetSubscriptionStatusFunc                  func(ctx context.Context, subscriptionID string) (string, time.Time, error)
+	UpdateDevicesFunc                          func(ctx context.Context, id uint, devicesJSON string) error
+	UpdateIPsFunc                              func(ctx context.Context, id uint, ipsJSON string) error
+	UpdateLastRequestFunc                      func(ctx context.Context, subscriptionID string) error
 
-	GetSubscriptionsExpiringInRangeFunc        func(ctx context.Context, from, to time.Time) ([]database.Subscription, error)
-	ClaimReminderFunc                          func(ctx context.Context, id uint, bit int, expiresAt time.Time) (bool, error)
-	ReleaseReminderFunc                        func(ctx context.Context, id uint, bit int, expiresAt time.Time) error
-	GetActiveSubscriptionsWithTrafficLimitFunc func(ctx context.Context) ([]database.SubscriptionTrafficTarget, error)
-	ClaimTrafficReminderFunc                   func(ctx context.Context, id uint, bit int) (bool, error)
-	ReleaseTrafficReminderFunc                 func(ctx context.Context, id uint, bit int) error
+	GetSubscriptionsExpiringInRangeFunc func(ctx context.Context, from, to time.Time) ([]database.Subscription, error)
+	ClaimReminderFunc                   func(ctx context.Context, id uint, bit int, expiresAt time.Time) (bool, error)
+	ReleaseReminderFunc                 func(ctx context.Context, id uint, bit int, expiresAt time.Time) error
 
 	CreateBroadcastFunc                  func(ctx context.Context, b *database.Broadcast) error
 	GetBroadcastFunc                     func(ctx context.Context, id uint) (*database.Broadcast, error)
@@ -314,110 +294,6 @@ func (m *DatabaseService) CreateSubscription(ctx context.Context, sub *database.
 	}
 
 	return nil
-}
-
-func (m *DatabaseService) CreateSubscriptionNode(ctx context.Context, sn *database.SubscriptionNode) error {
-	if m.CreateSubscriptionNodeFunc != nil {
-		return m.CreateSubscriptionNodeFunc(ctx, sn)
-	}
-
-	return nil
-}
-
-func (m *DatabaseService) UpdateSubscriptionNodeStatus(ctx context.Context, subID, nodeID uint, status database.SyncStatus) error {
-	if m.UpdateSubscriptionNodeStatusFunc != nil {
-		return m.UpdateSubscriptionNodeStatusFunc(ctx, subID, nodeID, status)
-	}
-
-	return nil
-}
-
-func (m *DatabaseService) UpsertSubscriptionNode(ctx context.Context, sn *database.SubscriptionNode) error {
-	if m.UpsertSubscriptionNodeFunc != nil {
-		return m.UpsertSubscriptionNodeFunc(ctx, sn)
-	}
-
-	return nil
-}
-
-func (m *DatabaseService) DeleteSubscriptionNode(ctx context.Context, subID, nodeID uint) error {
-	if m.DeleteSubscriptionNodeFunc != nil {
-		return m.DeleteSubscriptionNodeFunc(ctx, subID, nodeID)
-	}
-
-	return nil
-}
-
-func (m *DatabaseService) DeleteSubscriptionNodesBySubscriptionID(ctx context.Context, subID uint) error {
-	if m.DeleteSubscriptionNodesBySubscriptionIDFunc != nil {
-		return m.DeleteSubscriptionNodesBySubscriptionIDFunc(ctx, subID)
-	}
-
-	return nil
-}
-
-func (m *DatabaseService) MarkActiveNodesPendingUpdate(ctx context.Context, subID uint, targetNodeIDs []uint) error {
-	if m.MarkActiveNodesPendingUpdateFunc != nil {
-		return m.MarkActiveNodesPendingUpdateFunc(ctx, subID, targetNodeIDs)
-	}
-
-	return nil
-}
-
-func (m *DatabaseService) UpdateRetry(ctx context.Context, subID, nodeID uint, retryCount int, retryAt *time.Time, lastErr *string) error {
-	if m.UpdateRetryFunc != nil {
-		return m.UpdateRetryFunc(ctx, subID, nodeID, retryCount, retryAt, lastErr)
-	}
-
-	return nil
-}
-
-func (m *DatabaseService) GetBySubscriptionID(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-	if m.GetBySubscriptionIDFunc != nil {
-		return m.GetBySubscriptionIDFunc(ctx, subscriptionID)
-	}
-
-	return nil, nil
-}
-
-func (m *DatabaseService) GetPendingSync(ctx context.Context) ([]database.SubscriptionNode, error) {
-	if m.GetPendingSyncFunc != nil {
-		return m.GetPendingSyncFunc(ctx)
-	}
-
-	return nil, nil
-}
-
-func (m *DatabaseService) GetPendingBySubscriptionID(ctx context.Context, subscriptionID uint) ([]database.SubscriptionNode, error) {
-	if m.GetPendingBySubscriptionIDFunc != nil {
-		return m.GetPendingBySubscriptionIDFunc(ctx, subscriptionID)
-	}
-
-	return nil, nil
-}
-
-func (m *DatabaseService) GetNodeByID(ctx context.Context, id uint) (*database.Node, error) {
-	if m.GetNodeByIDFunc != nil {
-		return m.GetNodeByIDFunc(ctx, id)
-	}
-
-	return nil, gorm.ErrRecordNotFound
-}
-
-func (m *DatabaseService) GetNodesByPlanID(ctx context.Context, planID uint) ([]database.Node, error) {
-	if m.GetNodesByPlanIDFunc != nil {
-		return m.GetNodesByPlanIDFunc(ctx, planID)
-	}
-
-	return nil, gorm.ErrRecordNotFound
-}
-
-func (m *DatabaseService) ListEnabled(ctx context.Context) ([]database.Node, error) {
-	if m.ListEnabledFunc != nil {
-		return m.ListEnabledFunc(ctx)
-	}
-
-	return nil, gorm.ErrRecordNotFound
 }
 
 func (m *DatabaseService) GetProductByID(ctx context.Context, id uint) (*database.Product, error) {
@@ -1107,16 +983,6 @@ func (m *DatabaseService) CreateTrialSubscription(ctx context.Context, inviteCod
 	return &database.Subscription{InviteCode: &inviteVal, SubscriptionID: subscriptionID, ClientID: clientID, PlanID: trialPlan.ID}, nil
 }
 
-func (m *DatabaseService) ListNodes(ctx context.Context) ([]database.Node, error) {
-	if m.ListNodesFunc != nil {
-		return m.ListNodesFunc(ctx)
-	}
-
-	return []database.Node{
-		{ID: 1, Name: "default", IsActive: true, Host: "http://localhost:2053", APIToken: "test-token", InboundIDs: `[1]`, SubscriptionURL: "http://example.com/sub/"},
-	}, nil
-}
-
 func (m *DatabaseService) SeedDefaultData(ctx context.Context) error {
 	if m.SeedDefaultDataFunc != nil {
 		return m.SeedDefaultDataFunc(ctx)
@@ -1131,11 +997,11 @@ func (m *DatabaseService) GetPlanByName(ctx context.Context, name string) (*data
 	}
 
 	if name == database.FreePlanName {
-		return &database.Plan{ID: 2, Name: name, DevicesLimit: 1, TrafficLimit: 1073741824}, nil
+		return &database.Plan{ID: 2, Name: name}, nil
 	}
 
 	if name == database.TrialPlanName {
-		return &database.Plan{ID: 1, Name: name, DevicesLimit: 1, TrafficLimit: 1073741824}, nil
+		return &database.Plan{ID: 1, Name: name}, nil
 	}
 
 	return nil, gorm.ErrRecordNotFound
@@ -1179,23 +1045,6 @@ func (m *DatabaseService) DeletePlan(ctx context.Context, planID uint) error {
 	}
 
 	return nil
-}
-
-func (m *DatabaseService) GetNodesByPlanName(ctx context.Context, planName string) ([]database.Node, error) {
-	if m.GetNodesByPlanNameFunc != nil {
-		return m.GetNodesByPlanNameFunc(ctx, planName)
-	}
-
-	if planName == database.TrialPlanName {
-		inboundIDs, err := json.Marshal([]int{1})
-		if err != nil {
-			return nil, err
-		}
-
-		return []database.Node{{ID: 1, IsActive: true, Host: "http://localhost:2053", InboundIDs: string(inboundIDs)}}, nil
-	}
-
-	return nil, nil
 }
 
 func (m *DatabaseService) GetPlansBySourceID(ctx context.Context, sourceID uint) ([]database.Plan, error) {
@@ -1379,20 +1228,22 @@ func (m *DatabaseService) GetSubscriptionWithProviderSource(ctx context.Context,
 		return sub, nil
 	}
 
-	full, err := m.GetWithPlanAndNodes(ctx, subscriptionID)
-	if err != nil {
-		return nil, err
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, sub := range m.SubscriptionsByID {
+		if sub != nil && sub.SubscriptionID == subscriptionID {
+			return sub, nil
+		}
 	}
 
-	return &full.Subscription, nil
-}
-
-func (m *DatabaseService) GetWithPlanAndNodes(ctx context.Context, subscriptionID string) (*database.SubscriptionFull, error) {
-	if m.GetWithPlanAndNodesFunc != nil {
-		return m.GetWithPlanAndNodesFunc(ctx, subscriptionID)
+	for _, sub := range m.Subscriptions {
+		if sub != nil && sub.SubscriptionID == subscriptionID {
+			return sub, nil
+		}
 	}
 
-	return nil, gorm.ErrRecordNotFound
+	return nil, database.ErrSubscriptionNotFound
 }
 
 func (m *DatabaseService) GetSubscriptionStatus(ctx context.Context, subscriptionID string) (string, time.Time, error) {
@@ -1471,34 +1322,6 @@ func (m *DatabaseService) ClaimReminder(ctx context.Context, id uint, bit int, e
 	return true, nil
 }
 
-// GetActiveSubscriptionsWithTrafficLimit returns active subscriptions with
-// their respective positive plan traffic limits from the shared fake.
-func (m *DatabaseService) GetActiveSubscriptionsWithTrafficLimit(ctx context.Context) ([]database.SubscriptionTrafficTarget, error) {
-	if m.GetActiveSubscriptionsWithTrafficLimitFunc != nil {
-		return m.GetActiveSubscriptionsWithTrafficLimitFunc(ctx)
-	}
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var out []database.SubscriptionTrafficTarget
-	for _, sub := range m.Subscriptions {
-		if sub.Status != string(database.SubscriptionStatusActive) {
-			continue
-		}
-		plan, ok := m.Plans[sub.PlanID]
-		if !ok {
-			plan, _ = m.GetPlanByID(ctx, sub.PlanID)
-		}
-		if plan == nil || plan.TrafficLimit <= 0 {
-			continue
-		}
-		out = append(out, database.SubscriptionTrafficTarget{Subscription: *sub, TrafficLimit: plan.TrafficLimit})
-	}
-
-	return out, nil
-}
-
 func (m *DatabaseService) ReleaseReminder(ctx context.Context, id uint, bit int, expiresAt time.Time) error {
 	if m.ReleaseReminderFunc != nil {
 		return m.ReleaseReminderFunc(ctx, id, bit, expiresAt)
@@ -1526,58 +1349,6 @@ func (m *DatabaseService) ReleaseReminder(ctx context.Context, id uint, bit int,
 	return nil
 }
 
-// ClaimTrafficReminder atomically claims a traffic-notification bit in the
-// stateful fake.
-func (m *DatabaseService) ClaimTrafficReminder(ctx context.Context, id uint, bit int) (bool, error) {
-	if m.ClaimTrafficReminderFunc != nil {
-		return m.ClaimTrafficReminderFunc(ctx, id, bit)
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	sub, ok := m.SubscriptionsByID[id]
-	if !ok {
-		return false, gorm.ErrRecordNotFound
-	}
-
-	if sub.TrafficRemindersSent&bit != 0 {
-		return false, nil
-	}
-
-	sub.TrafficRemindersSent |= bit
-	if sub.TelegramID > 0 {
-		if current, exists := m.Subscriptions[sub.TelegramID]; exists {
-			current.TrafficRemindersSent = sub.TrafficRemindersSent
-		}
-	}
-
-	return true, nil
-}
-
-// ReleaseTrafficReminder clears a traffic-notification bit in the stateful fake.
-func (m *DatabaseService) ReleaseTrafficReminder(ctx context.Context, id uint, bit int) error {
-	if m.ReleaseTrafficReminderFunc != nil {
-		return m.ReleaseTrafficReminderFunc(ctx, id, bit)
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	sub, ok := m.SubscriptionsByID[id]
-	if !ok {
-		return gorm.ErrRecordNotFound
-	}
-
-	sub.TrafficRemindersSent &^= bit
-	if sub.TelegramID > 0 {
-		if current, exists := m.Subscriptions[sub.TelegramID]; exists {
-			current.TrafficRemindersSent = sub.TrafficRemindersSent
-		}
-	}
-
-	return nil
-}
 func (m *DatabaseService) ListActiveProducts(ctx context.Context) ([]database.Product, error) {
 	if m.ListActiveProductsFunc != nil {
 		return m.ListActiveProductsFunc(ctx)
@@ -1796,9 +1567,9 @@ func (m *DatabaseService) GetPaidOrdersWithoutProviderFeeAfterID(ctx context.Con
 	return orders, nil
 }
 
-func (m *DatabaseService) ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *database.Subscription, product *database.Product, applyPlan database.ApplyPlanInTxFn, callbackAmountCents int64) (bool, error) {
+func (m *DatabaseService) ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *database.Subscription, product *database.Product, callbackAmountCents int64) (bool, error) {
 	if m.ConfirmOrderPaidCASFunc != nil {
-		return m.ConfirmOrderPaidCASFunc(ctx, orderID, paidAt, activatedAt, sub, product, applyPlan, callbackAmountCents)
+		return m.ConfirmOrderPaidCASFunc(ctx, orderID, paidAt, activatedAt, sub, product, callbackAmountCents)
 	}
 
 	m.mu.Lock()
@@ -1807,16 +1578,6 @@ func (m *DatabaseService) ConfirmOrderPaidCAS(ctx context.Context, orderID uint,
 	order, ok := m.Orders[orderID]
 	if !ok || (order.Status != database.OrderStatusPending && order.Status != database.OrderStatusExpired) {
 		return false, nil
-	}
-
-	if applyPlan != nil {
-		// The in-memory fake has no transaction handle. Require tests that cover
-		// transaction-scoped plan reconciliation to provide ConfirmOrderPaidCASFunc;
-		// silently invoking the callback with nil would hide a production bug.
-		// Validate before mutating any state: in production an applyPlan failure
-		// rolls back the whole transaction, so the mock must not leave partial
-		// order/subscription mutations behind when it returns this error.
-		return false, errors.New("mock ConfirmOrderPaidCAS requires ConfirmOrderPaidCASFunc when applyPlan is set")
 	}
 
 	newExpiry := database.CalculatePaymentExpiry(activatedAt, sub, product)
@@ -1830,9 +1591,9 @@ func (m *DatabaseService) ConfirmOrderPaidCAS(ctx context.Context, orderID uint,
 	return true, nil
 }
 
-func (m *DatabaseService) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint, applyPlan database.ChargebackPlanInTxFn) (*database.ChargebackResult, error) {
+func (m *DatabaseService) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint) (*database.ChargebackResult, error) {
 	if m.CancelPaidOrderAndDowngradeCASFunc != nil {
-		return m.CancelPaidOrderAndDowngradeCASFunc(ctx, provider, providerPaymentID, now, freePlanID, applyPlan)
+		return m.CancelPaidOrderAndDowngradeCASFunc(ctx, provider, providerPaymentID, now, freePlanID)
 	}
 
 	return nil, errors.New("mock atomic chargeback requires CancelPaidOrderAndDowngradeCASFunc")
@@ -1887,146 +1648,6 @@ func CreateTestSubscription(telegramID int64, username string, status string, ex
 		Status:         status,
 		PlanID:         2,
 	}
-}
-
-type XUIClient struct {
-	mu                      sync.Mutex
-	PingFunc                func(ctx context.Context) error
-	AddClientFunc           func(ctx context.Context, inboundIDs []int, email string, trafficBytes int64, expiryTime time.Time) (*xui.ClientConfig, error)
-	AddClientWithIDFunc     func(ctx context.Context, req xui.ClientRequest) (*xui.ClientConfig, error)
-	UpdateClientFunc        func(ctx context.Context, req xui.ClientRequest) error
-	DeleteClientFunc        func(ctx context.Context, email string) error
-	GetClientTrafficFunc    func(ctx context.Context, email string) (*xui.ClientTraffic, error)
-	GetClientByEmailFunc    func(ctx context.Context, inboundID int, email string) (*xui.ClientConfig, error)
-	GetSubscriptionLinkFunc func(host, subID, subPath string) string
-	GetExternalURLFunc      func(host string) string
-
-	// Call tracking
-	AddClientCalled       bool
-	AddClientWithIDCalled bool
-	DeleteClientCalled    bool
-	UpdateClientCalled    bool
-	ResetTrafficCalled    bool
-}
-
-func (m *XUIClient) Ping(ctx context.Context) error {
-	if m.PingFunc != nil {
-		return m.PingFunc(ctx)
-	}
-
-	return nil
-}
-
-func (m *XUIClient) AddClient(ctx context.Context, inboundIDs []int, email string, trafficBytes int64, expiryTime time.Time) (*xui.ClientConfig, error) {
-	m.mu.Lock()
-	m.AddClientCalled = true
-	m.mu.Unlock()
-
-	if m.AddClientFunc != nil {
-		return m.AddClientFunc(ctx, inboundIDs, email, trafficBytes, expiryTime)
-	}
-
-	return &xui.ClientConfig{
-		ID:        "test-client-id",
-		Email:     email,
-		TotalGB:   trafficBytes,
-		ExpiresAt: expiryTime.UnixMilli(),
-		Enable:    true,
-	}, nil
-}
-
-func (m *XUIClient) AddClientWithID(ctx context.Context, req xui.ClientRequest) (*xui.ClientConfig, error) {
-	m.mu.Lock()
-	m.AddClientWithIDCalled = true
-	m.mu.Unlock()
-
-	if m.AddClientWithIDFunc != nil {
-		return m.AddClientWithIDFunc(ctx, req)
-	}
-
-	return &xui.ClientConfig{
-		ID:        req.ClientID,
-		Email:     req.Email,
-		TotalGB:   req.TrafficBytes,
-		ExpiresAt: req.ExpiryTime.UnixMilli(),
-		Enable:    true,
-		SubID:     req.SubID,
-	}, nil
-}
-
-func (m *XUIClient) UpdateClient(ctx context.Context, req xui.ClientRequest) error {
-	m.mu.Lock()
-	m.UpdateClientCalled = true
-	m.mu.Unlock()
-
-	if m.UpdateClientFunc != nil {
-		return m.UpdateClientFunc(ctx, req)
-	}
-
-	return nil
-}
-
-func (m *XUIClient) DeleteClient(ctx context.Context, email string) error {
-	m.mu.Lock()
-	m.DeleteClientCalled = true
-	m.mu.Unlock()
-
-	if m.DeleteClientFunc != nil {
-		return m.DeleteClientFunc(ctx, email)
-	}
-
-	return nil
-}
-
-func (m *XUIClient) ResetTraffic(_ context.Context, _ string) error {
-	m.mu.Lock()
-	m.ResetTrafficCalled = true
-	m.mu.Unlock()
-
-	return nil
-}
-
-func (m *XUIClient) GetClientTraffic(ctx context.Context, email string) (*xui.ClientTraffic, error) {
-	if m.GetClientTrafficFunc != nil {
-		return m.GetClientTrafficFunc(ctx, email)
-	}
-
-	return &xui.ClientTraffic{
-		Up:   1024 * 1024 * 100,
-		Down: 1024 * 1024 * 200,
-	}, nil
-}
-
-func (m *XUIClient) GetClientByEmail(ctx context.Context, inboundID int, email string) (*xui.ClientConfig, error) {
-	if m.GetClientByEmailFunc != nil {
-		return m.GetClientByEmailFunc(ctx, inboundID, email)
-	}
-
-	return nil, xui.ErrClientNotFound
-}
-
-func (m *XUIClient) GetSubscriptionLink(host, subID, subPath string) string {
-	if m.GetSubscriptionLinkFunc != nil {
-		return m.GetSubscriptionLinkFunc(host, subID, subPath)
-	}
-
-	return host + "/" + subPath + "/" + subID
-}
-
-func (m *XUIClient) GetExternalURL(host string) string {
-	if m.GetExternalURLFunc != nil {
-		return m.GetExternalURLFunc(host)
-	}
-
-	return host
-}
-
-func (m *XUIClient) Close() error {
-	return nil
-}
-
-func NewXUIClient() *XUIClient {
-	return &XUIClient{}
 }
 
 // BotAPI is a mock implementation of the Telegram Bot API for testing.

@@ -2,13 +2,11 @@ package database
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 // ==================== GetSubscriptionStatus Tests ====================
@@ -51,9 +49,9 @@ func TestGetSubscriptionStatus_NotFound(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// ==================== GetWithPlanAndNodes Tests ====================
+// ==================== GetSubscriptionWithProviderSource Tests ====================
 
-func TestGetWithPlanAndNodes_ActiveSubscription(t *testing.T) {
+func TestGetSubscriptionWithProviderSource_ActiveSubscription(t *testing.T) {
 	t.Parallel()
 
 	svc := newTestService(t)
@@ -74,23 +72,23 @@ func TestGetWithPlanAndNodes_ActiveSubscription(t *testing.T) {
 	}
 	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
 
-	result, err := svc.GetWithPlanAndNodes(ctx, sub.SubscriptionID)
+	result, err := svc.GetSubscriptionWithProviderSource(ctx, sub.SubscriptionID)
 	require.NoError(t, err)
-	assert.Equal(t, sub.SubscriptionID, result.Subscription.SubscriptionID)
-	assert.Equal(t, plan.ID, result.Plan.ID)
+	assert.Equal(t, sub.SubscriptionID, result.SubscriptionID)
+	assert.Equal(t, plan.ID, result.PlanID)
 }
 
-func TestGetWithPlanAndNodes_NotFound(t *testing.T) {
+func TestGetSubscriptionWithProviderSource_NotFound(t *testing.T) {
 	t.Parallel()
 
 	svc := newTestService(t)
 	ctx := context.Background()
 
-	_, err := svc.GetWithPlanAndNodes(ctx, "nonexistent")
+	_, err := svc.GetSubscriptionWithProviderSource(ctx, "nonexistent")
 	assert.ErrorIs(t, err, ErrSubscriptionNotFound)
 }
 
-func TestGetWithPlanAndNodes_ExpiredActiveSubscription(t *testing.T) {
+func TestGetSubscriptionWithProviderSource_ExpiredActiveSubscription(t *testing.T) {
 	t.Parallel()
 
 	svc := newTestService(t)
@@ -109,11 +107,11 @@ func TestGetWithPlanAndNodes_ExpiredActiveSubscription(t *testing.T) {
 	}
 	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
 
-	_, err = svc.GetWithPlanAndNodes(ctx, sub.SubscriptionID)
+	_, err = svc.GetSubscriptionWithProviderSource(ctx, sub.SubscriptionID)
 	assert.ErrorIs(t, err, ErrSubscriptionNotFound)
 }
 
-func TestGetWithPlanAndNodes_RevokedSubscription(t *testing.T) {
+func TestGetSubscriptionWithProviderSource_RevokedSubscription(t *testing.T) {
 	t.Parallel()
 
 	svc := newTestService(t)
@@ -122,7 +120,7 @@ func TestGetWithPlanAndNodes_RevokedSubscription(t *testing.T) {
 	sub := createTestSubscription(t, svc, 9101, "plan-revoked", "client-plan-rev")
 	require.NoError(t, svc.db.WithContext(ctx).Model(sub).Update("status", "revoked").Error)
 
-	_, err := svc.GetWithPlanAndNodes(ctx, sub.SubscriptionID)
+	_, err := svc.GetSubscriptionWithProviderSource(ctx, sub.SubscriptionID)
 	assert.ErrorIs(t, err, ErrSubscriptionNotFound)
 }
 
@@ -183,7 +181,7 @@ func TestGetExpiredPaidSubscriptions_WithExpiredPaidSub(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a paid plan subscription that has expired
-	paidPlan := &Plan{Name: "paid-plan-exp", DevicesLimit: 3, TrafficLimit: 100 * 1024 * 1024 * 1024, IsActive: true}
+	paidPlan := &Plan{Name: "paid-plan-exp", IsActive: true}
 	require.NoError(t, svc.db.WithContext(ctx).Create(paidPlan).Error)
 
 	pastTime := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Minute)
@@ -270,38 +268,6 @@ func TestGetExpiredPaidSubscriptions_TrialPlanExcluded(t *testing.T) {
 	assert.Empty(t, subs, "trial subscriptions are cleaned up by TrialCleanupScheduler")
 }
 
-func TestExpireSubscriptionWithPlanCAS_RollsBackOnPlanApplyFailure(t *testing.T) {
-	t.Parallel()
-
-	svc := newTestService(t)
-	ctx := context.Background()
-	freePlan, err := svc.GetPlanByName(ctx, FreePlanName)
-	require.NoError(t, err)
-
-	paidPlan := &Plan{Name: "expiry-rollback", IsActive: true}
-	require.NoError(t, svc.db.Create(paidPlan).Error)
-	product := &Product{PlanID: paidPlan.ID, Name: "rollback", DurationDays: 30, PriceCents: 100, Currency: "RUB", IsActive: true}
-	require.NoError(t, svc.db.Create(product).Error)
-
-	expired := time.Now().UTC().Add(-time.Hour)
-	productID := product.ID
-	currency := "RUB"
-	sub := &Subscription{TelegramID: 994005, Username: "expiry-rollback", ClientID: "expiry-rollback-client", SubscriptionID: "expiry-rollback-sub", Status: "active", PlanID: paidPlan.ID, ExpiresAt: &expired, ProductID: &productID, PricePaidCents: 100, Currency: &currency}
-	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
-
-	wantErr := errors.New("expiry sync setup failed")
-	err = svc.ExpireSubscriptionWithPlanCAS(ctx, sub.ID, freePlan.ID, func(context.Context, *gorm.DB, uint, uint) error {
-		return wantErr
-	})
-	require.ErrorIs(t, err, wantErr)
-	stored, err := svc.GetByID(ctx, sub.ID)
-	require.NoError(t, err)
-	assert.Equal(t, paidPlan.ID, stored.PlanID, "expiry downgrade must roll back with sync setup")
-	require.NotNil(t, stored.ExpiresAt)
-	assert.WithinDuration(t, expired, *stored.ExpiresAt, time.Second)
-	assert.Equal(t, int64(100), stored.PricePaidCents)
-}
-
 func TestExpireSubscriptionWithPlanCAS_RequiresExpiredActiveSubscription(t *testing.T) {
 	t.Parallel()
 
@@ -321,13 +287,8 @@ func TestExpireSubscriptionWithPlanCAS_RequiresExpiredActiveSubscription(t *test
 	sub := &Subscription{TelegramID: 994003, Username: "expiry-cas", ClientID: "expiry-cas-client", SubscriptionID: "expiry-cas-sub", Status: "active", PlanID: paidPlan.ID, ExpiresAt: &expired, ProductID: &productID, PricePaidCents: 100, Currency: &currency}
 	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
 
-	applyCalled := false
-	err = svc.ExpireSubscriptionWithPlanCAS(ctx, sub.ID, freePlan.ID, func(context.Context, *gorm.DB, uint, uint) error {
-		applyCalled = true
-		return nil
-	})
+	err = svc.ExpireSubscriptionWithPlanCAS(ctx, sub.ID, freePlan.ID)
 	require.NoError(t, err)
-	assert.True(t, applyCalled)
 
 	updated, err := svc.GetByID(ctx, sub.ID)
 	require.NoError(t, err)

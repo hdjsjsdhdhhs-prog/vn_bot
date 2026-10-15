@@ -19,13 +19,16 @@ func purchaseServiceFixture(t *testing.T) (*PurchaseService, *database.Service, 
 	db, err := database.NewService(filepath.Join(t.TempDir(), "purchase.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	plan := &database.Plan{Name: "purchase-policy", IsActive: true}
+	// A sellable plan is active and served by a subscription builder.
+	builder := &database.SubscriptionBuilder{Name: "purchase-policy-builder", Enabled: true}
+	require.NoError(t, db.GetDB().Create(builder).Error)
+	plan := &database.Plan{Name: "purchase-policy", IsActive: true, SubscriptionBuilderID: &builder.ID}
 	require.NoError(t, db.GetDB().Create(plan).Error)
 	product := &database.Product{PlanID: plan.ID, Name: "Monthly", DurationDays: 30, PriceCents: 5000, Currency: "RUB", IsActive: true}
 	require.NoError(t, db.GetDB().Create(product).Error)
 	sub := &database.Subscription{TelegramID: 44001, ClientID: "purchase-client", SubscriptionID: "purchase-sub", PlanID: plan.ID, Status: "active"}
 	require.NoError(t, db.CreateSubscription(context.Background(), sub, ""))
-	p := NewPurchaseService(NewSubscriptionService(db, nil, nil, nil, nil), func(context.Context) (int64, error) { return 44001, nil })
+	p := NewPurchaseService(NewSubscriptionService(db, nil), func(context.Context) (int64, error) { return 44001, nil })
 	return p, db, sub, product
 }
 
@@ -226,7 +229,7 @@ func TestPurchaseService_StalePaymentSettlement(t *testing.T) {
 			require.NoError(t, err)
 			// Same-plan confirmation requires no node provisioning. Exercise the real
 			// callback and CAS with a real DB, not a mocked settlement decision.
-			orders := NewOrderService(db, nil, NewSyncService(db, nil, nil), fakePaymentProvider{}, "", nil)
+			orders := NewOrderService(db, nil, fakePaymentProvider{}, "", nil)
 			confirmation, err := orders.ConfirmPayment(ctx, providerID, json.Number("50.00"), "RUB")
 			require.NoError(t, err)
 			require.NotNil(t, confirmation)

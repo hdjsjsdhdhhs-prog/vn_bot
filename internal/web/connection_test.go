@@ -296,7 +296,7 @@ func TestConnectionRoute_LocalHTTPWithDatabase(t *testing.T) {
 		require.NoError(t, db.CreateSubscription(context.Background(), sub, ""))
 	}
 	cfg := &config.Config{GlobalSubURL: "https://customer.example/custom/sub/"}
-	subSvc := service.NewSubscriptionService(db, nil, nil, nil, cfg)
+	subSvc := service.NewSubscriptionService(db, cfg)
 	srv := NewServer("127.0.0.1:0", db, cfg, "", subSvc, nil)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() {

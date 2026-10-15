@@ -26,7 +26,7 @@ const (
 
 func newSubscriptionInfoTestServer(db *testutil.DatabaseService) (*Server, *config.Config) {
 	cfg := &config.Config{GlobalSubURL: "https://customer.example/sub/"}
-	subSvc := service.NewSubscriptionService(db, nil, nil, nil, cfg)
+	subSvc := service.NewSubscriptionService(db, cfg)
 
 	return NewServer("127.0.0.1:0", db, cfg, "testbot", subSvc, nil), cfg
 }

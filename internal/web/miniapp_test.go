@@ -164,7 +164,7 @@ func TestMiniAppServiceFailuresAreSanitized(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := &miniAppFailingRepository{DatabaseService: testutil.NewDatabaseService(), sub: tc.sub, err: tc.err}
 			cfg := &config.Config{TelegramBotToken: miniAppTestToken, GlobalSubURL: "https://customer.example/sub/"}
-			svc := service.NewSubscriptionService(repo, nil, nil, nil, cfg)
+			svc := service.NewSubscriptionService(repo, cfg)
 			req := httptest.NewRequest(http.MethodGet, "/api/miniapp/subscription", nil)
 			req.Header.Set("Authorization", "tma "+miniAppTestData(42, time.Now(), miniAppTestToken))
 			rr := httptest.NewRecorder()
@@ -199,7 +199,7 @@ func TestMiniAppRoute_LocalHTTPWithManagement(t *testing.T) {
 	provider := &database.ProviderSource{Name: "miniapp-private-provider", Type: "external", Enabled: true, SubscriptionURL: "https://provider.example/private-miniapp-feed", HWID: "miniapp-private-hwid", Headers: `{"Authorization":"Bearer miniapp-private-header"}`}
 	require.NoError(t, db.CreateProviderSource(ctx, provider))
 	cfg := &config.Config{TelegramBotToken: miniAppTestToken, GlobalSubURL: "https://customer.example/sub/", TelegramAdminID: 1234567890123}
-	svc := service.NewSubscriptionService(db, nil, nil, nil, cfg)
+	svc := service.NewSubscriptionService(db, cfg)
 	var subs []*database.Subscription
 	for i, token := range []string{subscriptionInfoTokenA, subscriptionInfoTokenB} {
 		expiry := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)

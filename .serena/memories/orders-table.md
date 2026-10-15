@@ -1,8 +1,9 @@
+> **Внимание:** записи ниже о панелях 3x-ui/proxman, узлах (`nodes`, `subscription_nodes`), синхронизации, `internal/vpn`, `internal/xui` и панельных уведомлениях трафика — **исторические**: подсистема удалена миграцией `051_remove_legacy_nodes`. Актуальная модель: подписка — локальное состояние, содержимое `/sub` собирает Subscription Builder из ProviderSource (см. `doc/architecture.md`).
+
 # Orders & Payment (Platega)
 
 ## Two-phase Provisioning
-- Phase 1 (DB-setup, must-succeed): `ConfirmOrderPaidCAS` — single SQL transaction that (a) CAS-guards `orders.status='pending'→'paid'`, (b) updates the subscription, (c) invokes `applyPlanInTx` callback to materialize all `subscription_nodes` `pending_add`/`pending_remove`/`pending_update` rows in the same tx. Any error rolls the whole thing back.
-- Phase 2 (external-sync, best-effort): `SyncSubscription` → `SyncPendingNodes` worker with retry/backoff. The bot may respond OK before VPN is fully provisioned.
+- `ConfirmOrderPaidCAS` — одна SQL-транзакция: CAS `orders.status='pending'→'paid'` + обновление подписки. Материализации `subscription_nodes` и внешней синхронизации больше нет (удалены миграцией 051).
 
 ## Web entrypoint
 - `POST /payment/callback` (web.Server) — checks `web.PaymentConfig` first (else 503), then `X-MerchantId`/`X-Secret` (platega.VerifyHeaders), MaxBytesReader(256 KiB), UUID id, exact amount match.

@@ -29,6 +29,26 @@ func newTestSubSvc(t *testing.T) *Service {
 	return svc
 }
 
+// providerSourceSub returns an active subscription without a builder that is
+// served directly by one enabled ProviderSource at rawURL.
+func providerSourceSub(id uint, subID, rawURL string) *database.Subscription {
+	sub := activeRuntimeSubscription(subID, testSource(id, rawURL))
+	sub.ID = id
+
+	return sub
+}
+
+// seedProviderSourceCache routes subID to a ProviderSource that is never
+// reachable and pre-populates that route's cache entry, so a successful
+// response can only come from the cache.
+func seedProviderSourceCache(mockDB *testutil.DatabaseService, svc *Service, subID string, body []byte, headers map[string]string) {
+	sub := providerSourceSub(1, subID, "http://127.0.0.1:1/never-fetched")
+	mockDB.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
+		return sub, nil
+	}
+	svc.SetCache(providerSourceCacheKey(subID, *sub.ProviderSource), body, headers)
+}
+
 // ==================== HandleSubscription Tests ====================
 
 func TestHandleSubscription_CacheHit_Active(t *testing.T) {
@@ -38,15 +58,10 @@ func TestHandleSubscription_CacheHit_Active(t *testing.T) {
 	svc := newTestSubSvc(t)
 	ctx := context.Background()
 
-	// Pre-populate cache
+	// Pre-populate the cache of the subscription's serving route.
 	cachedBody := []byte("cached-content")
 	cachedHeaders := map[string]string{"content-type": "text/plain"}
-	svc.SetCache("sub123", cachedBody, cachedHeaders)
-
-	// Mock: subscription is active
-	mockDB.GetSubscriptionStatusFunc = func(ctx context.Context, subID string) (string, time.Time, error) {
-		return "active", time.Now().Add(24 * time.Hour), nil
-	}
+	seedProviderSourceCache(mockDB, svc, "sub123", cachedBody, cachedHeaders)
 
 	result, _, _, err := HandleSubscription(ctx, mockDB, svc, "sub123", "1.2.3.4", nil)
 	require.NoError(t, err)
@@ -135,7 +150,7 @@ func TestHandleSubscription_CacheMiss_SubscriptionNotFound(t *testing.T) {
 	svc := newTestSubSvc(t)
 	ctx := context.Background()
 
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
+	mockDB.GetSubscriptionWithProviderSourceFunc = func(ctx context.Context, subID string) (*database.Subscription, error) {
 		return nil, fmt.Errorf("not found: %w", database.ErrSubscriptionNotFound)
 	}
 
@@ -143,6 +158,41 @@ func TestHandleSubscription_CacheMiss_SubscriptionNotFound(t *testing.T) {
 	_ = result
 
 	assert.ErrorIs(t, err, ErrSubscriptionNotFound)
+}
+
+// TestHandleSubscription_NoBuilderNoSource_IsConfigurationError locks the
+// serving contract: an active subscription with no enabled builder (own or
+// plan default) and no linked ProviderSource has no route at all. It is a
+// configuration error (/sub answers 503), not "not found", and nothing is
+// fetched, cached or tracked.
+func TestHandleSubscription_NoBuilderNoSource_IsConfigurationError(t *testing.T) {
+	t.Parallel()
+
+	mockDB := testutil.NewDatabaseService()
+	svc := newTestSubSvc(t)
+	ctx := context.Background()
+
+	mockDB.GetSubscriptionWithProviderSourceFunc = func(ctx context.Context, subID string) (*database.Subscription, error) {
+		return activeRuntimeSubscription(subID, nil), nil
+	}
+	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error {
+		t.Error("an unservable subscription must not record devices")
+		return nil
+	}
+	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error {
+		t.Error("an unservable subscription must not record IPs")
+		return nil
+	}
+
+	result, success, total, err := HandleSubscription(ctx, mockDB, svc, "sub-no-builder", "1.2.3.4", nil)
+	assert.Nil(t, result)
+	require.ErrorIs(t, err, ErrBuilderUnavailable)
+	assert.NotErrorIs(t, err, ErrSubscriptionNotFound)
+	assert.Zero(t, success)
+	assert.Zero(t, total)
+
+	_, _, cached := svc.GetCache("sub-no-builder")
+	assert.False(t, cached)
 }
 
 func TestHandleSubscription_Base64Response(t *testing.T) {
@@ -164,14 +214,8 @@ func TestHandleSubscription_Base64Response(t *testing.T) {
 	ctx := context.Background()
 
 	subURL := ts.URL + "/"
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 1, SubscriptionID: "sub-b64", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 1073741824},
-			Nodes: []database.Node{
-				{ID: 1, Name: "test-node", IsActive: true, SubscriptionURL: subURL},
-			},
-		}, nil
+	mockDB.GetSubscriptionWithProviderSourceFunc = func(ctx context.Context, subID string) (*database.Subscription, error) {
+		return providerSourceSub(1, "sub-b64", subURL), nil
 	}
 	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
 	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
@@ -198,14 +242,8 @@ func TestHandleSubscription_PlainResponse(t *testing.T) {
 	svc := newTestSubSvc(t)
 	ctx := context.Background()
 
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 2, SubscriptionID: "sub-plain", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			Nodes: []database.Node{
-				{ID: 1, Name: "node", IsActive: true, SubscriptionURL: ts.URL + "/"},
-			},
-		}, nil
+	mockDB.GetSubscriptionWithProviderSourceFunc = func(ctx context.Context, subID string) (*database.Subscription, error) {
+		return providerSourceSub(2, "sub-plain", ts.URL+"/"), nil
 	}
 	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
 	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
@@ -246,14 +284,8 @@ func TestHandleSubscription_JSONResponse_PureJSON(t *testing.T) {
 	svc := newTestSubSvc(t)
 	ctx := context.Background()
 
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 3, SubscriptionID: "sub-json", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			Nodes: []database.Node{
-				{ID: 1, Name: "json-node", IsActive: true, SubscriptionURL: ts.URL + "/"},
-			},
-		}, nil
+	mockDB.GetSubscriptionWithProviderSourceFunc = func(ctx context.Context, subID string) (*database.Subscription, error) {
+		return providerSourceSub(3, "sub-json", ts.URL+"/"), nil
 	}
 	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
 	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
@@ -262,107 +294,6 @@ func TestHandleSubscription_JSONResponse_PureJSON(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, result.Body)
 	assert.Contains(t, result.Headers["content-type"], "application/json")
-}
-
-func TestHandleSubscription_NoNodesWithSubscriptionURL(t *testing.T) {
-	t.Parallel()
-
-	mockDB := testutil.NewDatabaseService()
-	svc := newTestSubSvc(t)
-	ctx := context.Background()
-
-	// Node has empty SubscriptionURL — should be skipped
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 4, SubscriptionID: "sub-no-url", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			Nodes: []database.Node{
-				{ID: 1, Name: "no-url-node", IsActive: true, SubscriptionURL: ""},
-			},
-		}, nil
-	}
-	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
-	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
-
-	result, _, _, err := HandleSubscription(ctx, mockDB, svc, "sub-no-url", "1.2.3.4", nil)
-	_ = result
-
-	assert.ErrorIs(t, err, ErrNoSubscriptionItems)
-}
-
-func TestHandleSubscription_FetchError_SkipsNode(t *testing.T) {
-	t.Parallel()
-
-	mockDB := testutil.NewDatabaseService()
-	svc := newTestSubSvc(t)
-	ctx := context.Background()
-
-	// Node points to an invalid URL — FetchFromNode will fail
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 5, SubscriptionID: "sub-fetch-err", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			Nodes: []database.Node{
-				{ID: 1, Name: "bad-node", IsActive: true, SubscriptionURL: "http://127.0.0.1:1/"},
-			},
-		}, nil
-	}
-	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
-	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
-
-	result, _, _, err := HandleSubscription(ctx, mockDB, svc, "sub-fetch-err", "1.2.3.4", nil)
-	_ = result
-
-	assert.ErrorIs(t, err, ErrNoSubscriptionItems)
-}
-
-func TestHandleSubscription_MultipleNodes_AggregatesResponses(t *testing.T) {
-	t.Parallel()
-
-	// Two upstream servers returning different share links
-	link1 := "vless://uuid1@server1:443?encryption=none#Node1"
-	link2 := "vless://uuid2@server2:443?encryption=none#Node2"
-
-	ts1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(link1))
-	}))
-	defer ts1.Close()
-
-	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(link2))
-	}))
-	defer ts2.Close()
-
-	mockDB := testutil.NewDatabaseService()
-	svc := newTestSubSvc(t)
-	ctx := context.Background()
-
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 6, SubscriptionID: "sub-multi", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			Nodes: []database.Node{
-				{ID: 1, Name: "node1", IsActive: true, SubscriptionURL: ts1.URL + "/"},
-				{ID: 2, Name: "node2", IsActive: true, SubscriptionURL: ts2.URL + "/"},
-			},
-		}, nil
-	}
-	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
-	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
-
-	result, _, _, err := HandleSubscription(ctx, mockDB, svc, "sub-multi", "1.2.3.4", nil)
-	require.NoError(t, err)
-	assert.NotNil(t, result.Body)
-
-	// Decode base64 body and check both links are present
-	decoded, decErr := base64.StdEncoding.DecodeString(string(result.Body))
-	require.NoError(t, decErr)
-
-	bodyStr := string(decoded)
-	assert.Contains(t, bodyStr, "vless://uuid1@")
-	assert.Contains(t, bodyStr, "vless://uuid2@")
 }
 
 // clashBody is a minimal Clash/Mihomo config used by the priority tests.
@@ -400,14 +331,8 @@ func TestHandleSubscription_ClashOnly_ReturnsBase64Links(t *testing.T) {
 	svc := newTestSubSvc(t)
 	ctx := context.Background()
 
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 7, SubscriptionID: "sub-clash", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			Nodes: []database.Node{
-				{ID: 1, Name: "node1", IsActive: true, SubscriptionURL: ts.URL + "/"},
-			},
-		}, nil
+	mockDB.GetSubscriptionWithProviderSourceFunc = func(ctx context.Context, subID string) (*database.Subscription, error) {
+		return providerSourceSub(7, "sub-clash", ts.URL+"/"), nil
 	}
 	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
 	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
@@ -423,138 +348,6 @@ func TestHandleSubscription_ClashOnly_ReturnsBase64Links(t *testing.T) {
 	assert.False(t, strings.HasPrefix(strings.TrimSpace(string(decoded)), "["),
 		"clash-only must not return a raw serverConfig array")
 	assert.Contains(t, string(decoded), "vless://0970324b-8c61-4ae7-8c3f-385a6f1e17e4@46.101.238.160:443")
-}
-
-// Any Clash node mixed with another format forces the base64/link output.
-func TestHandleSubscription_JSONAndClash_ReturnsBase64(t *testing.T) {
-	t.Parallel()
-
-	tsClash := newClashServer()
-	defer tsClash.Close()
-
-	jsonBody := `[{"type":"vless","address":"9.9.9.9","port":443,"uuid":"aaaaaaaa-8c61-4ae7-8c3f-385a6f1e17e4","remark":"J"}]`
-
-	tsJSON := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(jsonBody))
-	}))
-	defer tsJSON.Close()
-
-	mockDB := testutil.NewDatabaseService()
-	svc := newTestSubSvc(t)
-	ctx := context.Background()
-
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 8, SubscriptionID: "sub-mix", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			Nodes: []database.Node{
-				{ID: 1, Name: "json", IsActive: true, SubscriptionURL: tsJSON.URL + "/"},
-				{ID: 2, Name: "clash", IsActive: true, SubscriptionURL: tsClash.URL + "/"},
-			},
-		}, nil
-	}
-	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
-	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
-
-	result, _, _, err := HandleSubscription(ctx, mockDB, svc, "sub-mix", "1.2.3.4", nil)
-	require.NoError(t, err)
-	require.NotNil(t, result.Body)
-
-	decoded, decErr := base64.StdEncoding.DecodeString(string(result.Body))
-	require.NoError(t, decErr)
-
-	bodyStr := string(decoded)
-	assert.Contains(t, bodyStr, "vless://0970324b-8c61-4ae7-8c3f-385a6f1e17e4@46.101.238.160:443")
-	assert.Contains(t, bodyStr, "vless://aaaaaaaa-8c61-4ae7-8c3f-385a6f1e17e4@9.9.9.9:443")
-}
-
-// Base64 + Clash also forces the base64/link output.
-func TestHandleSubscription_Base64AndClash_ReturnsBase64(t *testing.T) {
-	t.Parallel()
-
-	tsClash := newClashServer()
-	defer tsClash.Close()
-
-	link := "trojan://pass@8.8.8.8:443?security=tls#T"
-
-	tsB64 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString([]byte(link))))
-	}))
-	defer tsB64.Close()
-
-	mockDB := testutil.NewDatabaseService()
-	svc := newTestSubSvc(t)
-	ctx := context.Background()
-
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 9, SubscriptionID: "sub-b64c", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			Nodes: []database.Node{
-				{ID: 1, Name: "b64", IsActive: true, SubscriptionURL: tsB64.URL + "/"},
-				{ID: 2, Name: "clash", IsActive: true, SubscriptionURL: tsClash.URL + "/"},
-			},
-		}, nil
-	}
-	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
-	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
-
-	result, _, _, err := HandleSubscription(ctx, mockDB, svc, "sub-b64c", "1.2.3.4", nil)
-	require.NoError(t, err)
-	require.NotNil(t, result.Body)
-
-	decoded, decErr := base64.StdEncoding.DecodeString(string(result.Body))
-	require.NoError(t, decErr)
-
-	bodyStr := string(decoded)
-	assert.Contains(t, bodyStr, "trojan://pass@8.8.8.8:443")
-	assert.Contains(t, bodyStr, "vless://0970324b-8c61-4ae7-8c3f-385a6f1e17e4@46.101.238.160:443")
-}
-
-func TestHandleSubscription_FetchNode_UsesURLDirectly(t *testing.T) {
-	t.Parallel()
-
-	// Fetch node: the upstream URL is used as-is, without appending subID.
-	// The server verifies it receives the exact URL path (no /sub-xxx suffix).
-	vlessLink := "vless://uuid@fetch-server:443?encryption=none#FetchNode"
-
-	var requestedPath string
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestedPath = r.URL.Path
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(vlessLink))
-	}))
-	defer ts.Close()
-
-	mockDB := testutil.NewDatabaseService()
-	svc := newTestSubSvc(t)
-	ctx := context.Background()
-
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 7, SubscriptionID: "sub-fetch", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			Nodes: []database.Node{
-				{ID: 1, Name: "fetch-node", IsActive: true, Type: database.NodeTypeFetch, SubscriptionURL: ts.URL + "/raw-proxy"},
-			},
-		}, nil
-	}
-	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
-	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
-
-	result, _, _, err := HandleSubscription(ctx, mockDB, svc, "sub-fetch", "1.2.3.4", nil)
-	require.NoError(t, err)
-	assert.NotNil(t, result.Body)
-
-	// Verify the server received the exact URL path, not path + subID
-	assert.Equal(t, "/raw-proxy", requestedPath)
-
-	// Verify the proxy data was returned
-	decoded, decErr := base64.StdEncoding.DecodeString(string(result.Body))
-	require.NoError(t, decErr)
-	assert.Contains(t, string(decoded), "vless://uuid@fetch-server")
 }
 
 // TestHandleSubscription_ParallelCacheMiss_PreservesDevicesAndIPs locks the
@@ -573,8 +366,15 @@ func TestHandleSubscription_ParallelCacheMiss_PreservesDevicesAndIPs(t *testing.
 		ips     = "[]"
 	)
 
+	// The upstream always fails: the response is never cached, so every
+	// request stays on the cache-miss path and runs the analytics update.
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream down", http.StatusBadGateway)
+	}))
+	defer failing.Close()
+
 	mockDB := testutil.NewDatabaseService()
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
+	mockDB.GetSubscriptionWithProviderSourceFunc = func(ctx context.Context, subID string) (*database.Subscription, error) {
 		stateMu.Lock()
 		curDevices, curIPs := devices, ips
 		stateMu.Unlock()
@@ -584,20 +384,10 @@ func TestHandleSubscription_ParallelCacheMiss_PreservesDevicesAndIPs(t *testing.
 		// loses concurrent updates.
 		time.Sleep(10 * time.Millisecond)
 
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{
-				ID:             1,
-				SubscriptionID: subID,
-				Status:         "active",
-				Devices:        curDevices,
-				Ips:            curIPs,
-			},
-			Plan: database.Plan{ID: 1, Name: "test", TrafficLimit: 0},
-			// No node with a subscription_url: fetching yields no items, the
-			// cache is never populated, so every request stays on the
-			// cache-miss path and runs the analytics update.
-			Nodes: []database.Node{{ID: 1, Name: "no-url", IsActive: true, SubscriptionURL: ""}},
-		}, nil
+		sub := providerSourceSub(1, subID, failing.URL)
+		sub.Devices, sub.Ips = curDevices, curIPs
+
+		return sub, nil
 	}
 	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error {
 		stateMu.Lock()
@@ -641,10 +431,10 @@ func TestHandleSubscription_ParallelCacheMiss_PreservesDevicesAndIPs(t *testing.
 	close(start)
 	wg.Wait()
 
-	// Every request runs the analytics path; the fetch yields no items, which
-	// is expected and irrelevant for this test.
+	// Every request runs the analytics path; the failing fetch is expected
+	// and irrelevant for this test.
 	for i, err := range errs {
-		require.ErrorIs(t, err, ErrNoSubscriptionItems, "request %d", i)
+		require.ErrorIs(t, err, ErrProviderSourceUnavailable, "request %d", i)
 	}
 
 	stateMu.Lock()
@@ -684,16 +474,14 @@ func TestUpdateDevices_NewDevice(t *testing.T) {
 		return nil
 	}
 
-	subFull := &database.SubscriptionFull{
-		Subscription: database.Subscription{
-			ID:             1,
-			SubscriptionID: "sub-dev-1",
-			Devices:        "[]",
-		},
+	sub := &database.Subscription{
+		ID:             1,
+		SubscriptionID: "sub-dev-1",
+		Devices:        "[]",
 	}
 
 	headers := map[string]string{"x-hwid": "device-abc"}
-	UpdateDevices(context.Background(), mockDB, subFull, headers)
+	UpdateDevices(context.Background(), mockDB, sub, headers)
 
 	assert.NotEmpty(t, capturedDevices)
 	assert.Contains(t, capturedDevices, "device-abc")
@@ -712,15 +500,13 @@ func TestUpdateDevices_NilHeaders_SkipsDevice(t *testing.T) {
 		return nil
 	}
 
-	subFull := &database.SubscriptionFull{
-		Subscription: database.Subscription{
-			ID:             2,
-			SubscriptionID: "sub-dev-nil",
-			Devices:        "[]",
-		},
+	sub := &database.Subscription{
+		ID:             2,
+		SubscriptionID: "sub-dev-nil",
+		Devices:        "[]",
 	}
 
-	UpdateDevices(context.Background(), mockDB, subFull, nil)
+	UpdateDevices(context.Background(), mockDB, sub, nil)
 	// Devices should still be saved (empty array), since SetDevices is called
 	assert.Equal(t, "[]", capturedDevices)
 }
@@ -739,16 +525,14 @@ func TestUpdateDevices_ReplacesExistingDevice(t *testing.T) {
 
 	// Pre-existing device with same hwid
 	existingDevices := `[{"x-hwid":"device-xyz","user-agent":"old-agent","timestamp":"2025-01-01T00:00:00Z"}]`
-	subFull := &database.SubscriptionFull{
-		Subscription: database.Subscription{
-			ID:             3,
-			SubscriptionID: "sub-dev-replace",
-			Devices:        existingDevices,
-		},
+	sub := &database.Subscription{
+		ID:             3,
+		SubscriptionID: "sub-dev-replace",
+		Devices:        existingDevices,
 	}
 
 	headers := map[string]string{"x-hwid": "device-xyz", "user-agent": "new-agent"}
-	UpdateDevices(context.Background(), mockDB, subFull, headers)
+	UpdateDevices(context.Background(), mockDB, sub, headers)
 
 	assert.Contains(t, capturedDevices, "device-xyz")
 	assert.Contains(t, capturedDevices, "new-agent")
@@ -761,18 +545,16 @@ func TestUpdateIPs_NewIP(t *testing.T) {
 	t.Parallel()
 
 	mockDB := testutil.NewDatabaseService()
-	subFull := &database.SubscriptionFull{
-		Subscription: database.Subscription{
-			ID:             10,
-			SubscriptionID: "sub-ip-1",
-			Ips:            "[]",
-		},
+	sub := &database.Subscription{
+		ID:             10,
+		SubscriptionID: "sub-ip-1",
+		Ips:            "[]",
 	}
 
-	UpdateIPs(context.Background(), mockDB, subFull, "10.0.0.1")
+	UpdateIPs(context.Background(), mockDB, sub, "10.0.0.1")
 
-	// Verify via the side effect on subFull.Subscription.Ips
-	assert.Contains(t, subFull.Subscription.Ips, "10.0.0.1")
+	// Verify via the side effect on sub.Ips
+	assert.Contains(t, sub.Ips, "10.0.0.1")
 }
 
 func TestUpdateIPs_EmptyIP_SkipsEntry(t *testing.T) {
@@ -780,18 +562,16 @@ func TestUpdateIPs_EmptyIP_SkipsEntry(t *testing.T) {
 
 	mockDB := testutil.NewDatabaseService()
 
-	subFull := &database.SubscriptionFull{
-		Subscription: database.Subscription{
-			ID:             11,
-			SubscriptionID: "sub-ip-empty",
-			Ips:            "[]",
-		},
+	sub := &database.Subscription{
+		ID:             11,
+		SubscriptionID: "sub-ip-empty",
+		Ips:            "[]",
 	}
 
-	UpdateIPs(context.Background(), mockDB, subFull, "")
+	UpdateIPs(context.Background(), mockDB, sub, "")
 
 	// Empty IP should not add any entry; Ips stays as empty array
-	assert.Equal(t, "[]", subFull.Subscription.Ips)
+	assert.Equal(t, "[]", sub.Ips)
 }
 
 func TestUpdateIPs_ReplacesExistingIP(t *testing.T) {
@@ -800,20 +580,18 @@ func TestUpdateIPs_ReplacesExistingIP(t *testing.T) {
 	mockDB := testutil.NewDatabaseService()
 
 	existingIPs := `[{"10.0.0.1":"2025-01-01T00:00:00Z"}]`
-	subFull := &database.SubscriptionFull{
-		Subscription: database.Subscription{
-			ID:             12,
-			SubscriptionID: "sub-ip-replace",
-			Ips:            existingIPs,
-		},
+	sub := &database.Subscription{
+		ID:             12,
+		SubscriptionID: "sub-ip-replace",
+		Ips:            existingIPs,
 	}
 
-	UpdateIPs(context.Background(), mockDB, subFull, "10.0.0.1")
+	UpdateIPs(context.Background(), mockDB, sub, "10.0.0.1")
 
 	// The IP entry should be replaced (rotated to end) with a new timestamp
-	assert.Contains(t, subFull.Subscription.Ips, "10.0.0.1")
+	assert.Contains(t, sub.Ips, "10.0.0.1")
 	// Count occurrences of "10.0.0.1" — should be exactly 1
-	assert.Equal(t, 1, strings.Count(subFull.Subscription.Ips, "10.0.0.1"))
+	assert.Equal(t, 1, strings.Count(sub.Ips, "10.0.0.1"))
 }
 
 // ==================== Helper Tests (subscription_helpers.go) ====================
@@ -1092,20 +870,11 @@ func TestHandleSubscription_PaidSubscription_ProfileTitleSuffix(t *testing.T) {
 			mockDB := testutil.NewDatabaseService()
 			svc := newTestSubSvc(t)
 
-			mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-				return &database.SubscriptionFull{
-					Subscription: database.Subscription{
-						ID:             1,
-						SubscriptionID: subID,
-						Status:         "active",
-						ProductID:      tt.product,
-						PricePaidCents: tt.price,
-					},
-					Plan: database.Plan{ID: 1, Name: "premium", TrafficLimit: 0},
-					Nodes: []database.Node{
-						{ID: 1, Name: "node", IsActive: true, SubscriptionURL: ts.URL + "/"},
-					},
-				}, nil
+			mockDB.GetSubscriptionWithProviderSourceFunc = func(ctx context.Context, subID string) (*database.Subscription, error) {
+				sub := providerSourceSub(1, subID, ts.URL+"/")
+				sub.ProductID, sub.PricePaidCents = tt.product, tt.price
+
+				return sub, nil
 			}
 			mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
 			mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }
@@ -1202,11 +971,7 @@ func TestHandleSubscription_CacheHit_UpdatesLastRequest(t *testing.T) {
 	svc := newTestSubSvc(t)
 	ctx := context.Background()
 
-	svc.SetCache("sub-lr-hit", []byte("cached"), map[string]string{"content-type": "text/plain"})
-
-	mockDB.GetSubscriptionStatusFunc = func(ctx context.Context, subID string) (string, time.Time, error) {
-		return "active", time.Now().Add(24 * time.Hour), nil
-	}
+	seedProviderSourceCache(mockDB, svc, "sub-lr-hit", []byte("cached"), map[string]string{"content-type": "text/plain"})
 
 	var calledSubID string
 
@@ -1229,11 +994,8 @@ func TestHandleSubscription_CacheHit_LastRequestError_DoesNotBlockResponse(t *te
 	svc := newTestSubSvc(t)
 	ctx := context.Background()
 
-	svc.SetCache("sub-lr-err", []byte("cached"), map[string]string{"content-type": "text/plain"})
+	seedProviderSourceCache(mockDB, svc, "sub-lr-err", []byte("cached"), map[string]string{"content-type": "text/plain"})
 
-	mockDB.GetSubscriptionStatusFunc = func(ctx context.Context, subID string) (string, time.Time, error) {
-		return "active", time.Now().Add(24 * time.Hour), nil
-	}
 	mockDB.UpdateLastRequestFunc = func(ctx context.Context, subscriptionID string) error {
 		return fmt.Errorf("db error")
 	}
@@ -1261,14 +1023,8 @@ func TestHandleSubscription_CacheMiss_UpdatesLastRequest(t *testing.T) {
 	ctx := context.Background()
 
 	subURL := ts.URL + "/"
-	mockDB.GetWithPlanAndNodesFunc = func(ctx context.Context, subID string) (*database.SubscriptionFull, error) {
-		return &database.SubscriptionFull{
-			Subscription: database.Subscription{ID: 1, SubscriptionID: "sub-lr-miss", Status: "active"},
-			Plan:         database.Plan{ID: 1, Name: "test", TrafficLimit: 1073741824},
-			Nodes: []database.Node{
-				{ID: 1, Name: "test-node", IsActive: true, SubscriptionURL: subURL},
-			},
-		}, nil
+	mockDB.GetSubscriptionWithProviderSourceFunc = func(ctx context.Context, subID string) (*database.Subscription, error) {
+		return providerSourceSub(1, "sub-lr-miss", subURL), nil
 	}
 	mockDB.UpdateDevicesFunc = func(ctx context.Context, id uint, devicesJSON string) error { return nil }
 	mockDB.UpdateIPsFunc = func(ctx context.Context, id uint, ipsJSON string) error { return nil }

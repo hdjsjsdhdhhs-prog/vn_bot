@@ -51,7 +51,10 @@ func NewService(dbPath string) (*Service, error) {
 
 	db, err := gorm.Open(gormsqlite.Open(dbPath), &gorm.Config{
 		PrepareStmt: false,
-		Logger:      gormlogger.New(log.New(io.Discard, "", 0), gormlogger.Config{SlowThreshold: 200 * time.Millisecond, LogLevel: gormlogger.Silent}),
+		// SQLite stores timestamps as text and compares them lexically, so
+		// every stored value and every query bound must share one zone: UTC.
+		NowFunc: func() time.Time { return time.Now().UTC() },
+		Logger:  gormlogger.New(log.New(io.Discard, "", 0), gormlogger.Config{SlowThreshold: 200 * time.Millisecond, LogLevel: gormlogger.Silent}),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -89,20 +92,12 @@ func NewService(dbPath string) (*Service, error) {
 
 	if count == 0 {
 		err = db.WithContext(context.Background()).Transaction(func(tx *gorm.DB) error {
-			planErr := tx.Create(&Plan{
-				Name:         TrialPlanName,
-				DevicesLimit: 1,
-				TrafficLimit: 1073741824,
-			}).Error
+			planErr := tx.Create(&Plan{Name: TrialPlanName}).Error
 			if planErr != nil {
 				return fmt.Errorf("failed to seed default trial plan: %w", planErr)
 			}
 
-			planErr = tx.Create(&Plan{
-				Name:         FreePlanName,
-				DevicesLimit: 1,
-				TrafficLimit: 53687091200,
-			}).Error
+			planErr = tx.Create(&Plan{Name: FreePlanName}).Error
 			if planErr != nil {
 				return fmt.Errorf("failed to seed default free plan: %w", planErr)
 			}

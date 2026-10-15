@@ -456,8 +456,6 @@ func TestAdminSubscriptionDetailAndAuditPaging(t *testing.T) {
 	future := time.Now().UTC().Add(time.Hour)
 	svc, sub := adminFixture(t, "active", &future)
 	ctx := context.Background()
-	node := createTestNode(t, svc, "node-a", "https://node-a", "token")
-	require.NoError(t, svc.UpsertSubscriptionNode(ctx, &SubscriptionNode{SubscriptionID: sub.ID, NodeID: node.ID, Status: SyncStatusPendingAdd}))
 	for i := range 3 {
 		_, err := svc.AdminMutateSubscription(ctx, adminMutation(sub, AdminActionRenew, fmt.Sprintf("k-%d", i)))
 		require.NoError(t, err)
@@ -468,9 +466,6 @@ func TestAdminSubscriptionDetailAndAuditPaging(t *testing.T) {
 	assert.Equal(t, sub.ID, detail.Subscription.ID)
 	require.NotNil(t, detail.Plan)
 	assert.Equal(t, FreePlanName, detail.Plan.Name)
-	require.Len(t, detail.Nodes, 1)
-	assert.Equal(t, "node-a", detail.Nodes[0].NodeName)
-	assert.Equal(t, SyncStatusPendingAdd, detail.Nodes[0].Status)
 	require.Len(t, detail.Audit, 2, "audit limit is honoured")
 	assert.Greater(t, detail.Audit[0].ID, detail.Audit[1].ID)
 

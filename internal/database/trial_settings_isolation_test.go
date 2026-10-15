@@ -65,7 +65,7 @@ func TestTrial_MutationsLeavePaidTariffsAndSubscriptionsUntouched(t *testing.T) 
 	require.NoError(t, f.svc.SetBuilderSources(f.ctx, paidBuilder.ID, []uint{f.b.ID}))
 	_, err := f.svc.UpsertBuilderItem(f.ctx, SubscriptionBuilderItem{BuilderID: paidBuilder.ID, Kind: BuilderItemKindCountry, SourceID: f.b.ID, CountryCode: "JP", Enabled: true})
 	require.NoError(t, err)
-	paid := &Plan{Name: "paid-" + t.Name(), IsActive: true, DevicesLimit: 3}
+	paid := &Plan{Name: "paid-" + t.Name(), IsActive: true}
 	require.NoError(t, db.Create(paid).Error)
 	setRuntimePlanBuilder(t, f.svc, paid.ID, &paidBuilder.ID)
 	_, err = f.svc.CreateTariff(f.ctx, trialMeta(), TariffInput{

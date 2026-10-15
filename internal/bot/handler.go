@@ -329,7 +329,7 @@ func (h *Handler) createSubscription(ctx context.Context, chatID int64, username
 
 // handleCreateError handles errors during subscription creation.
 func (h *Handler) handleCreateError(ctx context.Context, chatID int64, messageID int, username string, err error) {
-	h.getSubHandler().handleCreateError(ctx, chatID, messageID, username, err)
+	h.getSubHandler().handleCreateError(chatID, messageID, err)
 }
 
 // Referral delegates
@@ -452,9 +452,9 @@ func (h *Handler) isFreePlanSubscription(ctx context.Context, sub *database.Subs
 }
 
 // getHelpText returns the detailed setup help text.
-func (h *Handler) getHelpText(trafficLimit int, subscriptionURL string) string {
+func (h *Handler) getHelpText(subscriptionURL string) string {
 	// Use the detailed help from KeyboardBuilder which includes setup instructions.
-	return h.keyboards.HelpText(trafficLimit, subscriptionURL)
+	return h.keyboards.HelpText(subscriptionURL)
 }
 
 // getDonateText returns the donate info text.

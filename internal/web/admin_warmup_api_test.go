@@ -38,7 +38,7 @@ func newWarmupAPIFixture(t *testing.T, withWarmup bool) *warmupAPIFixture {
 	require.NoError(t, err)
 	cfg := &config.Config{AdminUsername: "admin", AdminPasswordHash: string(hash), SiteURL: "https://admin.example.com"}
 	s := NewServer("127.0.0.1:0", nil, cfg, "", nil, nil)
-	s.SetAdminService(service.NewAdminService(base.db, nil, nil))
+	s.SetAdminService(service.NewAdminService(base.db, nil))
 	if withWarmup {
 		s.SetWarmupService(service.NewWarmupService(base.db, database.TrialDefaults{DurationHours: 72, RateLimitPerHour: 3}))
 	}

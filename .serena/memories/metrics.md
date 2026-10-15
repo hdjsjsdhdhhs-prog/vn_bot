@@ -1,3 +1,5 @@
+> **Внимание:** записи ниже о панелях 3x-ui/proxman, узлах (`nodes`, `subscription_nodes`), синхронизации, `internal/vpn`, `internal/xui` и панельных уведомлениях трафика — **исторические**: подсистема удалена миграцией `051_remove_legacy_nodes`. Актуальная модель: подписка — локальное состояние, содержимое `/sub` собирает Subscription Builder из ProviderSource (см. `doc/architecture.md`).
+
 # Метрики Prometheus — текущее состояние
 
 ## Обновлённые/оживлённые метрики
@@ -19,10 +21,8 @@
 - `subserver_partial_sources_total{sub_id}` — deprecated, опасная cardinality.
 - `trial_conversions_total` — удалена, нет явного trial→paid флоу.
 
-## Живые метрики XUI
-
-- `xui_requests_total{operation,result}` — счётчик XUI-запросов, инкрементируется в `internal/xui/client.go`.
-- `xui_request_duration_seconds{operation}` — длительность XUI-запросов, инкрементируется в `internal/xui/client.go`.
+## Метрики XUI — удалены
+`xui_requests_total` и `xui_request_duration_seconds` удалены миграцией 051 вместе с пакетом `internal/xui` (историческая справка).
 
 ## Важно
 

@@ -22,7 +22,7 @@ import (
 )
 
 // fetchHTTPClient is a shared HTTP client for fetching subscription responses
-// from upstream nodes (3x-ui JSON, Clash YAML, base64, plain links). It limits
+// from upstream provider sources (JSON, Clash YAML, base64, plain links). It limits
 // idle connections (2 per host) and keeps transparent gzip decompression
 // enabled (DisableCompression is false), so resp.Body is the decompressed
 // content that DetectFormat and the parsers consume directly.
@@ -38,93 +38,11 @@ var fetchHTTPClient = &http.Client{
 
 const defaultSourceUserAgent = "RS8 KVN Subserver"
 
-// NodeResponse holds the body and headers returned by an upstream node's
-// subscription endpoint (3x-ui JSON, Clash YAML, base64, plain links).
+// NodeResponse holds the body and headers returned by an upstream provider
+// source's subscription endpoint (JSON, Clash YAML, base64, plain links).
 type NodeResponse struct {
 	Body    []byte
 	Headers map[string]string
-}
-
-// FetchFromNode sends an HTTP GET to url with a custom User-Agent and returns
-// the response body (up to config.MaxResponseSize) together with all response headers stored
-// under lowercased keys. Header values are taken from the first value for each key.
-// Non-2xx responses are treated as fetch errors so upstream failures are never
-// aggregated into a subscription.
-func FetchFromNode(ctx context.Context, url string) (*NodeResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		logger.Error("Failed to create HTTP request for source fetch",
-			zap.String("url", logger.SafeURL(url)),
-			logger.SafeError(err, url))
-
-		return nil, fmt.Errorf("create source fetch request: %w", err)
-	}
-
-	req.Header.Set("User-Agent", defaultSourceUserAgent)
-
-	resp, err := fetchHTTPClient.Do(req)
-	if err != nil {
-		logger.Error("Source fetch request failed",
-			zap.String("url", logger.SafeURL(url)),
-			logger.SafeError(err, url))
-
-		return nil, fmt.Errorf("execute source fetch request: %w", err)
-	}
-
-	if resp == nil || resp.Body == nil {
-		logger.Error("Source fetch returned no response body",
-			zap.String("url", logger.SafeURL(url)))
-
-		return nil, fmt.Errorf("source fetch returned no body: %s", url)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_ = resp.Body.Close()
-		logger.Error("Source fetch returned non-2xx status",
-			zap.String("url", logger.SafeURL(url)),
-			zap.Int("status", resp.StatusCode))
-
-		return nil, fmt.Errorf("source fetch %s returned status %d", url, resp.StatusCode)
-	}
-
-	defer func() {
-		closeErr := resp.Body.Close()
-		if closeErr != nil {
-			logger.Error("Failed to close source response body",
-				zap.String("url", logger.SafeURL(url)),
-				logger.SafeError(closeErr, url))
-		}
-	}()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseSize+1))
-	if err != nil {
-		logger.Error("Failed to read source response body",
-			zap.String("url", logger.SafeURL(url)),
-			logger.SafeError(err, url))
-
-		return nil, fmt.Errorf("read source response body: %w", err)
-	}
-
-	if len(body) > config.MaxResponseSize {
-		logger.Error("Source response body exceeds size limit",
-			zap.String("url", logger.SafeURL(url)),
-			zap.Int("limit", config.MaxResponseSize))
-
-		return nil, fmt.Errorf("source response body exceeds %d bytes", config.MaxResponseSize)
-	}
-
-	headers := make(map[string]string)
-
-	for key, values := range resp.Header {
-		if len(values) > 0 {
-			headers[strings.ToLower(key)] = values[0]
-		}
-	}
-
-	return &NodeResponse{
-		Body:    body,
-		Headers: headers,
-	}, nil
 }
 
 // FetchFromProviderSource fetches a read-only upstream subscription using only
@@ -148,7 +66,7 @@ const (
 	fetchFailUnreachable    = "unreachable"
 	fetchFailReadError      = "read_error"
 	fetchFailTooLarge       = "too_large"
-	fetchFailCredentialEcho = "credential_echo"
+	fetchFailCredentialEcho = "credential_echo" // #nosec G101 -- failure code label, not a credential
 )
 
 // fetchProviderSource performs the provider source request. On failure it

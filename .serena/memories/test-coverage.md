@@ -1,3 +1,5 @@
+> **Внимание:** записи ниже о панелях 3x-ui/proxman, узлах (`nodes`, `subscription_nodes`), синхронизации, `internal/vpn`, `internal/xui` и панельных уведомлениях трафика — **исторические**: подсистема удалена миграцией `051_remove_legacy_nodes`. Актуальная модель: подписка — локальное состояние, содержимое `/sub` собирает Subscription Builder из ProviderSource (см. `doc/architecture.md`).
+
 # Test Coverage Analysis — rs8kvn_bot
 
 **Последняя проверка:** 2026-08-21
@@ -13,7 +15,6 @@
 | internal/flag | ~97% | 🟢 |
 | internal/heartbeat | ~92% | 🟢 |
 | internal/ratelimiter | ~90% | 🟢 |
-| internal/xui | ~85% | 🟢 |
 | internal/bot | ~82% | 🟢 |
 | internal/scheduler | ~80% | 🟢 |
 | internal/web | ~78% | 🟡 |
@@ -28,9 +29,7 @@
 | internal/testutil | 0% | ⚪ (ожидаемо) |
 
 ## Файлы с низким покрытием
-- internal/database/subscription_nodes.go — частично покрыт sync.go тестами
 - internal/service/sync.go — ~50% (нужны тесты на ReconcilePlanNodes, handleSyncError)
-- internal/vpn/client.go — ~65% (ThreeXUIClient, classify errors)
 - internal/utils/markdown.go — EscapeMarkdown
 
 ## Приоритеты улучшения
@@ -40,7 +39,6 @@
 2. vpn/client.go — classify ошибок, retryUnavailableNode
 
 ### P2 — Среднее
-3. database/subscription_nodes.go — UpsertSubscriptionNode, GetPendingSync edge cases
 4. database/trials.go — BindTrialSubscription race-condition flows
 
 ### P3 — Низкое

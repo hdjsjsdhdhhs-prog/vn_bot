@@ -2,7 +2,6 @@ package database
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -29,7 +28,7 @@ type trialFixture struct {
 }
 
 // newTrialFixture: two sources with a catalogue (A: DE×2, NL, one node without
-// country; B: DE, JP), a builder linked to both, a trial node.
+// country; B: DE, JP), a builder linked to both.
 func newTrialFixture(t *testing.T) *trialFixture {
 	t.Helper()
 	svc := newTestService(t)
@@ -48,7 +47,6 @@ func newTrialFixture(t *testing.T) *trialFixture {
 	require.NoError(t, err)
 	f.builder = newRuntimeTestBuilder(t, svc, "trial-builder-"+t.Name(), true)
 	require.NoError(t, svc.SetBuilderSources(ctx, f.builder.ID, []uint{f.a.ID, f.b.ID}))
-	createTestNode(t, svc, "trial-node", "trial.example", "token")
 	f.plan, err = svc.GetPlanByName(ctx, TrialPlanName)
 	require.NoError(t, err)
 	return f
@@ -102,20 +100,18 @@ func TestTrial_DefaultsWithoutStoredSettings(t *testing.T) {
 	assert.False(t, eff.Stored)
 	assert.Zero(t, eff.Version)
 
-	// Legacy serving (no builder) still needs the trial node CreateTrial uses.
+	// The trial is served only by the trial plan builder: without one it
+	// cannot be issued.
 	_, err = svc.CheckTrialIssuance(ctx, trialTestDefaults)
 	require.ErrorIs(t, err, ErrTrialUnavailable)
-	createTestNode(t, svc, "legacy", "legacy.example", "token")
-	issuance, err := svc.CheckTrialIssuance(ctx, trialTestDefaults)
-	require.NoError(t, err)
-	assert.Equal(t, TrialServeLegacy, issuance.Preview.Serve)
+	assert.ErrorContains(t, err, "builder_required")
 }
 
 func TestTrial_SaveDurationEnableAndVersioning(t *testing.T) {
 	t.Parallel()
 	f := newTrialFixture(t)
 
-	d := f.draft(nil, nil)
+	d := f.draft(uptr(f.builder.ID), nil)
 	d.DurationHours, d.Title, d.Features, d.Badge = 24, "Пробный доступ", []string{"Без карты"}, "Бесплатно"
 	res, err := f.save(t, 0, d)
 	require.NoError(t, err)
@@ -446,132 +442,33 @@ func TestTrial_ExpiryUsesExpiresAt(t *testing.T) {
 	assert.Equal(t, "exp-sub", claimed[0].SubscriptionID)
 }
 
-func trialPlanLinks(t *testing.T, svc *Service, planName string) []uint {
-	t.Helper()
-	plan, err := svc.GetPlanByName(context.Background(), planName)
-	require.NoError(t, err)
-	ids, err := trialPlanNodeIDs(svc.db, plan.ID)
-	require.NoError(t, err)
-	return ids
-}
-
-func uids(v ...uint) *[]uint { return &v }
-
-func TestTrial_LegacyNodesViewPreviewAndSave(t *testing.T) {
+// TestTrial_ExpiryIgnoresWriterTimeZone guards the UTC storage invariant:
+// SQLite compares text timestamps lexically, so times written in a non-UTC
+// zone (+03:00 here, independent of the host zone) must still order correctly
+// against the UTC bounds of the expiry queries.
+func TestTrial_ExpiryIgnoresWriterTimeZone(t *testing.T) {
 	t.Parallel()
 	f := newTrialFixture(t)
-	original := trialPlanLinks(t, f.svc, TrialPlanName) // the fixture's trial-node, linked to every plan
-	require.Len(t, original, 1)
-	spare := Node{Name: "spare-fetch", IsActive: true, Type: NodeTypeFetch, Host: "spare-secret.example", APIToken: "spare-secret-token", InboundIDs: "[]"}
-	require.NoError(t, f.svc.CreateNode(f.ctx, &spare))
-	off := Node{Name: "off-panel", IsActive: true, Type: NodeType3xUI, Host: "off-secret.example", APIToken: "off-secret-token", InboundIDs: "[1]"}
-	require.NoError(t, f.svc.CreateNode(f.ctx, &off))
-	require.NoError(t, f.svc.db.Model(&Node{}).Where("id = ?", off.ID).UpdateColumn("is_active", false).Error)
-	paid := &Plan{Name: "paid-" + t.Name(), IsActive: true}
-	require.NoError(t, f.svc.db.Create(paid).Error)
-	require.NoError(t, f.svc.db.Create(&PlanNode{PlanID: paid.ID, NodeID: spare.ID}).Error)
-	freeBefore := trialPlanLinks(t, f.svc, FreePlanName)
+	msk := time.FixedZone("MSK", 3*60*60)
+	now := time.Now().In(msk)
 
-	// The view lists every node with its link, never host or credentials.
-	view, err := f.svc.GetTrialAdminView(f.ctx, trialTestDefaults)
-	require.NoError(t, err)
-	assert.Equal(t, []TrialLegacyNode{
-		{ID: original[0], Name: "trial-node", Type: NodeType3xUI, IsActive: true, Linked: true},
-		{ID: spare.ID, Name: "spare-fetch", Type: NodeTypeFetch, IsActive: true, Linked: false},
-		{ID: off.ID, Name: "off-panel", Type: NodeType3xUI, IsActive: false, Linked: false},
-	}, view.LegacyNodes)
-	wire, err := json.Marshal(view)
-	require.NoError(t, err)
-	for _, secret := range []string{"secret", "trial.example", "token\""} {
-		assert.NotContains(t, string(wire), secret)
+	expiredTrial := &Subscription{TelegramID: -771101, ClientID: "msk-exp-client", SubscriptionID: "msk-exp-sub", PlanID: f.plan.ID,
+		Status: "active", ExpiresAt: ptrTime(now.Add(-time.Hour)), CreatedAt: now.Add(-2 * time.Hour)}
+	validTrial := &Subscription{TelegramID: -771102, ClientID: "msk-valid-client", SubscriptionID: "msk-valid-sub", PlanID: f.plan.ID,
+		Status: "active", ExpiresAt: ptrTime(now.Add(time.Hour)), CreatedAt: now.Add(-30 * time.Minute)}
+	expiredSub := &Subscription{TelegramID: 771103, ClientID: "msk-paid-client", SubscriptionID: "msk-paid-sub", PlanID: f.plan.ID,
+		Status: "active", ExpiresAt: ptrTime(now.Add(-time.Hour))}
+	for _, sub := range []*Subscription{expiredTrial, validTrial, expiredSub} {
+		require.NoError(t, f.svc.db.Create(sub).Error)
 	}
 
-	// The preview counts the chosen nodes; nothing is written.
-	none, err := f.svc.PreviewTrial(f.ctx, TrialDraft{Enabled: true, DurationHours: 6, RateLimitPerHour: 5, LegacyNodeIDs: uids()})
+	claimed, err := f.svc.ClaimExpiredTrials(f.ctx, 3)
 	require.NoError(t, err)
-	assert.False(t, none.Issuable)
-	assert.Equal(t, []TrialProblem{{Field: "legacy_nodes", Code: "no_trial_node", Severity: TrialProblemUnavailable}}, none.Problems)
-	chosen, err := f.svc.PreviewTrial(f.ctx, TrialDraft{Enabled: true, DurationHours: 6, RateLimitPerHour: 5, LegacyNodeIDs: uids(spare.ID)})
-	require.NoError(t, err)
-	assert.True(t, chosen.Issuable, "%+v", chosen.Problems)
-	assert.Equal(t, 1, chosen.LegacyNodes)
-	assert.Equal(t, original, trialPlanLinks(t, f.svc, TrialPlanName), "a preview never writes")
+	require.Len(t, claimed, 1)
+	assert.Equal(t, "msk-exp-sub", claimed[0].SubscriptionID)
 
-	// Invalid choices are rejected and write nothing.
-	for _, tc := range []struct {
-		ids    *[]uint
-		reason string
-	}{
-		{uids(off.ID), "legacy_node_inactive"},
-		{uids(987654), "legacy_node_not_found"},
-		{uids(spare.ID, spare.ID), "duplicate"},
-		{uids(0), "duplicate"},
-	} {
-		d := f.draft(nil, nil)
-		d.LegacyNodeIDs = tc.ids
-		_, err := f.save(t, 0, d)
-		assert.Equal(t, tc.reason, trialReason(t, err))
-	}
-	assert.Equal(t, original, trialPlanLinks(t, f.svc, TrialPlanName))
-
-	// Saving replaces the trial plan links only, with audit and version.
-	d := f.draft(nil, nil)
-	d.LegacyNodeIDs = uids(spare.ID)
-	res, err := f.save(t, 0, d)
-	require.NoError(t, err)
-	assert.Equal(t, string(AdminActionTrialUpdated), res.Audit.Action)
-	assert.Contains(t, res.Audit.OldValue, fmt.Sprintf(`"legacy_node_ids":[%d]`, original[0]))
-	assert.Contains(t, res.Audit.NewValue, fmt.Sprintf(`"legacy_node_ids":[%d]`, spare.ID))
-	assert.Equal(t, []uint{spare.ID}, trialPlanLinks(t, f.svc, TrialPlanName))
-	assert.Equal(t, freeBefore, trialPlanLinks(t, f.svc, FreePlanName), "other plans keep their links")
-	assert.Equal(t, []uint{spare.ID}, trialPlanLinks(t, f.svc, paid.Name))
-	nodes, err := f.svc.GetNodesByPlanName(f.ctx, TrialPlanName)
-	require.NoError(t, err)
-	require.Len(t, nodes, 1)
-	assert.Equal(t, "spare-fetch", nodes[0].Name, "CreateTrial issues onto the chosen node")
-	issuance, err := f.svc.CheckTrialIssuance(f.ctx, trialTestDefaults)
-	require.NoError(t, err)
-	assert.Equal(t, 1, issuance.Preview.LegacyNodes)
-
-	// A stale version is a conflict and keeps the links.
-	d.LegacyNodeIDs = uids(original[0])
-	_, err = f.save(t, 0, d)
-	require.ErrorIs(t, err, ErrTrialVersionConflict)
-	assert.Equal(t, []uint{spare.ID}, trialPlanLinks(t, f.svc, TrialPlanName))
-
-	// nil keeps the links.
-	d.LegacyNodeIDs = nil
-	d.DurationHours = 12
-	_, err = f.save(t, 1, d)
-	require.NoError(t, err)
-	assert.Equal(t, []uint{spare.ID}, trialPlanLinks(t, f.svc, TrialPlanName))
-
-	// No node: an enabled trial is refused, a switched-off one may be saved.
-	d.LegacyNodeIDs = uids()
-	_, err = f.save(t, 2, d)
-	assert.Equal(t, "no_trial_node", trialReason(t, err))
-	d.Enabled = false
-	_, err = f.save(t, 2, d)
-	require.NoError(t, err)
-	assert.Empty(t, trialPlanLinks(t, f.svc, TrialPlanName))
-	assert.Equal(t, []uint{spare.ID}, trialPlanLinks(t, f.svc, paid.Name))
-}
-
-// Stored links to a disabled node do not count: CreateTrial cannot use it.
-func TestTrial_DisabledLinkedNodeIsNotAnIssuanceNode(t *testing.T) {
-	t.Parallel()
-	f := newTrialFixture(t)
-	linked := trialPlanLinks(t, f.svc, TrialPlanName)
-	require.Len(t, linked, 1)
-	require.NoError(t, f.svc.db.Model(&Node{}).Where("id = ?", linked[0]).UpdateColumn("is_active", false).Error)
-
-	_, err := f.svc.CheckTrialIssuance(f.ctx, trialTestDefaults)
-	require.ErrorIs(t, err, ErrTrialUnavailable)
-	assert.ErrorContains(t, err, "no_trial_node")
-	view, err := f.svc.GetTrialAdminView(f.ctx, trialTestDefaults)
-	require.NoError(t, err)
-	require.Len(t, view.LegacyNodes, 1)
-	assert.Equal(t, TrialLegacyNode{ID: linked[0], Name: "trial-node", Type: NodeType3xUI, IsActive: false, Linked: true}, view.LegacyNodes[0])
+	_, err = f.svc.GetSubscriptionWithProviderSource(f.ctx, "msk-paid-sub")
+	require.ErrorIs(t, err, ErrSubscriptionNotFound, "a subscription expired an hour ago must not be served")
 }
 
 func TestTrial_PaidPlanAndSubscriptionsUnaffected(t *testing.T) {

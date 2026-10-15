@@ -139,7 +139,7 @@ func TestAdminLiveSmokeServer(t *testing.T) {
 	// front of the plain server, exactly like production TLS termination.
 	const internalAddr = "127.0.0.1:18182"
 	s := NewServer(internalAddr, db, cfg, "", nil, subSrv)
-	s.SetAdminService(service.NewAdminService(db, nil, nil))
+	s.SetAdminService(service.NewAdminService(db, nil))
 	s.SetBuilderService(builders)
 	require.NoError(t, s.Start(ctx))
 	t.Cleanup(func() {

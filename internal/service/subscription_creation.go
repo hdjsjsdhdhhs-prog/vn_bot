@@ -14,7 +14,7 @@ import (
 
 // CustomerSubscriptionTerms opts Create into the finite ProviderSource-backed
 // customer lifecycle. All fields are required. Source selection is explicit:
-// no default, first-row selection, or fallback to legacy plan nodes.
+// no default, first-row selection, or fallback.
 // ExpiresAt is an absolute instant, normalized to UTC, not a local calendar date.
 // This grants access without recording a purchase or charging the customer.
 type CustomerSubscriptionTerms struct {
@@ -42,8 +42,8 @@ func (s *SubscriptionService) createCustomer(ctx context.Context, telegramID int
 	}
 	expiry := terms.ExpiresAt.UTC()
 	// No get-or-renew here: the unique telegram_id constraint arbitrates
-	// concurrent creation, including races against the legacy/trial paths.
-	return s.createNewSubscription(ctx, telegramID, XUIEmail(username, telegramID), inviteCode, plan.ID, &terms.ProviderSourceID, &expiry, &now)
+	// concurrent creation, including races against the free/trial paths.
+	return s.createNewSubscription(ctx, telegramID, SubscriptionUsername(username, telegramID), inviteCode, plan.ID, &terms.ProviderSourceID, &expiry, &now)
 }
 
 // validatePublicSubscriptionURL fails before creation/renewal persistence if a
@@ -78,14 +78,7 @@ func (s *SubscriptionService) createNewSubscription(ctx context.Context, telegra
 	if err := s.db.CreateSubscription(ctx, sub, inviteCode); err != nil {
 		return nil, fmt.Errorf("create subscription: %w", err)
 	}
-	if err := s.ensureSubscriptionNodes(ctx, sub); err != nil {
-		return nil, fmt.Errorf("ensure subscription nodes: %w", err)
-	}
-	referrerID := int64(0)
-	if sub.ReferredBy != nil {
-		referrerID = *sub.ReferredBy
-	}
 	metrics.SubscriptionCreatesTotal.Inc()
 	s.RefreshActiveSubscriptionsMetric(ctx)
-	return &CreateResult{Subscription: sub, SubscriptionURL: s.cfg.SubURL(sub.Token), ReferrerTGID: referrerID}, nil
+	return &CreateResult{Subscription: sub, SubscriptionURL: s.cfg.SubURL(sub.Token), ReferrerTGID: referrerOf(sub)}, nil
 }

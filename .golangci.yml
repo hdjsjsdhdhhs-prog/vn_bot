@@ -123,11 +123,6 @@ linters:
         linters:
           - gosec
         text: "G404"
-      # internal/xui/client.go: gosec G404 for math/rand jitter
-      - path: internal/xui/client\.go
-        linters:
-          - gosec
-        text: "G404"
       # internal/flag/flag.go: inamedparam - interface from standard flag package
       - path: internal/flag/flag\.go
         linters:

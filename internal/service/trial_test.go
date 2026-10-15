@@ -8,10 +8,7 @@ import (
 
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/testutil"
-	"github.com/kereal/rs8kvn_bot/internal/vpn"
-	"github.com/kereal/rs8kvn_bot/internal/xui"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,10 +32,9 @@ func (f *fakeTrialPolicy) CheckTrialIssuance(_ context.Context, d database.Trial
 }
 
 type trialServiceFixture struct {
-	svc      *SubscriptionService
-	xuiCalls int
-	expiry   time.Time
-	created  int
+	svc     *SubscriptionService
+	expiry  time.Time
+	created int
 }
 
 func newTrialServiceFixture(t *testing.T, policy TrialPolicy) *trialServiceFixture {
@@ -47,7 +43,7 @@ func newTrialServiceFixture(t *testing.T, policy TrialPolicy) *trialServiceFixtu
 	cfg := &config.Config{TrialDurationHours: 3, TrialRateLimit: 3}
 	db := &testutil.DatabaseService{
 		GetPlanByNameFunc: func(_ context.Context, name string) (*database.Plan, error) {
-			return &database.Plan{ID: 1, Name: name, TrafficLimit: 1 << 30}, nil
+			return &database.Plan{ID: 1, Name: name}, nil
 		},
 		CreateTrialSubscriptionFunc: func(_ context.Context, _, subID, clientID string, expiry time.Time) (*database.Subscription, error) {
 			f.created++
@@ -56,15 +52,7 @@ func newTrialServiceFixture(t *testing.T, policy TrialPolicy) *trialServiceFixtu
 				Token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}, nil
 		},
 	}
-	xuiClient := &testutil.XUIClient{
-		AddClientWithIDFunc: func(_ context.Context, req xui.ClientRequest) (*xui.ClientConfig, error) {
-			f.xuiCalls++
-			return &xui.ClientConfig{ID: req.ClientID, SubID: req.SubID}, nil
-		},
-	}
-	nodes := []database.Node{{ID: 1, IsActive: true, Host: "http://localhost:2053", InboundIDs: "[1]"}}
-	f.svc = NewSubscriptionService(db, map[uint]interfaces.XUIClient{1: xuiClient},
-		map[uint]vpn.Client{1: vpn.NewThreeXUIClient(xuiClient, []int{1})}, nodes, cfg)
+	f.svc = NewSubscriptionService(db, cfg)
 	if policy != nil {
 		f.svc.SetTrialPolicy(policy)
 	}
@@ -104,7 +92,6 @@ func TestCreateTrial_DisabledOrUnavailableIssuesNothing(t *testing.T) {
 		result, err := f.svc.CreateTrial(context.Background(), "invite")
 		require.ErrorIs(t, err, issueErr)
 		assert.Nil(t, result)
-		assert.Zero(t, f.xuiCalls, "no panel client for %v", issueErr)
 		assert.Zero(t, f.created, "no subscription row for %v", issueErr)
 	}
 }

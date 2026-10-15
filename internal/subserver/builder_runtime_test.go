@@ -89,7 +89,6 @@ func nodeItem(sourceID uint, fingerprint, originalName string, custom *string, p
 func strPtr(s string) *string { return &s }
 
 // builderTestDB wires a mock repository that serves builderFn() for subID.
-// Legacy plan-node loading fails the test: builder subscriptions never use it.
 func builderTestDB(t *testing.T, sub *database.Subscription, builderFn func() *database.SubscriptionBuilder) *testutil.DatabaseService {
 	t.Helper()
 
@@ -104,10 +103,6 @@ func builderTestDB(t *testing.T, sub *database.Subscription, builderFn func() *d
 			return nil, nil
 		}
 		return &database.ResolvedBuilder{Builder: *b, Selection: database.BuilderSelectionSubscription}, nil
-	}
-	db.GetWithPlanAndNodesFunc = func(context.Context, string) (*database.SubscriptionFull, error) {
-		t.Error("builder subscription must not load legacy plan nodes")
-		return nil, errors.New("unexpected legacy path")
 	}
 
 	return db
@@ -141,10 +136,10 @@ func headerValue(headers map[string]string, key string) string {
 }
 
 // ---------------------------------------------------------------------------
-// selection priority / legacy
+// selection priority
 // ---------------------------------------------------------------------------
 
-func TestBuilder_OverridesProviderSourceAndLegacyPipeline(t *testing.T) {
+func TestBuilder_OverridesProviderSource(t *testing.T) {
 	t.Parallel()
 
 	provider := newBuilderTestUpstream(t, http.StatusOK, nil, testLink("p", "provider.example", "Provider"))
@@ -163,33 +158,26 @@ func TestBuilder_OverridesProviderSourceAndLegacyPipeline(t *testing.T) {
 	assert.Zero(t, provider.hits.Load(), "linked ProviderSource must not be fetched when a builder is selected")
 }
 
-func TestBuilder_NoBuilderKeepsLegacyAndProviderPipelines(t *testing.T) {
+func TestBuilder_NoBuilderUsesProviderSourceOrFailsClosed(t *testing.T) {
 	t.Parallel()
 
-	t.Run("legacy plan nodes", func(t *testing.T) {
+	t.Run("neither builder nor source", func(t *testing.T) {
 		t.Parallel()
 
-		legacy := newBuilderTestUpstream(t, http.StatusOK, nil, "vless://legacy@legacy.example:443#Legacy")
 		db := testutil.NewDatabaseService()
 		db.GetSubscriptionWithProviderSourceFunc = func(context.Context, string) (*database.Subscription, error) {
-			return activeRuntimeSubscription("builder-legacy", nil), nil
+			return activeRuntimeSubscription("builder-none", nil), nil
 		}
 		var resolverCalls atomic.Int32
 		db.ResolveSubscriptionBuilderFunc = func(context.Context, *database.Subscription) (*database.ResolvedBuilder, error) {
 			resolverCalls.Add(1)
 			return nil, nil
 		}
-		db.GetWithPlanAndNodesFunc = func(context.Context, string) (*database.SubscriptionFull, error) {
-			return &database.SubscriptionFull{
-				Subscription: *activeRuntimeSubscription("builder-legacy", nil),
-				Nodes:        []database.Node{{ID: 1, Name: "legacy", SubscriptionURL: legacy.srv.URL + "/"}},
-			}, nil
-		}
 
-		result, _, _, err := HandleSubscription(context.Background(), db, newTestSubSvc(t), "builder-legacy", "", nil)
-		require.NoError(t, err)
+		result, _, _, err := HandleSubscription(context.Background(), db, newTestSubSvc(t), "builder-none", "", nil)
+		assert.Nil(t, result)
+		require.ErrorIs(t, err, ErrBuilderUnavailable)
 		assert.Equal(t, int32(1), resolverCalls.Load())
-		assert.Equal(t, []string{"vless://legacy@legacy.example:443#Legacy"}, decodeBuilderLinks(t, result))
 	})
 
 	t.Run("provider source", func(t *testing.T) {
@@ -205,7 +193,7 @@ func TestBuilder_NoBuilderKeepsLegacyAndProviderPipelines(t *testing.T) {
 	})
 }
 
-func TestBuilder_ResolverErrorIsNotServedFromLegacy(t *testing.T) {
+func TestBuilder_ResolverErrorIsNotServed(t *testing.T) {
 	t.Parallel()
 
 	sub := activeRuntimeSubscription("builder-resolver-error", nil)
@@ -218,6 +206,7 @@ func TestBuilder_ResolverErrorIsNotServedFromLegacy(t *testing.T) {
 	assert.Nil(t, result)
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrSubscriptionNotFound)
+	assert.NotErrorIs(t, err, ErrBuilderUnavailable, "a resolver failure is a database error, not a missing builder")
 }
 
 // ---------------------------------------------------------------------------

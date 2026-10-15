@@ -68,7 +68,7 @@ Trial invitation page. Validates invite code, applies IP rate limit, creates tri
 
 **Response 429:** IP rate limit exceeded.
 
-**Response 500:** VPN node or database failure.
+**Response 500:** Database failure.
 
 ---
 
@@ -76,7 +76,7 @@ Trial invitation page. Validates invite code, applies IP rate limit, creates tri
 
 ### `GET /sub/{subID}`
 
-Returns the merged subscription configuration from all active nodes. Responses are cached for 240 seconds; inactive/expired subscriptions return 404.
+Returns the subscription configuration assembled by the resolved Builder from its ProviderSource catalogues. Responses are cached for 240 seconds; inactive/expired subscriptions return 404.
 
 **Response 200:** Subscription body and aggregated `Subscription-Userinfo` headers.
 
@@ -175,7 +175,7 @@ Returns the embedded 512×512 PNG logo. Also responds to `HEAD`.
 | `INVITE_NOT_FOUND` | 404 | Invite code invalid |
 | `RATE_LIMIT_EXCEEDED` | 429 | Too many trial requests from IP |
 | `SUBSCRIPTION_NOT_FOUND` | 404 | Subscription not found/inactive/expired |
-| `TRIAL_CREATION_FAILED` | 500 | VPN node failed to create trial |
+| `TRIAL_CREATION_FAILED` | 500 | Trial could not be created (database error) |
 | `DATABASE_ERROR` | 500 | Database query failed |
 | `INTERNAL_ERROR` | 500 | Unexpected system failure |
 

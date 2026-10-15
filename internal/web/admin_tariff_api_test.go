@@ -31,14 +31,14 @@ type tariffAPIFixture struct {
 func newTariffAPIFixture(t *testing.T, withTariffs bool) *tariffAPIFixture {
 	t.Helper()
 	base := newAdminAPIFixtureNoServer(t)
-	plan := &database.Plan{Name: "api-premium", IsActive: true, DevicesLimit: 3}
+	plan := &database.Plan{Name: "api-premium", IsActive: true}
 	require.NoError(t, base.db.GetDB().Create(plan).Error)
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(adminTestPassword), config.AdminMinBcryptCost)
 	require.NoError(t, err)
 	cfg := &config.Config{AdminUsername: "admin", AdminPasswordHash: string(hash), SiteURL: "https://admin.example.com"}
 	s := NewServer("127.0.0.1:0", nil, cfg, "", nil, nil)
-	s.SetAdminService(service.NewAdminService(base.db, nil, nil))
+	s.SetAdminService(service.NewAdminService(base.db, nil))
 	if withTariffs {
 		s.SetTariffService(service.NewTariffService(base.db))
 	}

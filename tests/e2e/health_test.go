@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kereal/rs8kvn_bot/internal/database"
-	"github.com/kereal/rs8kvn_bot/internal/interfaces"
 	"github.com/kereal/rs8kvn_bot/internal/service"
 	"github.com/kereal/rs8kvn_bot/internal/web"
 
@@ -23,9 +21,7 @@ func TestE2E_HealthEndpoint(t *testing.T) {
 	env := setupE2EEnv(t)
 	defer env.db.Close()
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	srv.RegisterChecker("database", func(ctx context.Context) web.ComponentHealth {
@@ -65,9 +61,7 @@ func TestE2E_HealthEndpoint_DBError(t *testing.T) {
 	env := setupE2EEnv(t)
 	defer env.db.Close()
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	srv.RegisterChecker("database", func(ctx context.Context) web.ComponentHealth {
@@ -102,9 +96,7 @@ func TestE2E_ReadyEndpoint(t *testing.T) {
 	env := setupE2EEnv(t)
 	defer env.db.Close()
 
-	xuiClients := map[uint]interfaces.XUIClient{1: env.xui}
-	nodes := []database.Node{{Name: "main", Host: "https://panel.example.com", APIToken: "test-api-token", InboundIDs: "[1]", IsActive: true}}
-	subService := service.NewSubscriptionService(env.db, xuiClients, e2eVPNClients(xuiClients), nodes, env.cfg)
+	subService := service.NewSubscriptionService(env.db, env.cfg)
 	srv := web.NewServer("127.0.0.1:0", env.db, env.cfg, env.botConfig.Username, subService, nil)
 
 	srv.RegisterChecker("database", func(ctx context.Context) web.ComponentHealth {

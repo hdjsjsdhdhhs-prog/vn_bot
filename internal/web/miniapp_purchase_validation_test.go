@@ -18,19 +18,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// createSellablePlan stores an active paid plan served by an enabled
+// subscription builder: a plan without a builder is not sold.
+func createSellablePlan(t *testing.T, db *database.Service, name string) *database.Plan {
+	t.Helper()
+	builder := &database.SubscriptionBuilder{Name: name + "-builder", Enabled: true}
+	require.NoError(t, db.GetDB().Create(builder).Error)
+	plan := &database.Plan{Name: name, IsActive: true, SubscriptionBuilderID: &builder.ID}
+	require.NoError(t, db.GetDB().Create(plan).Error)
+	return plan
+}
+
 func purchaseHTTPFixture(t *testing.T) (http.Handler, *database.Service, *database.Subscription, *database.Product) {
 	t.Helper()
 	db, err := database.NewService(filepath.Join(t.TempDir(), "purchase.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	plan := &database.Plan{Name: "purchase-http", IsActive: true}
-	require.NoError(t, db.GetDB().Create(plan).Error)
+	plan := createSellablePlan(t, db, "purchase-http")
 	product := &database.Product{PlanID: plan.ID, Name: "Monthly", DurationDays: 30, PriceCents: 5000, Currency: "RUB", IsActive: true}
 	require.NoError(t, db.GetDB().Create(product).Error)
 	sub := &database.Subscription{TelegramID: 45001, ClientID: "purchase-http-client", SubscriptionID: "purchase-http-sub", PlanID: plan.ID, Status: "active"}
 	require.NoError(t, db.CreateSubscription(context.Background(), sub, ""))
 	cfg := &config.Config{TelegramBotToken: miniAppTestToken}
-	return newMiniAppHandler(cfg, service.NewSubscriptionService(db, nil, nil, nil, cfg)), db, sub, product
+	return newMiniAppHandler(cfg, service.NewSubscriptionService(db, cfg)), db, sub, product
 }
 
 func purchaseHTTPRequest(handler http.Handler, identity int64, method, path, body string, keys []string) *httptest.ResponseRecorder {

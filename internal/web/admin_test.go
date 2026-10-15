@@ -247,7 +247,7 @@ func newAdminAPIFixture(t *testing.T) *adminAPIFixture {
 	require.NoError(t, err)
 	require.Negative(t, f.trial.TelegramID)
 
-	f.attach(startAdminTestServerWith(t, true, service.NewAdminService(db, nil, nil)))
+	f.attach(startAdminTestServerWith(t, true, service.NewAdminService(db, nil)))
 	return f
 }
 
@@ -994,7 +994,7 @@ func TestAdminAPI_SubscriptionByID(t *testing.T) {
 		resp := f.do(http.MethodGet, f.subscriptionPath(f.active.ID))
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		raw := f.raw(resp)
-		require.ElementsMatch(t, []string{"subscription", "plan", "nodes", "audit"}, mapKeys(raw))
+		require.ElementsMatch(t, []string{"subscription", "plan", "audit"}, mapKeys(raw))
 
 		sub := raw["subscription"].(map[string]any)
 		assertSafeSubscriptionView(t, sub)
@@ -1010,12 +1010,11 @@ func TestAdminAPI_SubscriptionByID(t *testing.T) {
 
 		plan := raw["plan"].(map[string]any)
 		assert.Equal(t, database.FreePlanName, plan["name"])
-		assert.ElementsMatch(t, []string{"id", "name", "is_active", "devices_limit", "traffic_limit", "subscription_builder_id"}, mapKeys(plan))
+		// Plans carry no traffic or device limits: none are enforced.
+		assert.ElementsMatch(t, []string{"id", "name", "is_active", "subscription_builder_id"}, mapKeys(plan))
 		assert.Nil(t, plan["subscription_builder_id"], "no plan default builder assigned: null")
 		assert.Contains(t, sub, "subscription_builder_id")
 		assert.Nil(t, sub["subscription_builder_id"], "no subscription override assigned: null")
-
-		assert.Equal(t, []any{}, raw["nodes"], "no bindings: [] not null")
 
 		audit := raw["audit"].([]any)
 		require.Len(t, audit, 1, "only this subscription's rows")

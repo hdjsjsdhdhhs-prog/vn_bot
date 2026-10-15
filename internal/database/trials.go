@@ -228,7 +228,7 @@ func (s *Service) ClaimExpiredTrials(ctx context.Context, hours int) ([]Subscrip
 	}
 
 	now := time.Now().UTC()
-	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
+	cutoff := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
 	var subs []Subscription
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Raw(
@@ -257,7 +257,7 @@ func (s *Service) ClaimExpiredTrials(ctx context.Context, hours int) ([]Subscrip
 		return nil, fmt.Errorf("failed to claim expired trials: %w", err)
 	}
 
-	rateLimitCutoff := time.Now().Add(-1*time.Hour + 1*time.Second)
+	rateLimitCutoff := time.Now().UTC().Add(-1*time.Hour + 1*time.Second)
 	err = s.db.WithContext(ctx).Where("created_at < ?", rateLimitCutoff).Delete(&TrialRequest{}).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to cleanup expired trial requests: %w", err)
@@ -294,7 +294,7 @@ func (s *Service) DeleteClaimedTrial(ctx context.Context, id uint) error {
 func (s *Service) CountTrialRequestsByIPLastHour(ctx context.Context, ip string) (int, error) {
 	var count int64
 
-	oneHourAgo := time.Now().Add(-1 * time.Hour)
+	oneHourAgo := time.Now().UTC().Add(-1 * time.Hour)
 
 	result := s.db.WithContext(ctx).
 		Model(&TrialRequest{}).
@@ -331,7 +331,7 @@ func (s *Service) CleanupExpiredTrials(ctx context.Context, hours int) ([]Subscr
 		return nil, fmt.Errorf("failed to resolve trial plan: %w", err)
 	}
 
-	cutoff := time.Now().Add(-time.Duration(hours) * time.Hour)
+	cutoff := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
 
 	var subs []Subscription
 
@@ -345,7 +345,7 @@ func (s *Service) CleanupExpiredTrials(ctx context.Context, hours int) ([]Subscr
 		return nil, fmt.Errorf("failed to cleanup expired trials: %w", result.Error)
 	}
 
-	rateLimitCutoff := time.Now().Add(-1*time.Hour + 1*time.Second)
+	rateLimitCutoff := time.Now().UTC().Add(-1*time.Hour + 1*time.Second)
 
 	err = s.db.WithContext(ctx).
 		Where("created_at < ?", rateLimitCutoff).

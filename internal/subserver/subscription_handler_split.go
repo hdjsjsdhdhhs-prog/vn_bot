@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/kereal/rs8kvn_bot/internal/database"
@@ -20,7 +19,7 @@ import (
 )
 
 type loadedSubscription struct {
-	full           *database.SubscriptionFull
+	sub            *database.Subscription
 	providerSource *database.ProviderSource
 	builder        *database.SubscriptionBuilder
 	cacheKey       string
@@ -28,8 +27,9 @@ type loadedSubscription struct {
 }
 
 // loadSubscription resolves the serving route under the per-subscription
-// analytics lock. ProviderSource-backed subscriptions never load plan nodes;
-// unlinked subscriptions continue through GetWithPlanAndNodes unchanged.
+// analytics lock: the enabled builder (subscription override > plan default),
+// otherwise a directly linked ProviderSource. Without either it returns
+// ErrBuilderUnavailable — a configuration error; there is no other route.
 func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository, subSvc *Service, subID, clientIP string, requestHeaders map[string]string) (*loadedSubscription, error) {
 	// The analytics update is a read-modify-write on the subscription row
 	// (devices/IPs JSON). The freshest row must be loaded AFTER taking the lock
@@ -76,10 +76,10 @@ func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository,
 		return nil, ErrSubscriptionNotFound
 	}
 
-	loaded := &loadedSubscription{cacheKey: subID}
+	loaded := &loadedSubscription{sub: sub, cacheKey: subID}
 
-	// Builder selection: subscription override > plan default > existing
-	// pipeline (ProviderSource or legacy plan nodes), which stays untouched.
+	// Builder selection: subscription override > plan default. A disabled or
+	// dangling builder at one level is skipped in favour of the next level.
 	resolved, err := db.ResolveSubscriptionBuilder(ctx, sub)
 	if err != nil {
 		logger.Error("Failed to resolve subscription builder",
@@ -89,14 +89,15 @@ func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository,
 		return nil, fmt.Errorf("database error: %w", err)
 	}
 
-	if resolved != nil {
+	switch {
+	case resolved != nil:
 		loaded.builder = &resolved.Builder
 		loaded.cacheKey = builderCacheKey(subID, &resolved.Builder)
 		logger.Debug("Subscription served by builder",
 			zap.String("sub_id", subID),
 			zap.Uint("builder_id", resolved.Builder.ID),
 			zap.String("selection", string(resolved.Selection)))
-	} else if sub.ProviderSourceID != nil {
+	case sub.ProviderSourceID != nil:
 		if sub.ProviderSource == nil {
 			subSvc.InvalidateCache(subID)
 			logger.Warn("Linked provider source is missing",
@@ -117,6 +118,24 @@ func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository,
 
 		loaded.providerSource = sub.ProviderSource
 		loaded.cacheKey = providerSourceCacheKey(subID, *sub.ProviderSource)
+	default:
+		// Configuration error, not a client error: the subscription is valid
+		// but nothing is configured to serve it. The reason is logged for the
+		// operator; the client gets 503 without details.
+		subSvc.InvalidateCache(subID)
+		metrics.SubserverCacheInvalidationsTotal.WithLabelValues("no_builder").Inc()
+		fields := []zap.Field{
+			zap.String("sub_id", subID),
+			zap.Uint("subscription_pk", sub.ID),
+			zap.Uint("plan_id", sub.PlanID),
+			zap.String("reason", "no enabled subscription builder assigned to the subscription or its plan"),
+		}
+		if sub.SubscriptionBuilderID != nil {
+			fields = append(fields, zap.Uint("subscription_builder_id", *sub.SubscriptionBuilderID))
+		}
+		logger.Warn("Subscription cannot be served: builder is not configured", fields...)
+
+		return nil, ErrBuilderUnavailable
 	}
 
 	if cachedBody, cachedHeaders, ok := subSvc.GetCache(loaded.cacheKey); ok {
@@ -127,39 +146,16 @@ func loadSubscription(ctx context.Context, db interfaces.SubscriptionRepository,
 		return loaded, nil
 	}
 
-	var subFull *database.SubscriptionFull
-	if loaded.providerSource == nil && loaded.builder == nil {
-		subFull, err = db.GetWithPlanAndNodes(ctx, subID)
-		if err != nil {
-			if errors.Is(err, database.ErrSubscriptionNotFound) {
-				logger.Debug("Subscription not found in database",
-					zap.String("sub_id", subID))
-
-				return nil, ErrSubscriptionNotFound
-			}
-
-			logger.Error("Failed to get subscription with plan and sources",
-				zap.String("sub_id", subID),
-				zap.Error(err))
-
-			return nil, fmt.Errorf("database error: %w", err)
-		}
-	} else {
-		subFull = &database.SubscriptionFull{Subscription: *sub}
-	}
-
-	loaded.full = subFull
-
 	logger.Debug("Subscription loaded from database",
-		zap.Uint("sub_pk", subFull.Subscription.ID),
-		zap.String("status", subFull.Subscription.Status),
-		zap.Timep("expires_at", subFull.Subscription.ExpiresAt),
+		zap.Uint("sub_pk", sub.ID),
+		zap.String("status", sub.Status),
+		zap.Timep("expires_at", sub.ExpiresAt),
 		zap.Bool("provider_source", loaded.providerSource != nil),
 		zap.Bool("builder", loaded.builder != nil),
 	)
 
-	UpdateDevices(ctx, db, subFull, requestHeaders)
-	UpdateIPs(ctx, db, subFull, clientIP)
+	UpdateDevices(ctx, db, sub, requestHeaders)
+	UpdateIPs(ctx, db, sub, clientIP)
 
 	updateLastRequest(ctx, db, subID)
 
@@ -192,21 +188,12 @@ type aggregatedSources struct {
 }
 
 // maxSourceConcurrency bounds how many upstream sources are fetched in parallel
-// so a single slow/down node cannot be amplified into unbounded connection usage.
+// so a single slow/down source cannot be amplified into unbounded connection usage.
 const maxSourceConcurrency = 8
-
-// sourceResult holds the outcome of fetching a single upstream node.
-type sourceResult struct {
-	source  database.Node
-	body    []byte
-	headers map[string]string
-	format  Format
-}
 
 // fetchAndAggregateProviderSource fetches exactly one linked ProviderSource and
 // feeds its payload through the same format detection and normalization used by
-// legacy nodes. Provider fetch failures are terminal and never fall back to
-// plan nodes.
+// builders. Provider fetch failures are terminal: there is no fallback route.
 func fetchAndAggregateProviderSource(ctx context.Context, subID string, source database.ProviderSource) (aggregatedSources, int, int, error) {
 	fetchStart := time.Now()
 	response, err := FetchFromProviderSource(ctx, source)
@@ -236,168 +223,21 @@ func fetchAndAggregateProviderSource(ctx context.Context, subID string, source d
 	agg.totalUpload = ParseUserInfoValue(response.Headers, "upload")
 	agg.totalDownload = ParseUserInfoValue(response.Headers, "download")
 
-	aggregateFormat(&agg, format, response.Body, database.Node{
-		ID:   source.ID,
-		Name: source.Name,
-	}, subID)
+	aggregateFormat(&agg, format, response.Body, source.Name, subID)
 
 	return agg, 1, 1, nil
 }
 
-// fetchAndAggregateSources fetches all active source nodes concurrently (bounded
-// by maxSourceConcurrency) and aggregates their items and traffic counters. The
-// per-source fetch is isolated: a failure logs and is skipped, never aborting the
-// others. Results are merged in source order to keep header/expire selection
-// deterministic.
-func fetchAndAggregateSources(ctx context.Context, subID string, nodes []database.Node) (aggregatedSources, int, int) {
-	agg := aggregatedSources{
-		allJSON: true,
-	}
-
-	results := make([]sourceResult, len(nodes))
-	sem := make(chan struct{}, maxSourceConcurrency)
-
-	var wg sync.WaitGroup
-
-	for i := range nodes {
-		src := nodes[i]
-		if src.SubscriptionURL == "" {
-			logger.Warn("Skipping node without subscription_url",
-				zap.String("sub_id", subID),
-				zap.String("source", src.Name),
-			)
-
-			continue
-		}
-
-		if ctx.Err() != nil {
-			break
-		}
-
-		wg.Add(1)
-
-		sem <- struct{}{}
-
-		go func(idx int, src database.Node) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			results[idx] = fetchSource(ctx, subID, src)
-		}(i, src)
-	}
-
-	wg.Wait()
-
-	successCount := 0
-	totalCount := 0
-
-	for i := range nodes {
-		if nodes[i].SubscriptionURL == "" {
-			continue
-		}
-
-		totalCount++
-
-		if results[i].body != nil {
-			successCount++
-		}
-	}
-
-	for i := range nodes {
-		res := results[i]
-		if res.body == nil {
-			continue
-		}
-		// Capture headers from the first successful source for client replay.
-		if agg.firstSourceHeaders == nil {
-			agg.firstSourceHeaders = res.headers
-		}
-
-		updateMinExpire(&agg, res.headers)
-
-		// Aggregate usage counters across all sources.
-		agg.totalUpload += ParseUserInfoValue(res.headers, "upload")
-		agg.totalDownload += ParseUserInfoValue(res.headers, "download")
-
-		aggregateFormat(&agg, res.format, res.body, res.source, subID)
-	}
-
-	return agg, successCount, totalCount
-}
-
-// fetchSource performs a single upstream fetch, records metrics, and returns the
-// parsed result. On error it returns a zero sourceResult (nil body), which the
-// caller treats as "skip this source".
-func fetchSource(ctx context.Context, subID string, src database.Node) sourceResult {
-	sourceURL := buildSourceURL(src, subID)
-
-	fetchStart := time.Now()
-	srcResp, err := FetchFromNode(ctx, sourceURL)
-	fetchDuration := time.Since(fetchStart).Seconds()
-
-	if err != nil {
-		metrics.SubserverSourceFetchTotal.WithLabelValues("error", "unknown").Inc()
-		metrics.SubserverSourceFetchDuration.WithLabelValues("error").Observe(fetchDuration)
-		logger.Error("Failed to fetch from node",
-			zap.String("sub_id", subID),
-			zap.String("source", src.Name),
-			zap.String("node_url", logger.SafeURL(sourceURL)),
-			logger.SafeError(err, sourceURL, subID))
-
-		return sourceResult{}
-	}
-
-	body := srcResp.Body
-
-	srcHeaders := srcResp.Headers
-	if srcHeaders == nil {
-		srcHeaders = make(map[string]string)
-	}
-
-	format := DetectFormat(body)
-	metrics.SubserverSourceFetchTotal.WithLabelValues("success", format.String()).Inc()
-	metrics.SubserverSourceFetchDuration.WithLabelValues("success").Observe(fetchDuration)
-	logger.Debug("Node response received",
-		zap.String("sub_id", subID),
-		zap.String("source", src.Name),
-		zap.String("format", format.String()),
-		zap.Int("body_size", len(body)),
-		zap.Int("headers_count", len(srcHeaders)),
-	)
-
-	return sourceResult{
-		source:  src,
-		body:    body,
-		headers: srcHeaders,
-		format:  format,
-	}
-}
-
-// buildSourceURL constructs the upstream fetch URL for a node, handling
-// fetch-type nodes (use URL as-is) versus regular nodes (append subID).
-func buildSourceURL(src database.Node, subID string) string {
-	if src.Type == database.NodeTypeFetch {
-		return src.SubscriptionURL
-	}
-
-	srcSubURL := src.SubscriptionURL
-	if !strings.HasSuffix(srcSubURL, "/") {
-		srcSubURL += "/"
-	}
-
-	return srcSubURL + subID
-}
-
 // aggregateFormat parses the upstream body according to its detected format
 // and appends items or JSON configs to the aggregator.
-func aggregateFormat(agg *aggregatedSources, format Format, body []byte, src database.Node, subID string) {
+func aggregateFormat(agg *aggregatedSources, format Format, body []byte, sourceName string, subID string) {
 	switch format {
 	case FormatJSON:
 		configs, parseErr := ExtractJSONConfigs(body)
 		if parseErr != nil {
-			logger.Error("Failed to parse JSON configs from node",
+			logger.Error("Failed to parse JSON configs from source",
 				zap.String("sub_id", subID),
-				zap.String("source", src.Name),
+				zap.String("source", sourceName),
 				zap.Error(parseErr))
 
 			agg.allJSON = false
@@ -412,9 +252,9 @@ func aggregateFormat(agg *aggregatedSources, format Format, body []byte, src dat
 
 		configs, parseErr := ExtractClashConfigs(body)
 		if parseErr != nil {
-			logger.Error("Failed to parse Clash configs from node",
+			logger.Error("Failed to parse Clash configs from source",
 				zap.String("sub_id", subID),
-				zap.String("source", src.Name),
+				zap.String("source", sourceName),
 				zap.Error(parseErr))
 
 			return

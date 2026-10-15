@@ -28,7 +28,7 @@ type starsRepository interface {
 	ApproveStarsCheckout(context.Context, string, int64, string, string, int64, database.PurchaseValidator) error
 	RecordTelegramPayment(context.Context, *database.TelegramPaymentReceipt) error
 	PendingTelegramPayments(context.Context, uint, int) ([]database.TelegramPaymentReceipt, error)
-	SettleStarsPayment(context.Context, string, string, database.PurchaseValidator, database.ApplyPlanInTxFn) (*database.Order, *database.Subscription, bool, error)
+	SettleStarsPayment(ctx context.Context, ref, chargeID string, validate database.PurchaseValidator) (*database.Order, *database.Subscription, bool, error)
 }
 
 // StarsPaymentService adapts Telegram payments to Purchase Foundation and the
@@ -48,7 +48,7 @@ func NewStarsPaymentService(orders *OrderService, telegram StarsInvoiceClient) *
 }
 
 func (s *StarsPaymentService) ready() bool {
-	return s != nil && s.repo != nil && s.orders != nil && s.orders.syncSvc != nil && s.telegram != nil
+	return s != nil && s.repo != nil && s.orders != nil && s.telegram != nil
 }
 
 // Invoice only accepts an existing purchase reference, resolved with the same
@@ -201,7 +201,7 @@ func (s *StarsPaymentService) settle(ctx context.Context, payload, charge string
 	if err != nil {
 		return nil, err
 	}
-	order, sub, activated, err := s.repo.SettleStarsPayment(ctx, ref, charge, validateStarsFulfillment, s.orders.syncSvc.ApplyPlanToSubscriptionInTx)
+	order, sub, activated, err := s.repo.SettleStarsPayment(ctx, ref, charge, validateStarsFulfillment)
 	if err != nil {
 		return nil, fmt.Errorf("settle Stars payment: %w", err)
 	}
@@ -211,17 +211,11 @@ func (s *StarsPaymentService) settle(ctx context.Context, payload, charge string
 			s.orders.subSvc.InvalidateSubscription(ctx, sub.TelegramID)
 			s.orders.subSvc.InvalidateBySubID(ctx, sub.SubscriptionID)
 		}
-		// Durable node prerequisites already committed; external sync is best effort.
-		syncCtx, cancel := context.WithTimeout(ctx, paymentSyncTimeout)
-		defer cancel()
-		if err := s.orders.syncSvc.SyncSubscription(syncCtx, sub.ID); err != nil {
-			logger.Warn("Stars post-commit sync failed", zap.Uint("order_id", order.ID), zap.Error(err))
-		}
 	}
 	return &PaymentConfirmation{Order: order, Activated: activated}, nil
 }
 
-// RetryPayments recovers after a process crash or DB-setup failure. Keyset
+// RetryPayments recovers after a process crash or a failed settlement. Keyset
 // pagination ensures an unfulfillable receipt cannot starve subsequent payments.
 func (s *StarsPaymentService) RetryPayments(ctx context.Context) error {
 	if !s.ready() {

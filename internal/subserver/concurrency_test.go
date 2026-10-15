@@ -8,35 +8,37 @@ import (
 	"time"
 
 	"github.com/kereal/rs8kvn_bot/internal/database"
+	"github.com/kereal/rs8kvn_bot/internal/testutil"
 	"github.com/stretchr/testify/assert"
 )
 
-func TestFetchAndAggregateSources_Parallel(t *testing.T) {
-	// 10 nodes, each sleeping for 100ms.
+func TestFetchAndAggregateBuilder_Parallel(t *testing.T) {
+	// 10 builder sources, each sleeping for 100ms.
 	// Sequential: 1000ms.
 	// Parallel (concurrency 8): ~200ms.
-	numNodes := 10
+	numSources := 10
 	sleepTime := 100 * time.Millisecond
 
-	nodes := make([]database.Node, numNodes)
-	for i := range numNodes {
+	sources := make([]*database.ProviderSource, numSources)
+	for i := range numSources {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Intentional delay: simulates node work so the test can verify
-			// that nodes are fetched in parallel (not sequentially).
+			// Intentional delay: simulates upstream work so the test can verify
+			// that sources are fetched in parallel (not sequentially).
 			time.Sleep(sleepTime)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("[]"))
 		}))
 		defer ts.Close()
 
-		nodes[i] = database.Node{Name: "node", SubscriptionURL: ts.URL}
+		sources[i] = testSource(uint(i+1), ts.URL)
 	}
 
 	start := time.Now()
 	ctx := context.Background()
-	agg, _, _ := fetchAndAggregateSources(ctx, "test", nodes)
-	_ = agg
+	agg, _, _, err := fetchAndAggregateBuilder(ctx, testutil.NewDatabaseService(), "test", testBuilder(1, sources))
 	duration := time.Since(start)
+	// Only the wall-clock time is under test here.
+	_, _ = agg, err
 
 	// Verify parallel execution (significantly less than sequential)
 	assert.Less(t, duration, 800*time.Millisecond, "Should be faster than sequential execution")

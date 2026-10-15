@@ -43,7 +43,7 @@ func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 	db, err := database.NewService(filepath.Join(t.TempDir(), "lifecycle.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	var providerCalls, legacyCalls atomic.Int32
+	var providerCalls atomic.Int32
 	var echoSecrets atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		providerCalls.Add(1)
@@ -59,25 +59,12 @@ func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 		_, _ = w.Write([]byte("vless://connection@vpn.example:443#Customer"))
 	}))
 	t.Cleanup(upstream.Close)
-	legacyUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		legacyCalls.Add(1)
-		assert.Empty(t, r.Header.Get("X-HWID"))
-		_, _ = w.Write([]byte("vless://legacy@legacy.example:443#Legacy"))
-	}))
-	t.Cleanup(legacyUpstream.Close)
 	source := &database.ProviderSource{Name: "private-provider", Type: "external", Enabled: true, SubscriptionURL: upstream.URL + "/upstream-private-feed", HWID: "private-hwid", UserAgent: "private-agent", Headers: `{"Authorization":"Bearer private-auth"}`}
 	require.NoError(t, db.CreateProviderSource(ctx, source))
 	plan := &database.Plan{Name: "customer", IsActive: true}
 	require.NoError(t, db.GetDB().Create(plan).Error)
-	free, err := db.GetPlanByName(ctx, database.FreePlanName)
-	require.NoError(t, err)
-	node := &database.Node{Name: "legacy", Type: database.NodeTypeFetch, IsActive: true, SubscriptionURL: legacyUpstream.URL}
-	require.NoError(t, db.GetDB().Create(node).Error)
-	for _, planID := range []uint{plan.ID, free.ID} {
-		require.NoError(t, db.GetDB().Create(&database.PlanNode{PlanID: planID, NodeID: node.ID}).Error)
-	}
 	cfg := &config.Config{GlobalSubURL: "https://customer.example/sub/"}
-	subSvc := service.NewSubscriptionService(db, nil, nil, nil, cfg)
+	subSvc := service.NewSubscriptionService(db, cfg)
 	runtime := subserver.NewService(time.Minute)
 	t.Cleanup(runtime.Stop)
 	subSvc.SetInvalidateBySubIDFunc(runtime.InvalidateCache)
@@ -129,7 +116,6 @@ func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 		assert.Contains(t, string(decoded), "vless://connection@vpn.example")
 	}
 	assert.Equal(t, int32(1), providerCalls.Load())
-	assert.Zero(t, legacyCalls.Load())
 	status, body, headers := get("/subscription-info/" + sub.Token)
 	require.Equal(t, http.StatusOK, status)
 	assertSafe(body, headers)
@@ -149,7 +135,7 @@ func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 
 	assertRenewalVisible := func() {
 		t.Helper()
-		callsBefore, legacyBefore := providerCalls.Load(), legacyCalls.Load()
+		callsBefore := providerCalls.Load()
 		renewed, err := subSvc.RenewSubscription(ctx, sub.ID, 7)
 		require.NoError(t, err)
 		assert.Equal(t, sub.ID, renewed.Subscription.ID)
@@ -168,7 +154,6 @@ func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 			assert.Contains(t, string(decoded), "vless://connection@vpn.example")
 		}
 		assert.Equal(t, callsBefore+1, providerCalls.Load(), "renewal must invalidate the warmed provider cache")
-		assert.Equal(t, legacyBefore, legacyCalls.Load(), "renewal must never fall back to legacy")
 		status, body, headers := get("/subscription-info/" + sub.Token)
 		require.Equal(t, http.StatusOK, status)
 		assertSafe(body, headers)
@@ -187,22 +172,20 @@ func TestCustomerLifecycle_LocalHTTP(t *testing.T) {
 	}
 	assertRenewalVisible() // active renewal with warmed feed cache
 
-	// Existing free creation still delivers through legacy nodes.
+	// A free subscription whose plan has no builder (and no linked source) is a
+	// configuration error: 503 with a generic body, no fallback route.
 	legacy, err := subSvc.Create(ctx, 876543210, "legacy", "")
 	require.NoError(t, err)
-	status, body, _ = get("/sub/" + legacy.Subscription.Token)
-	require.Equal(t, http.StatusOK, status)
-	decoded, err := base64.StdEncoding.DecodeString(body)
-	require.NoError(t, err)
-	assert.Contains(t, string(decoded), "vless://legacy@legacy.example")
-	assert.Equal(t, int32(1), legacyCalls.Load())
+	status, body, headers = get("/sub/" + legacy.Subscription.Token)
+	require.Equal(t, http.StatusServiceUnavailable, status)
+	assert.Equal(t, "Subscription is temporarily unavailable", body)
+	assertSafe(body, headers)
 
-	// Revalidate the source even on a cache hit; no legacy fallback.
+	// Revalidate the source even on a cache hit; no fallback route.
 	require.NoError(t, db.GetDB().Model(source).Update("enabled", false).Error)
 	status, body, headers = get("/sub/" + sub.Token)
 	assert.Equal(t, http.StatusServiceUnavailable, status)
 	assertSafe(body, headers)
-	assert.Equal(t, int32(1), legacyCalls.Load())
 	require.NoError(t, db.GetDB().Model(source).Update("enabled", true).Error)
 	echoSecrets.Store(true)
 	status, body, headers = get("/sub/" + sub.Token)

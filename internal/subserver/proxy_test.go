@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestFetchFromNode_ResponseSizeLimit(t *testing.T) {
+func TestFetchProviderSource_ResponseSizeLimit(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -24,9 +24,13 @@ func TestFetchFromNode_ResponseSizeLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := FetchFromNode(context.Background(), srv.URL)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeds")
+	source := database.ProviderSource{SubscriptionURL: srv.URL, Headers: `{}`, Enabled: true}
+	resp, failure := fetchProviderSource(context.Background(), source)
+	assert.Nil(t, resp)
+	assert.Equal(t, fetchFailTooLarge, failure)
+
+	_, err := FetchFromProviderSource(context.Background(), source)
+	require.ErrorIs(t, err, ErrProviderSourceUnavailable)
 }
 
 func TestDetectFormat_Plain(t *testing.T) {
@@ -102,7 +106,7 @@ func TestAggregateFormat_RawBase64(t *testing.T) {
 	encoded := base64.RawStdEncoding.EncodeToString([]byte(plain))
 	var agg aggregatedSources
 
-	aggregateFormat(&agg, FormatBase64, []byte(encoded), database.Node{Name: "raw-base64"}, "sub-raw")
+	aggregateFormat(&agg, FormatBase64, []byte(encoded), "raw-base64", "sub-raw")
 
 	assert.Equal(t, []string{"vless://one@example.com:443", "trojan://pass@example.com:443"}, agg.items)
 }

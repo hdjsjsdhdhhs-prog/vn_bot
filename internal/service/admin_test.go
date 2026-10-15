@@ -12,73 +12,19 @@ import (
 	"github.com/kereal/rs8kvn_bot/internal/config"
 	"github.com/kereal/rs8kvn_bot/internal/database"
 	"github.com/kereal/rs8kvn_bot/internal/testutil"
-	"github.com/kereal/rs8kvn_bot/internal/vpn"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// adminVPNClient is a goroutine-safe recording vpn.Client: concurrent admin
-// mutations on one subscription are serialized by the sync lock, but the
-// counters are read from the test goroutine afterwards.
-type adminVPNClient struct {
-	mu        sync.Mutex
-	created   int
-	updated   int
-	deleted   int
-	reset     int
-	createErr error
-	deleteErr error
-}
-
-func (c *adminVPNClient) CreateSubscription(context.Context, vpn.SubscriptionProvision) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.created++
-	return c.createErr
-}
-
-func (c *adminVPNClient) UpdateSubscription(context.Context, vpn.SubscriptionProvision) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.updated++
-	return nil
-}
-
-func (c *adminVPNClient) DeleteSubscription(context.Context, vpn.SubscriptionProvision) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.deleted++
-	return c.deleteErr
-}
-
-func (c *adminVPNClient) ResetTraffic(context.Context, vpn.SubscriptionProvision) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.reset++
-	return nil
-}
-
-func (c *adminVPNClient) Close() error { return nil }
-
-func (c *adminVPNClient) counts() (created, updated, deleted, reset int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.created, c.updated, c.deleted, c.reset
-}
-
-// adminServiceFixture wires the real SQLite repository, the real
-// SubscriptionService (for cache invalidation) and the real SyncService with
-// recording VPN clients, so the post-commit contract is exercised end to end.
+// adminServiceFixture wires the real SQLite repository and the real
+// SubscriptionService (for cache invalidation), so the post-commit contract is
+// exercised end to end.
 type adminServiceFixture struct {
 	db    *database.Service
 	subs  *SubscriptionService
-	sync  *SyncService
 	admin *AdminService
 	plan  *database.Plan
-	node1 *database.Node
-	node2 *database.Node
-	vpn   map[uint]*adminVPNClient
 	sub   *database.Subscription
 
 	mu             sync.Mutex
@@ -91,25 +37,17 @@ const (
 	adminFixtureSubID      = "s-admin-target"
 )
 
-// newAdminServiceFixture creates a two-node plan and one subscription in the
-// given lifecycle state. withNodes provisions both plan nodes as active
-// bindings (the normal state of a live legacy subscription).
-func newAdminServiceFixture(t *testing.T, status string, expiresAt *time.Time, withNodes bool) *adminServiceFixture {
+// newAdminServiceFixture creates a plan and one subscription in the given
+// lifecycle state.
+func newAdminServiceFixture(t *testing.T, status string, expiresAt *time.Time) *adminServiceFixture {
 	t.Helper()
 	ctx := context.Background()
 	db, err := testutil.NewTestDatabaseService(t)
 	require.NoError(t, err)
 
-	f := &adminServiceFixture{db: db, vpn: map[uint]*adminVPNClient{}}
-	f.plan = &database.Plan{Name: "admin-plan", TrafficLimit: 1 << 30, IsActive: true}
+	f := &adminServiceFixture{db: db}
+	f.plan = &database.Plan{Name: "admin-plan", IsActive: true}
 	require.NoError(t, db.GetDB().WithContext(ctx).Create(f.plan).Error)
-	f.node1 = &database.Node{Name: "admin-node-1", Type: database.NodeType3xUI, IsActive: true, Host: "http://a1", APIToken: "t1", InboundIDs: `[1]`}
-	f.node2 = &database.Node{Name: "admin-node-2", Type: database.NodeType3xUI, IsActive: true, Host: "http://a2", APIToken: "t2", InboundIDs: `[1]`}
-	for _, n := range []*database.Node{f.node1, f.node2} {
-		require.NoError(t, db.GetDB().WithContext(ctx).Create(n).Error)
-		require.NoError(t, db.GetDB().WithContext(ctx).Create(&database.PlanNode{PlanID: f.plan.ID, NodeID: n.ID}).Error)
-		f.vpn[n.ID] = &adminVPNClient{}
-	}
 
 	f.sub = &database.Subscription{
 		TelegramID: adminFixtureTelegramID, Username: "admin-target", ClientID: "c-admin-target",
@@ -121,18 +59,8 @@ func newAdminServiceFixture(t *testing.T, status string, expiresAt *time.Time, w
 	require.NoError(t, db.UpdateSubscription(ctx, f.sub))
 	f.sub, err = db.GetByID(ctx, f.sub.ID)
 	require.NoError(t, err)
-	if withNodes {
-		for _, n := range []*database.Node{f.node1, f.node2} {
-			require.NoError(t, db.CreateSubscriptionNode(ctx, &database.SubscriptionNode{SubscriptionID: f.sub.ID, NodeID: n.ID, Status: database.SyncStatusActive}))
-		}
-	}
 
-	nodes := []database.Node{*f.node1, *f.node2}
-	vpnClients := make(map[uint]vpn.Client, len(f.vpn))
-	for id, c := range f.vpn {
-		vpnClients[id] = c
-	}
-	f.subs = NewSubscriptionService(db, nil, vpnClients, nodes, &config.Config{GlobalSubURL: "https://admin.example/sub/"})
+	f.subs = NewSubscriptionService(db, &config.Config{GlobalSubURL: "https://admin.example/sub/"})
 	f.subs.SetInvalidateFunc(func(id int64) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -143,8 +71,7 @@ func newAdminServiceFixture(t *testing.T, status string, expiresAt *time.Time, w
 		defer f.mu.Unlock()
 		f.invalidatedSub = append(f.invalidatedSub, id)
 	})
-	f.sync = NewSyncService(db, vpnClients, nodes)
-	f.admin = NewAdminService(db, f.subs, f.sync)
+	f.admin = NewAdminService(db, f.subs)
 	return f
 }
 
@@ -156,30 +83,6 @@ func (f *adminServiceFixture) invalidations() ([]int64, []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]int64(nil), f.invalidatedTG...), append([]string(nil), f.invalidatedSub...)
-}
-
-func (f *adminServiceFixture) nodeStatuses(t *testing.T) map[uint]database.SyncStatus {
-	t.Helper()
-	rows, err := f.db.GetBySubscriptionID(context.Background(), f.sub.ID)
-	require.NoError(t, err)
-	out := make(map[uint]database.SyncStatus, len(rows))
-	for _, r := range rows {
-		out[r.NodeID] = r.Status
-	}
-	return out
-}
-
-func (f *adminServiceFixture) nodeRow(t *testing.T, nodeID uint) database.SubscriptionNode {
-	t.Helper()
-	rows, err := f.db.GetBySubscriptionID(context.Background(), f.sub.ID)
-	require.NoError(t, err)
-	for _, r := range rows {
-		if r.NodeID == nodeID {
-			return r
-		}
-	}
-	t.Fatalf("node %d has no binding", nodeID)
-	return database.SubscriptionNode{}
 }
 
 func (f *adminServiceFixture) auditRows(t *testing.T) []database.AdminAuditLog {
@@ -278,9 +181,9 @@ func (r *fakeAdminRepo) ListAdminAudit(ctx context.Context, f database.AdminAudi
 
 // --- Renew ---------------------------------------------------------------
 
-func TestAdminService_Mutate_RenewExtendsWithoutTouchingNodes(t *testing.T) {
+func TestAdminService_Mutate_RenewExtendsExpiry(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Second)
-	f := newAdminServiceFixture(t, "active", &future, true)
+	f := newAdminServiceFixture(t, "active", &future)
 
 	outcome, err := f.admin.Mutate(context.Background(), f.mutation(database.AdminActionRenew, "renew-1"))
 	require.NoError(t, err)
@@ -295,15 +198,6 @@ func TestAdminService_Mutate_RenewExtendsWithoutTouchingNodes(t *testing.T) {
 	assert.Equal(t, f.sub.ID, outcome.Audit.SubscriptionID)
 	assertViewHidesBearerMaterial(t, outcome.Subscription, f.sub)
 
-	// Active bindings must stay active: no pending_update, no traffic reset,
-	// no panel calls at all — same contract as RenewSubscription.
-	statuses := f.nodeStatuses(t)
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
-	for id, c := range f.vpn {
-		created, updated, deleted, reset := c.counts()
-		assert.Zero(t, created+updated+deleted+reset, "node %d must not be touched by renew", id)
-	}
 	f.assertInvalidatedTimes(t, 1)
 
 	stored := f.stored(t)
@@ -312,23 +206,16 @@ func TestAdminService_Mutate_RenewExtendsWithoutTouchingNodes(t *testing.T) {
 	assert.Len(t, f.auditRows(t), 1)
 }
 
-func TestAdminService_Mutate_RenewReactivatesExpiredAndReprovisions(t *testing.T) {
+func TestAdminService_Mutate_RenewReactivatesExpired(t *testing.T) {
 	past := time.Now().UTC().Add(-time.Hour)
-	// The expiry worker downgraded the row: status expired, bindings gone.
-	f := newAdminServiceFixture(t, "expired", &past, false)
+	// The expiry worker left the row expired.
+	f := newAdminServiceFixture(t, "expired", &past)
 
 	outcome, err := f.admin.Mutate(context.Background(), f.mutation(database.AdminActionRenew, "renew-expired"))
 	require.NoError(t, err)
 	assert.Equal(t, "active", outcome.Subscription.Status)
 	assert.True(t, outcome.Subscription.ExpiresAt.After(time.Now().UTC().AddDate(0, 0, 29)))
 
-	statuses := f.nodeStatuses(t)
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID], "missing plan node → pending_add → provisioned")
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
-	for _, c := range f.vpn {
-		created, _, _, _ := c.counts()
-		assert.Equal(t, 1, created)
-	}
 	f.assertInvalidatedTimes(t, 1)
 }
 
@@ -347,7 +234,7 @@ func TestAdminService_Mutate_RenewRejectionsAreAuditedWithoutSideEffects(t *test
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newAdminServiceFixture(t, tc.status, tc.expiresAt, true)
+			f := newAdminServiceFixture(t, tc.status, tc.expiresAt)
 			outcome, err := f.admin.Mutate(context.Background(), f.mutation(database.AdminActionRenew, "renew-rej"))
 			require.ErrorIs(t, err, tc.wantErr)
 			require.NotNil(t, outcome, "rejections return the recorded audit entry")
@@ -356,15 +243,8 @@ func TestAdminService_Mutate_RenewRejectionsAreAuditedWithoutSideEffects(t *test
 			assert.Equal(t, tc.status, outcome.Subscription.Status)
 			assert.Equal(t, f.sub, f.stored(t), "rejected mutation must not touch the row")
 			// Nothing was committed, so no post-commit work may run: no cache
-			// invalidation, no node churn (revoked leftovers are the /del flow's job).
+			// invalidation.
 			f.assertInvalidatedTimes(t, 0)
-			statuses := f.nodeStatuses(t)
-			assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-			assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
-			for _, c := range f.vpn {
-				created, updated, deleted, reset := c.counts()
-				assert.Zero(t, created+updated+deleted+reset)
-			}
 			assert.Len(t, f.auditRows(t), 1)
 		})
 	}
@@ -372,34 +252,18 @@ func TestAdminService_Mutate_RenewRejectionsAreAuditedWithoutSideEffects(t *test
 
 // --- Disable / Enable ------------------------------------------------------
 
-func TestAdminService_Mutate_DisableDrainsNodesBestEffort(t *testing.T) {
+func TestAdminService_Mutate_DisablePausesAndKeepsExpiry(t *testing.T) {
 	future := time.Now().UTC().Add(72 * time.Hour).Truncate(time.Second)
-	f := newAdminServiceFixture(t, "active", &future, true)
-	panelDown := errors.New("panel unreachable")
-	f.vpn[f.node2.ID].deleteErr = panelDown
+	f := newAdminServiceFixture(t, "active", &future)
 
 	outcome, err := f.admin.Mutate(context.Background(), f.mutation(database.AdminActionDisable, "disable-1"))
-	require.NoError(t, err, "external sync failure is best-effort and must not surface")
+	require.NoError(t, err)
 	assert.Equal(t, "paused", outcome.Subscription.Status)
 	assert.True(t, future.Equal(*outcome.Subscription.ExpiresAt), "disable keeps expiry")
 	assert.Equal(t, 3, outcome.Subscription.RemindersSent, "disable keeps reminders")
 	assert.True(t, outcome.Audit.Success)
 
-	// node1: pending_remove → deleted on the panel → binding dropped.
-	// node2: pending_remove stays with retry metadata for the background worker.
-	statuses := f.nodeStatuses(t)
-	assert.NotContains(t, statuses, f.node1.ID)
-	assert.Equal(t, database.SyncStatusPendingRemove, statuses[f.node2.ID])
-	failed := f.nodeRow(t, f.node2.ID)
-	assert.Equal(t, 1, failed.RetryCount)
-	require.NotNil(t, failed.RetryAt)
-	require.NotNil(t, failed.LastError)
-	assert.Contains(t, *failed.LastError, panelDown.Error())
-	for _, c := range f.vpn {
-		created, _, deleted, _ := c.counts()
-		assert.Zero(t, created)
-		assert.Equal(t, 1, deleted)
-	}
+	assert.Equal(t, "paused", f.stored(t).Status)
 	f.assertInvalidatedTimes(t, 1)
 }
 
@@ -407,7 +271,7 @@ func TestAdminService_Mutate_DisableRejectsNonActive(t *testing.T) {
 	future := time.Now().UTC().Add(time.Hour)
 	for _, status := range []string{"paused", "revoked", "canceled"} {
 		t.Run(status, func(t *testing.T) {
-			f := newAdminServiceFixture(t, status, &future, false)
+			f := newAdminServiceFixture(t, status, &future)
 			outcome, err := f.admin.Mutate(context.Background(), f.mutation(database.AdminActionDisable, "disable-rej"))
 			require.ErrorIs(t, err, database.ErrAdminInvalidState)
 			require.NotNil(t, outcome)
@@ -418,10 +282,10 @@ func TestAdminService_Mutate_DisableRejectsNonActive(t *testing.T) {
 	}
 }
 
-func TestAdminService_Mutate_EnableRestoresPlanNodes(t *testing.T) {
+func TestAdminService_Mutate_EnableReactivatesPaused(t *testing.T) {
 	future := time.Now().UTC().Add(72 * time.Hour).Truncate(time.Second)
-	// A disable already drained the bindings; only the status is paused.
-	f := newAdminServiceFixture(t, "paused", &future, false)
+	// A disable already paused the subscription.
+	f := newAdminServiceFixture(t, "paused", &future)
 
 	outcome, err := f.admin.Mutate(context.Background(), f.mutation(database.AdminActionEnable, "enable-1"))
 	require.NoError(t, err)
@@ -429,38 +293,7 @@ func TestAdminService_Mutate_EnableRestoresPlanNodes(t *testing.T) {
 	assert.True(t, future.Equal(*outcome.Subscription.ExpiresAt))
 	assert.True(t, outcome.Audit.Success)
 
-	statuses := f.nodeStatuses(t)
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
-	for _, c := range f.vpn {
-		created, _, deleted, reset := c.counts()
-		assert.Equal(t, 1, created)
-		assert.Zero(t, deleted)
-		assert.Zero(t, reset, "enable must not grant fresh traffic")
-	}
 	f.assertInvalidatedTimes(t, 1)
-}
-
-func TestAdminService_Mutate_EnableReactivatesPendingRemoveLeftovers(t *testing.T) {
-	future := time.Now().UTC().Add(72 * time.Hour)
-	f := newAdminServiceFixture(t, "paused", &future, false)
-	ctx := context.Background()
-	// The disable's deprovision is still in flight: bindings are pending_remove.
-	for _, n := range []*database.Node{f.node1, f.node2} {
-		require.NoError(t, f.db.CreateSubscriptionNode(ctx, &database.SubscriptionNode{SubscriptionID: f.sub.ID, NodeID: n.ID, Status: database.SyncStatusPendingRemove}))
-	}
-
-	_, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionEnable, "enable-leftover"))
-	require.NoError(t, err)
-
-	statuses := f.nodeStatuses(t)
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID], "pending_remove → pending_add → provisioned")
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
-	for _, c := range f.vpn {
-		created, _, deleted, _ := c.counts()
-		assert.Equal(t, 1, created)
-		assert.Zero(t, deleted, "reactivated bindings must not be removed first")
-	}
 }
 
 func TestAdminService_Mutate_EnableRejectsExpiredPausedAndNonPaused(t *testing.T) {
@@ -480,7 +313,7 @@ func TestAdminService_Mutate_EnableRejectsExpiredPausedAndNonPaused(t *testing.T
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newAdminServiceFixture(t, tc.status, tc.expiresAt, false)
+			f := newAdminServiceFixture(t, tc.status, tc.expiresAt)
 			outcome, err := f.admin.Mutate(context.Background(), f.mutation(database.AdminActionEnable, "enable-rej"))
 			require.ErrorIs(t, err, tc.wantErr)
 			require.NotNil(t, outcome)
@@ -488,11 +321,6 @@ func TestAdminService_Mutate_EnableRejectsExpiredPausedAndNonPaused(t *testing.T
 			assert.Equal(t, tc.wantCode, outcome.Audit.ErrorCode)
 			assert.Equal(t, tc.status, outcome.Subscription.Status)
 			assert.Equal(t, f.sub, f.stored(t))
-			assert.Empty(t, f.nodeStatuses(t), "no provisioning for a rejected enable")
-			for _, c := range f.vpn {
-				created, _, _, _ := c.counts()
-				assert.Zero(t, created)
-			}
 			f.assertInvalidatedTimes(t, 0)
 		})
 	}
@@ -500,10 +328,9 @@ func TestAdminService_Mutate_EnableRejectsExpiredPausedAndNonPaused(t *testing.T
 
 // --- Paused rules ------------------------------------------------------------
 
-// Renew and change_expiry on a paused subscription keep it paused, and a
-// paused subscription never keeps live VPN clients: leftover bindings are
-// drained on every successful mutation, not only on disable.
-func TestAdminService_Mutate_PausedRenewAndChangeExpiryStayPausedWithoutVPN(t *testing.T) {
+// Renew and change_expiry on a paused subscription keep it paused: only enable
+// leaves the paused state.
+func TestAdminService_Mutate_PausedRenewAndChangeExpiryStayPaused(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Second)
 	newExpiry := future.Add(24 * time.Hour)
 	cases := []struct {
@@ -523,8 +350,7 @@ func TestAdminService_Mutate_PausedRenewAndChangeExpiryStayPausedWithoutVPN(t *t
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Leftover active bindings model an interrupted disable.
-			f := newAdminServiceFixture(t, "paused", &future, true)
+			f := newAdminServiceFixture(t, "paused", &future)
 			outcome, err := f.admin.Mutate(context.Background(), tc.mutate(f.mutation("", "paused-"+tc.name)))
 			require.NoError(t, err)
 			assert.Equal(t, "paused", outcome.Subscription.Status, "only enable leaves paused")
@@ -532,12 +358,6 @@ func TestAdminService_Mutate_PausedRenewAndChangeExpiryStayPausedWithoutVPN(t *t
 			assert.True(t, outcome.Audit.Success)
 			assert.Equal(t, "paused", f.stored(t).Status)
 
-			assert.Empty(t, f.nodeStatuses(t), "paused subscription must not keep VPN bindings")
-			for _, c := range f.vpn {
-				created, _, deleted, _ := c.counts()
-				assert.Zero(t, created)
-				assert.Equal(t, 1, deleted)
-			}
 			f.assertInvalidatedTimes(t, 1)
 		})
 	}
@@ -545,7 +365,7 @@ func TestAdminService_Mutate_PausedRenewAndChangeExpiryStayPausedWithoutVPN(t *t
 
 func TestAdminService_Mutate_PausedExpiredRenewThenEnable(t *testing.T) {
 	past := time.Now().UTC().Add(-time.Hour)
-	f := newAdminServiceFixture(t, "paused", &past, false)
+	f := newAdminServiceFixture(t, "paused", &past)
 	ctx := context.Background()
 
 	_, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionEnable, "enable-before"))
@@ -555,14 +375,10 @@ func TestAdminService_Mutate_PausedExpiredRenewThenEnable(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "paused", renewed.Subscription.Status, "renew from the past keeps paused, only moves expiry")
 	assert.True(t, renewed.Subscription.ExpiresAt.After(time.Now().UTC()))
-	assert.Empty(t, f.nodeStatuses(t))
 
 	enabled, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionEnable, "enable-after"))
 	require.NoError(t, err)
 	assert.Equal(t, "active", enabled.Subscription.Status)
-	statuses := f.nodeStatuses(t)
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
 
 	rows := f.auditRows(t)
 	require.Len(t, rows, 3)
@@ -577,40 +393,30 @@ func TestAdminService_Mutate_ChangeExpiry(t *testing.T) {
 	future := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
 	farFuture := future.Add(240 * time.Hour)
 
-	t.Run("expired to future reactivates and provisions", func(t *testing.T) {
-		f := newAdminServiceFixture(t, "expired", &past, false)
+	t.Run("expired to future reactivates", func(t *testing.T) {
+		f := newAdminServiceFixture(t, "expired", &past)
 		m := f.mutation(database.AdminActionChangeExpiry, "ce-1")
 		m.ExpiresAt = &farFuture
 		outcome, err := f.admin.Mutate(context.Background(), m)
 		require.NoError(t, err)
 		assert.Equal(t, "active", outcome.Subscription.Status)
 		assert.True(t, farFuture.Equal(*outcome.Subscription.ExpiresAt))
-		statuses := f.nodeStatuses(t)
-		assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-		assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
 		f.assertInvalidatedTimes(t, 1)
 	})
 
 	t.Run("active to past keeps status for the expiry worker", func(t *testing.T) {
-		f := newAdminServiceFixture(t, "active", &future, true)
+		f := newAdminServiceFixture(t, "active", &future)
 		m := f.mutation(database.AdminActionChangeExpiry, "ce-2")
 		m.ExpiresAt = &past
 		outcome, err := f.admin.Mutate(context.Background(), m)
 		require.NoError(t, err)
 		assert.Equal(t, "active", outcome.Subscription.Status, "admin sets the timestamp; the expiry worker downgrades")
 		assert.True(t, past.Equal(*outcome.Subscription.ExpiresAt))
-		statuses := f.nodeStatuses(t)
-		assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-		assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
-		for _, c := range f.vpn {
-			created, updated, deleted, reset := c.counts()
-			assert.Zero(t, created+updated+deleted+reset, "no pending_update: expiry change must not reset traffic")
-		}
 		f.assertInvalidatedTimes(t, 1)
 	})
 
 	t.Run("perpetual free gets an expiry", func(t *testing.T) {
-		f := newAdminServiceFixture(t, "active", nil, true)
+		f := newAdminServiceFixture(t, "active", nil)
 		m := f.mutation(database.AdminActionChangeExpiry, "ce-3")
 		m.ExpiresAt = &future
 		outcome, err := f.admin.Mutate(context.Background(), m)
@@ -620,7 +426,7 @@ func TestAdminService_Mutate_ChangeExpiry(t *testing.T) {
 	})
 
 	t.Run("terminal is rejected and audited", func(t *testing.T) {
-		f := newAdminServiceFixture(t, "revoked", &future, false)
+		f := newAdminServiceFixture(t, "revoked", &future)
 		m := f.mutation(database.AdminActionChangeExpiry, "ce-4")
 		m.ExpiresAt = &farFuture
 		outcome, err := f.admin.Mutate(context.Background(), m)
@@ -631,7 +437,7 @@ func TestAdminService_Mutate_ChangeExpiry(t *testing.T) {
 	})
 
 	t.Run("missing expiry is a shape error and not audited", func(t *testing.T) {
-		f := newAdminServiceFixture(t, "active", &future, false)
+		f := newAdminServiceFixture(t, "active", &future)
 		outcome, err := f.admin.Mutate(context.Background(), f.mutation(database.AdminActionChangeExpiry, "ce-5"))
 		require.ErrorIs(t, err, database.ErrAdminInvalidRequest)
 		assert.Nil(t, outcome)
@@ -640,11 +446,11 @@ func TestAdminService_Mutate_ChangeExpiry(t *testing.T) {
 	})
 }
 
-// --- Legacy node sync / provider-backed --------------------------------------
+// --- Provider-backed ---------------------------------------------------------
 
-func TestAdminService_Mutate_ProviderBackedDrainsLegacyBindings(t *testing.T) {
+func TestAdminService_Mutate_ProviderBackedRenewKeepsSource(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour)
-	f := newAdminServiceFixture(t, "active", &future, true)
+	f := newAdminServiceFixture(t, "active", &future)
 	ctx := context.Background()
 	source := &database.ProviderSource{Name: "upstream", Type: "external", Enabled: true, SubscriptionURL: "https://upstream.example/feed"}
 	require.NoError(t, f.db.CreateProviderSource(ctx, source))
@@ -657,50 +463,23 @@ func TestAdminService_Mutate_ProviderBackedDrainsLegacyBindings(t *testing.T) {
 	require.NotNil(t, outcome.Subscription.ProviderSourceID)
 	assert.Equal(t, source.ID, *outcome.Subscription.ProviderSourceID)
 
-	assert.Empty(t, f.nodeStatuses(t), "provider-backed access never keeps legacy plan nodes")
-	for _, c := range f.vpn {
-		created, _, deleted, _ := c.counts()
-		assert.Zero(t, created)
-		assert.Equal(t, 1, deleted)
-	}
 	f.assertInvalidatedTimes(t, 1)
-}
-
-func TestAdminService_Mutate_ReconcilesStalePlanMembership(t *testing.T) {
-	future := time.Now().UTC().Add(48 * time.Hour)
-	f := newAdminServiceFixture(t, "active", &future, true)
-	ctx := context.Background()
-	// node2 was removed from the plan while the binding stayed active.
-	require.NoError(t, f.db.GetDB().WithContext(ctx).Where("plan_id = ? AND node_id = ?", f.plan.ID, f.node2.ID).Delete(&database.PlanNode{}).Error)
-
-	_, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionRenew, "renew-stale"))
-	require.NoError(t, err)
-
-	statuses := f.nodeStatuses(t)
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-	assert.NotContains(t, statuses, f.node2.ID, "stale binding → pending_remove → dropped")
-	_, _, deleted1, _ := f.vpn[f.node1.ID].counts()
-	_, _, deleted2, _ := f.vpn[f.node2.ID].counts()
-	assert.Zero(t, deleted1)
-	assert.Equal(t, 1, deleted2)
 }
 
 // --- Replay / idempotency ----------------------------------------------------
 
 func TestAdminService_Mutate_ReplayFollowsCurrentStateNotTheOldAction(t *testing.T) {
 	future := time.Now().UTC().Add(72 * time.Hour).Truncate(time.Second)
-	f := newAdminServiceFixture(t, "active", &future, true)
+	f := newAdminServiceFixture(t, "active", &future)
 	ctx := context.Background()
 
 	disabled, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionDisable, "k-disable"))
 	require.NoError(t, err)
 	assert.Equal(t, "paused", disabled.Subscription.Status)
-	assert.Empty(t, f.nodeStatuses(t))
 
 	enabled, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionEnable, "k-enable"))
 	require.NoError(t, err)
 	assert.Equal(t, "active", enabled.Subscription.Status)
-	_, _, deletedBefore, _ := f.vpn[f.node1.ID].counts()
 
 	// A late retry of the old disable request must not strip access again.
 	replayed, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionDisable, "k-disable"))
@@ -710,18 +489,13 @@ func TestAdminService_Mutate_ReplayFollowsCurrentStateNotTheOldAction(t *testing
 	assert.Equal(t, "active", replayed.Subscription.Status, "replay reports the current row")
 	assert.Equal(t, "active", f.stored(t).Status)
 
-	statuses := f.nodeStatuses(t)
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
-	_, _, deletedAfter, _ := f.vpn[f.node1.ID].counts()
-	assert.Equal(t, deletedBefore, deletedAfter, "replayed disable must not deprovision an active subscription")
 	assert.Len(t, f.auditRows(t), 2, "replay does not add an audit row")
 	f.assertInvalidatedTimes(t, 3, "replays re-run cache invalidation so an interrupted first attempt can be retried")
 }
 
 func TestAdminService_Mutate_ReplayOfRejectionReturnsOriginalError(t *testing.T) {
 	past := time.Now().UTC().Add(-time.Hour)
-	f := newAdminServiceFixture(t, "paused", &past, false)
+	f := newAdminServiceFixture(t, "paused", &past)
 	ctx := context.Background()
 
 	first, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionEnable, "k-rej"))
@@ -737,7 +511,7 @@ func TestAdminService_Mutate_ReplayOfRejectionReturnsOriginalError(t *testing.T)
 
 func TestAdminService_Mutate_RequestKeyConflictIsNotAudited(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour)
-	f := newAdminServiceFixture(t, "active", &future, true)
+	f := newAdminServiceFixture(t, "active", &future)
 	ctx := context.Background()
 
 	_, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionRenew, "k-same"))
@@ -755,7 +529,7 @@ func TestAdminService_Mutate_RequestKeyConflictIsNotAudited(t *testing.T) {
 
 func TestAdminService_Mutate_ValidatesBeforeRepository(t *testing.T) {
 	repo := &fakeAdminRepo{}
-	svc := NewAdminService(repo, nil, nil)
+	svc := NewAdminService(repo, nil)
 	future := time.Now().Add(time.Hour)
 	cases := map[string]database.AdminMutation{
 		"empty actor":       {RequestKey: "k", Action: database.AdminActionDisable, SubscriptionID: 1},
@@ -780,7 +554,7 @@ func TestAdminService_Mutate_ValidatesBeforeRepository(t *testing.T) {
 
 func TestAdminService_Mutate_UnknownSubscription(t *testing.T) {
 	future := time.Now().UTC().Add(time.Hour)
-	f := newAdminServiceFixture(t, "active", &future, false)
+	f := newAdminServiceFixture(t, "active", &future)
 	m := f.mutation(database.AdminActionRenew, "k-missing")
 	m.SubscriptionID = f.sub.ID + 1000
 	outcome, err := f.admin.Mutate(context.Background(), m)
@@ -795,49 +569,16 @@ func TestAdminService_Mutate_InfrastructureErrorHasNoOutcomeAndNoSideEffects(t *
 		return nil, boom
 	}}
 	mockDB := testutil.NewDatabaseService()
-	subs := NewSubscriptionService(mockDB, nil, nil, nil, &config.Config{})
+	subs := NewSubscriptionService(mockDB, &config.Config{})
 	invalidated := 0
 	subs.SetInvalidateFunc(func(int64) { invalidated++ })
 	subs.SetInvalidateBySubIDFunc(func(string) { invalidated++ })
-	svc := NewAdminService(repo, subs, NewSyncService(mockDB, nil, nil))
+	svc := NewAdminService(repo, subs)
 
 	outcome, err := svc.Mutate(context.Background(), database.AdminMutation{Actor: "a", RequestKey: "k", Action: database.AdminActionDisable, SubscriptionID: 7})
 	require.ErrorIs(t, err, boom)
 	assert.Nil(t, outcome)
 	assert.Zero(t, invalidated, "nothing committed → nothing to invalidate")
-}
-
-// The lifecycle change is committed; a failure lining up node work must be
-// reported (so the admin retries with the same key) but caches are dropped
-// regardless, otherwise the subserver keeps serving the pre-mutation state.
-func TestAdminService_Mutate_NodeSyncSetupFailureIsReportedAndCacheInvalidated(t *testing.T) {
-	committed := &database.Subscription{ID: 7, TelegramID: 555, SubscriptionID: "sub-555", Status: "paused", PlanID: 3}
-	audit := database.AdminAuditLog{ID: 1, Actor: "a", Action: "disable", SubscriptionID: 7, Success: true, RequestKey: "k"}
-	repo := &fakeAdminRepo{mutate: func(context.Context, database.AdminMutation) (*database.AdminMutationResult, error) {
-		return &database.AdminMutationResult{Subscription: committed, Audit: audit}, nil
-	}}
-	loadErr := errors.New("subscription_nodes: database is locked")
-	mockDB := testutil.NewDatabaseService()
-	mockDB.GetByIDFunc = func(context.Context, uint) (*database.Subscription, error) { return committed, nil }
-	mockDB.GetBySubscriptionIDFunc = func(context.Context, uint) ([]database.SubscriptionNode, error) { return nil, loadErr }
-	subs := NewSubscriptionService(mockDB, nil, nil, nil, &config.Config{})
-	var tg []int64
-	var ids []string
-	subs.SetInvalidateFunc(func(id int64) { tg = append(tg, id) })
-	subs.SetInvalidateBySubIDFunc(func(id string) { ids = append(ids, id) })
-	svc := NewAdminService(repo, subs, NewSyncService(mockDB, nil, nil))
-
-	outcome, err := svc.Mutate(context.Background(), database.AdminMutation{Actor: "a", RequestKey: "k", Action: database.AdminActionDisable, SubscriptionID: 7})
-	require.ErrorIs(t, err, loadErr)
-	assert.Contains(t, err.Error(), "admin disable: schedule node sync")
-	require.NotNil(t, outcome, "the mutation is committed and audited; the caller must see both")
-	assert.Equal(t, audit, outcome.Audit)
-	assert.Equal(t, "paused", outcome.Subscription.Status)
-	assert.Equal(t, []int64{555}, tg)
-	assert.Equal(t, []string{"sub-555"}, ids)
-	for _, sentinel := range []error{database.ErrAdminInvalidState, database.ErrAdminInvalidRequest, database.ErrAdminRequestKeyConflict} {
-		assert.NotErrorIs(t, err, sentinel, "infrastructure failure must not look like a domain rejection")
-	}
 }
 
 // cancellingAdminRepo commits through the real repository and then cancels the
@@ -855,38 +596,36 @@ func (r cancellingAdminRepo) AdminMutateSubscription(ctx context.Context, m data
 
 func TestAdminService_Mutate_CancelledContextAfterCommitStillInvalidatesCache(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour)
-	f := newAdminServiceFixture(t, "active", &future, true)
+	f := newAdminServiceFixture(t, "active", &future)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	svc := NewAdminService(cancellingAdminRepo{AdminRepository: f.db, cancel: cancel}, f.subs, f.sync)
+	svc := NewAdminService(cancellingAdminRepo{AdminRepository: f.db, cancel: cancel}, f.subs)
 
+	// Post-commit work is detached from the request context: a client that
+	// leaves right after the commit still gets its caches dropped, no error.
 	outcome, err := svc.Mutate(ctx, f.mutation(database.AdminActionDisable, "k-cancel"))
-	require.Error(t, err, "node-sync setup cannot run on a cancelled context")
-	assert.ErrorIs(t, err, context.Canceled)
+	require.NoError(t, err)
 	require.NotNil(t, outcome)
 	assert.Equal(t, "paused", outcome.Subscription.Status)
 	assert.Equal(t, "paused", f.stored(t).Status, "the commit is not undone")
 	f.assertInvalidatedTimes(t, 1)
 
-	// Retrying with the same key replays the commit and finishes the node work.
+	// Retrying with the same key replays the commit and invalidates again.
 	replayed, err := f.admin.Mutate(context.Background(), f.mutation(database.AdminActionDisable, "k-cancel"))
 	require.NoError(t, err)
 	assert.True(t, replayed.Replayed)
-	assert.Empty(t, f.nodeStatuses(t))
 	assert.Len(t, f.auditRows(t), 1)
 	f.assertInvalidatedTimes(t, 2)
 }
 
-func TestAdminService_Mutate_WithoutSubscriptionAndSyncServices(t *testing.T) {
+func TestAdminService_Mutate_WithoutSubscriptionService(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour)
-	f := newAdminServiceFixture(t, "active", &future, true)
-	svc := NewAdminService(f.db, nil, nil)
+	f := newAdminServiceFixture(t, "active", &future)
+	svc := NewAdminService(f.db, nil)
 
 	outcome, err := svc.Mutate(context.Background(), f.mutation(database.AdminActionDisable, "k-bare"))
 	require.NoError(t, err)
 	assert.Equal(t, "paused", outcome.Subscription.Status)
-	statuses := f.nodeStatuses(t)
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID], "no sync service → no node work")
 	f.assertInvalidatedTimes(t, 0)
 }
 
@@ -894,7 +633,7 @@ func TestAdminService_Mutate_WithoutSubscriptionAndSyncServices(t *testing.T) {
 
 func TestAdminService_Mutate_ConcurrentRenewsSerializeOnTheRow(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Second)
-	f := newAdminServiceFixture(t, "active", &future, true)
+	f := newAdminServiceFixture(t, "active", &future)
 	const workers = 8
 
 	var wg sync.WaitGroup
@@ -917,13 +656,6 @@ func TestAdminService_Mutate_ConcurrentRenewsSerializeOnTheRow(t *testing.T) {
 	assert.Equal(t, "active", stored.Status)
 	assert.True(t, future.AddDate(0, 0, workers).Equal(*stored.ExpiresAt), "every renew must build on the previous committed expiry, got %s", stored.ExpiresAt)
 	assert.Len(t, f.auditRows(t), workers)
-	statuses := f.nodeStatuses(t)
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-	assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
-	for _, c := range f.vpn {
-		created, updated, deleted, reset := c.counts()
-		assert.Zero(t, created+updated+deleted+reset)
-	}
 	f.assertInvalidatedTimes(t, workers)
 }
 
@@ -931,7 +663,7 @@ func TestAdminService_Mutate_ConcurrentDisableEnableConverge(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour)
 	for round := 0; round < 5; round++ {
 		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
-			f := newAdminServiceFixture(t, "active", &future, true)
+			f := newAdminServiceFixture(t, "active", &future)
 			var wg sync.WaitGroup
 			var disableErr, enableErr error
 			wg.Add(2)
@@ -947,18 +679,14 @@ func TestAdminService_Mutate_ConcurrentDisableEnableConverge(t *testing.T) {
 
 			require.NoError(t, disableErr, "disable always finds an active row")
 			stored := f.stored(t)
-			statuses := f.nodeStatuses(t)
 			switch {
 			case enableErr == nil:
 				// disable committed first, enable second: access is restored.
 				assert.Equal(t, "active", stored.Status)
-				assert.Equal(t, database.SyncStatusActive, statuses[f.node1.ID])
-				assert.Equal(t, database.SyncStatusActive, statuses[f.node2.ID])
 			default:
 				// enable ran first against an active row and was rejected.
 				require.ErrorIs(t, enableErr, database.ErrAdminInvalidState)
 				assert.Equal(t, "paused", stored.Status)
-				assert.Empty(t, statuses, "paused → every binding drained")
 			}
 			assert.Len(t, f.auditRows(t), 2, "both requests are audited exactly once")
 		})
@@ -973,7 +701,7 @@ func TestAdminService_ListUsers_ValidatesAndClampsPaging(t *testing.T) {
 		seen = f
 		return []database.AdminUserRow{{Subscription: database.Subscription{ID: 1, TelegramID: 10, Token: "tok", ClientID: "cid", SubscriptionID: "sid", Status: "active"}, PlanName: "premium"}}, 1, nil
 	}}
-	svc := NewAdminService(repo, nil, nil)
+	svc := NewAdminService(repo, nil)
 	ctx := context.Background()
 
 	_, err := svc.ListUsers(ctx, database.AdminUserFilter{Status: "deleted"})
@@ -1004,7 +732,7 @@ func TestAdminService_ListUsers_ValidatesAndClampsPaging(t *testing.T) {
 
 func TestAdminService_ReadModelsAgainstRepository(t *testing.T) {
 	future := time.Now().UTC().Add(48 * time.Hour)
-	f := newAdminServiceFixture(t, "active", &future, true)
+	f := newAdminServiceFixture(t, "active", &future)
 	ctx := context.Background()
 	_, err := f.admin.Mutate(ctx, f.mutation(database.AdminActionRenew, "read-renew"))
 	require.NoError(t, err)
@@ -1015,7 +743,6 @@ func TestAdminService_ReadModelsAgainstRepository(t *testing.T) {
 	assert.Equal(t, "admin-plan", page.Subscription.PlanName)
 	require.NotNil(t, page.Plan)
 	assert.Equal(t, f.plan.ID, page.Plan.ID)
-	assert.Len(t, page.Nodes, 2)
 	require.Len(t, page.Audit, 1)
 	assert.Equal(t, "renew", page.Audit[0].Action)
 	assertViewHidesBearerMaterial(t, page.Subscription, f.sub)
@@ -1041,7 +768,7 @@ func TestAdminService_ReadModelsAgainstRepository(t *testing.T) {
 
 func TestAdminService_ReadModelsWrapRepositoryErrors(t *testing.T) {
 	repo := &fakeAdminRepo{}
-	svc := NewAdminService(repo, nil, nil)
+	svc := NewAdminService(repo, nil)
 	ctx := context.Background()
 
 	_, err := svc.Dashboard(ctx)

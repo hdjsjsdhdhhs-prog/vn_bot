@@ -33,34 +33,35 @@ type PaymentProvider interface {
 	GetTransactionStatus(ctx context.Context, transactionID uuid.UUID) (*platega.TransactionStatusResponse, error)
 }
 
-// paymentSyncTimeout bounds the best-effort post-commit VPN sync. It prevents a
-// stuck node from keeping the webhook handler open indefinitely; the sync worker
-// retries any remaining pending node operations later.
+// paymentSyncTimeout bounds one best-effort provider-fee lookup so a hung
+// payment provider cannot keep a scheduler tick open indefinitely.
 const paymentSyncTimeout = 20 * time.Second
 
 // feeSyncBudget bounds one whole provider-fee sync pass. Without it, a hung
 // provider could stall the scheduler for limit×paymentSyncTimeout (up to ~16
-// minutes) and delay the node sync that shares the same worker tick.
+// minutes).
 const feeSyncBudget = 60 * time.Second
 
 // Sentinel errors returned for expected payment states and configuration failures.
 // Callers should use errors.Is when they need to distinguish these cases.
 var (
-	ErrPaymentDisabled              = errors.New("payment is disabled")
-	ErrAmountMismatch               = errors.New("payment amount mismatch")
-	ErrCurrencyMismatch             = errors.New("payment currency mismatch")
-	ErrInvalidPaymentTransition     = errors.New("invalid payment transition")
-	ErrPaymentCreationUncertain     = errors.New("payment creation requires manual reconciliation")
-	ErrPaymentAlreadyInProgress     = errors.New("payment is already in progress")
-	ErrPaymentSyncNotReady          = errors.New("payment synchronization is not ready")
-	ErrChargebackAtomicPathNotReady = errors.New("atomic chargeback path is not ready")
+	ErrPaymentDisabled          = errors.New("payment is disabled")
+	ErrAmountMismatch           = errors.New("payment amount mismatch")
+	ErrCurrencyMismatch         = errors.New("payment currency mismatch")
+	ErrInvalidPaymentTransition = errors.New("invalid payment transition")
+	ErrPaymentCreationUncertain = errors.New("payment creation requires manual reconciliation")
+	ErrPaymentAlreadyInProgress = errors.New("payment is already in progress")
+
+	// errPlanNotSellable: the product's plan is inactive or has no
+	// subscription builder. Plan access is served only by the plan builder
+	// (/sub answers 503 without one), so such a tariff is never sold.
+	errPlanNotSellable = errors.New("product plan is inactive or has no subscription builder")
 )
 
 // OrderService handles order creation and activation flows.
 type OrderService struct {
 	db          interfaces.DatabaseService
 	subSvc      *SubscriptionService
-	syncSvc     *SyncService
 	payment     PaymentProvider
 	botUsername string
 	cfg         *config.Config
@@ -86,10 +87,10 @@ type paymentLock struct {
 	waiters int
 }
 
-// paymentLockTimeoutDefault mirrors the SyncService per-subscription lock
-// default. A stuck holder cannot starve other goroutines on this order past
-// this ceiling; longer-held work (e.g. post-commit sync) happens AFTER the
-// caller releases the token.
+// paymentLockTimeoutDefault caps how long a goroutine waits for a per-order
+// lock. A stuck holder cannot starve other goroutines on this order past this
+// ceiling; post-commit notifications happen AFTER the caller releases the
+// token.
 const paymentLockTimeoutDefault = 30 * time.Second
 
 // PaymentInfo contains payment details for an order.
@@ -230,11 +231,10 @@ func truncatePaymentMessage(value string) string {
 }
 
 // NewOrderService wires the order service dependencies explicitly.
-func NewOrderService(db interfaces.DatabaseService, subSvc *SubscriptionService, syncSvc *SyncService, payment PaymentProvider, botUsername string, cfg *config.Config) *OrderService {
+func NewOrderService(db interfaces.DatabaseService, subSvc *SubscriptionService, payment PaymentProvider, botUsername string, cfg *config.Config) *OrderService {
 	return &OrderService{
 		db:                 db,
 		subSvc:             subSvc,
-		syncSvc:            syncSvc,
 		payment:            payment,
 		botUsername:        botUsername,
 		cfg:                cfg,
@@ -316,9 +316,6 @@ func (o *OrderService) dropPaymentWaiter(l *paymentLock, providerPaymentID uuid.
 	}
 	o.paymentLocksMu.Unlock()
 }
-
-// SetSyncService wires post-commit VPN synchronization after startup.
-func (o *OrderService) SetSyncService(syncSvc *SyncService) { o.syncSvc = syncSvc }
 
 // SetBotUsername sets the username used to build provider return and failure URLs.
 func (o *OrderService) SetBotUsername(username string) { o.botUsername = strings.TrimSpace(username) }
@@ -606,8 +603,8 @@ func (o *OrderService) requestPayment(ctx context.Context, telegramID int64, use
 			return nil, nil, fmt.Errorf("load product plan: %w", planErr)
 		}
 
-		if plan == nil || !plan.IsActive {
-			return nil, nil, errors.New("product plan is inactive")
+		if plan == nil || !plan.IsActive || plan.SubscriptionBuilderID == nil {
+			return nil, nil, errPlanNotSellable
 		}
 
 		if o.subSvc == nil {
@@ -652,8 +649,8 @@ func (o *OrderService) requestPayment(ctx context.Context, telegramID int64, use
 			return nil, nil, fmt.Errorf("load product plan: %w", planErr)
 		}
 
-		if plan == nil || !plan.IsActive {
-			return nil, nil, errors.New("product plan is inactive")
+		if plan == nil || !plan.IsActive || plan.SubscriptionBuilderID == nil {
+			return nil, nil, errPlanNotSellable
 		}
 		// The repository transaction expires an old link and creates/reuses the
 		// single pending intent under the partial unique index. This is the only
@@ -706,8 +703,8 @@ func (o *OrderService) requestPayment(ctx context.Context, telegramID int64, use
 		return nil, order, fmt.Errorf("load product plan: %w", planErr)
 	}
 
-	if plan == nil || !plan.IsActive {
-		return nil, order, errors.New("product plan is inactive")
+	if plan == nil || !plan.IsActive || plan.SubscriptionBuilderID == nil {
+		return nil, order, errPlanNotSellable
 	}
 
 	claimed, err := o.db.MarkPaymentCreationUncertain(ctx, order.ID, true)
@@ -819,7 +816,7 @@ func (o *OrderService) requestPayment(ctx context.Context, telegramID int64, use
 
 // ConfirmPayment validates a provider callback and atomically applies the paid
 // transition plus subscription plan changes. Only the successful pending-to-paid
-// CAS caller performs post-commit synchronization and reports Activated=true.
+// CAS caller invalidates caches, notifies the admin and reports Activated=true.
 func (o *OrderService) ConfirmPayment(ctx context.Context, providerPaymentID uuid.UUID, amount json.Number, currency string) (*PaymentConfirmation, error) {
 	start := time.Now()
 	confirmation, err := o.confirmPayment(ctx, providerPaymentID, amount, currency)
@@ -940,11 +937,6 @@ func (o *OrderService) confirmPayment(ctx context.Context, providerPaymentID uui
 		return nil, ErrInvalidPaymentTransition
 	}
 
-	if o.syncSvc == nil {
-		o.NotifyPaymentIssue(ctx, PaymentIssue{Event: "payment_sync_not_ready", Reason: "post-commit synchronization service is not configured", Action: "wire SyncService before enabling payment callbacks", OrderID: order.ID, ProductID: order.ProductID, SubscriptionID: order.SubscriptionID, AmountCents: order.AmountCents, Currency: order.Currency, ProviderID: providerPaymentID.String(), CallbackStatus: "CONFIRMED"})
-		return nil, ErrPaymentSyncNotReady
-	}
-
 	product, err := o.db.GetProductByID(ctx, order.ProductID)
 	if err != nil {
 		if errors.Is(err, database.ErrProductNotFound) || errors.Is(err, gorm.ErrRecordNotFound) {
@@ -983,45 +975,30 @@ func (o *OrderService) confirmPayment(ctx context.Context, providerPaymentID uui
 	// A renewal extends an already-paid subscription; a first purchase activates
 	// a free-plan one. Captured before CAS mutates sub in place.
 	isRenewal := sub.PricePaidCents > 0 || sub.ProductID != nil
-	var applyPlan database.ApplyPlanInTxFn
-	if o.syncSvc != nil {
-		applyPlan = o.syncSvc.ApplyPlanToSubscriptionInTx
-	}
 
-	activated, err := o.db.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, applyPlan, cents)
+	activated, err := o.db.ConfirmOrderPaidCAS(ctx, order.ID, now, now, sub, product, cents)
 	if err != nil {
-		o.NotifyPaymentIssue(ctx, PaymentIssue{Event: "confirm_payment_failed", Reason: err.Error(), Action: "retry callback; order must remain pending if DB setup rolled back", OrderID: order.ID, TelegramID: sub.TelegramID, ProductID: order.ProductID, ProductName: product.Name, SubscriptionID: order.SubscriptionID, AmountCents: order.AmountCents, Currency: order.Currency, ProviderID: providerPaymentID.String(), CallbackStatus: "CONFIRMED"})
+		o.NotifyPaymentIssue(ctx, PaymentIssue{Event: "confirm_payment_failed", Reason: err.Error(), Action: "retry callback; order must remain pending if the transaction rolled back", OrderID: order.ID, TelegramID: sub.TelegramID, ProductID: order.ProductID, ProductName: product.Name, SubscriptionID: order.SubscriptionID, AmountCents: order.AmountCents, Currency: order.Currency, ProviderID: providerPaymentID.String(), CallbackStatus: "CONFIRMED"})
 		return nil, err
 	}
 
 	if activated {
 		mirrorOrderFromSubscriptionAfterCAS(order, sub, now)
 	}
-	// The database transition and in-memory result are complete. Do not hold
-	// the per-order payment lock while contacting VPN nodes; that external
-	// call is best-effort and may take up to paymentSyncTimeout.
+	// The database transition and in-memory result are complete; the admin
+	// notification below must not hold the per-order payment lock.
 	unlock()
 
 	if activated {
 		// The subscription row changed (plan/product/price) and the subserver
 		// response cache is keyed by the unchanged subID, so a stale cached
-		// entry (old profile-title, old traffic limit) would otherwise be
-		// served until its TTL expires.
+		// entry (old builder, old profile-title) would otherwise be served
+		// until its TTL expires.
 		if o.subSvc != nil && sub.SubscriptionID != "" {
 			o.subSvc.InvalidateBySubID(ctx, sub.SubscriptionID)
 		}
 
 		o.notifyAdminPaid(ctx, sub, order, product, isRenewal)
-	}
-
-	if activated && o.syncSvc != nil {
-		syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), paymentSyncTimeout)
-		defer cancel()
-
-		err := o.syncSvc.SyncSubscription(syncCtx, sub.ID)
-		if err != nil {
-			logger.Warn("payment post-commit sync failed", zap.Uint("subscription_id", sub.ID), zap.Error(err))
-		}
 	}
 
 	return &PaymentConfirmation{Order: order, Activated: activated}, nil
@@ -1233,20 +1210,13 @@ func (o *OrderService) CancelPaymentByProvider(ctx context.Context, providerPaym
 	}
 
 	if isChargeback {
-		if o.syncSvc == nil {
-			err := fmt.Errorf("%w: SyncService is not configured", ErrChargebackAtomicPathNotReady)
-			o.NotifyPaymentIssue(ctx, PaymentIssue{Event: "cancel_payment_failed", Reason: err.Error(), Action: "wire SyncService before enabling chargebacks", OrderID: order.ID, ProductID: order.ProductID, SubscriptionID: order.SubscriptionID, AmountCents: order.AmountCents, Currency: order.Currency, ProviderID: providerPaymentID.String(), CallbackStatus: status})
-
-			return nil, false, err
-		}
-
 		freePlan, planErr := o.db.GetPlanByName(ctx, database.FreePlanName)
 		if planErr != nil {
 			o.NotifyPaymentIssue(ctx, PaymentIssue{Event: "cancel_payment_failed", Reason: planErr.Error(), Action: "retry callback after database recovery", OrderID: order.ID, ProductID: order.ProductID, SubscriptionID: order.SubscriptionID, AmountCents: order.AmountCents, Currency: order.Currency, ProviderID: providerPaymentID.String(), CallbackStatus: status})
 			return nil, false, fmt.Errorf("resolve free plan for chargeback: %w", planErr)
 		}
 
-		result, txErr := o.db.CancelPaidOrderAndDowngradeCAS(ctx, "platega", providerPaymentID, time.Now().UTC(), freePlan.ID, o.chargebackPlanInTx())
+		result, txErr := o.db.CancelPaidOrderAndDowngradeCAS(ctx, "platega", providerPaymentID, time.Now().UTC(), freePlan.ID)
 		if txErr != nil {
 			o.NotifyPaymentIssue(ctx, PaymentIssue{Event: "cancel_payment_failed", Reason: txErr.Error(), Action: "retry callback after database recovery", OrderID: order.ID, ProductID: order.ProductID, SubscriptionID: order.SubscriptionID, AmountCents: order.AmountCents, Currency: order.Currency, ProviderID: providerPaymentID.String(), CallbackStatus: status})
 			return nil, false, fmt.Errorf("cancel payment: %w", txErr)
@@ -1277,7 +1247,7 @@ func (o *OrderService) CancelPaymentByProvider(ctx context.Context, providerPaym
 		}
 
 		if result.Downgraded {
-			o.syncChargebackAfterCommit(ctx, order.SubscriptionID)
+			o.invalidateAfterChargeback(ctx, order.SubscriptionID)
 		}
 
 		return order, wasPaid, nil
@@ -1301,16 +1271,6 @@ func (o *OrderService) CancelPaymentByProvider(ctx context.Context, providerPaym
 	unlock()
 
 	return order, wasPaid, nil
-}
-
-func (o *OrderService) chargebackPlanInTx() database.ChargebackPlanInTxFn {
-	if o.syncSvc == nil {
-		return nil
-	}
-
-	return func(ctx context.Context, tx *gorm.DB, subscriptionID, freePlanID uint) error {
-		return o.syncSvc.ApplyPlanToSubscriptionInTx(ctx, tx, subscriptionID, freePlanID)
-	}
 }
 
 // mirrorOrderFromSubscriptionAfterCAS keeps the order snapshot consistent with
@@ -1363,18 +1323,28 @@ func (o *OrderService) loadChargebackAlertContext(ctx context.Context, order *da
 	return sub, product
 }
 
-func (o *OrderService) syncChargebackAfterCommit(ctx context.Context, subscriptionID uint) {
-	if o.syncSvc == nil {
+// invalidateAfterChargeback drops the cached /sub response and bot card of a
+// subscription downgraded by a chargeback, so the free plan's builder serves
+// it on the next request. Best-effort: a failed lookup only delays the switch
+// until the cache TTL expires.
+func (o *OrderService) invalidateAfterChargeback(ctx context.Context, subscriptionID uint) {
+	if o.subSvc == nil {
 		return
 	}
 
-	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), paymentSyncTimeout)
-	defer cancel()
-
-	err := o.syncSvc.SyncSubscription(dctx, subscriptionID)
-	if err != nil {
-		logger.Warn("chargeback post-commit sync failed", zap.Uint("subscription_id", subscriptionID), zap.Error(err))
+	sub, err := o.db.GetByID(context.WithoutCancel(ctx), subscriptionID)
+	if err != nil || sub == nil {
+		logger.Warn("chargeback: could not load subscription for cache invalidation", zap.Uint("subscription_id", subscriptionID), zap.Error(err))
+		return
 	}
+
+	if sub.TelegramID > 0 {
+		o.subSvc.InvalidateSubscription(ctx, sub.TelegramID)
+	}
+	if sub.SubscriptionID != "" {
+		o.subSvc.InvalidateBySubID(ctx, sub.SubscriptionID)
+	}
+	o.subSvc.RefreshActiveSubscriptionsMetric(context.WithoutCancel(ctx))
 }
 
 // BuildPaidUserNotification produces the subscription presentation used by the bot
@@ -1408,12 +1378,12 @@ func (o *OrderService) BuildPaidUserNotification(ctx context.Context, order *dat
 		return 0, "", errors.New("subscription service is not configured")
 	}
 
-	_, traffic, err := o.subSvc.GetWithTraffic(ctx, sub.TelegramID)
+	_, details, err := o.subSvc.GetWithDetails(ctx, sub.TelegramID)
 	if err != nil {
-		return 0, "", fmt.Errorf("load paid subscription traffic: %w", err)
+		return 0, "", fmt.Errorf("load paid subscription details: %w", err)
 	}
 
-	text := fmt.Sprintf("🎉 *Добро пожаловать в Premium!*\n\n%s\n\n%s", PremiumBenefitsText, FormatSubscriptionMessage("✅ *Оплата подтверждена!*", "", traffic, SubscriptionURL(o.cfg, sub.Token)))
+	text := fmt.Sprintf("🎉 *Добро пожаловать в Premium!*\n\n%s\n\n%s", PremiumBenefitsText, FormatSubscriptionMessage("✅ *Оплата подтверждена!*", "", details, SubscriptionURL(o.cfg, sub.Token)))
 
 	return sub.TelegramID, text, nil
 }

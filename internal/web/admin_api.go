@@ -488,16 +488,14 @@ func (a *adminAPI) mutate(w http.ResponseWriter, r *http.Request, id uint, actio
 		// The mutation (or its rejection) is committed and audited; report the
 		// outcome alongside the error so the operator sees the recorded state.
 		code := database.AdminErrorCode(err)
-		status := http.StatusConflict
 		if code == "" {
-			// Post-commit node-sync setup failed: the row changed, sync did not.
-			code, status = "sync_failed", http.StatusInternalServerError
-			logger.Error("admin mutation committed but node sync setup failed",
-				zap.String("action", string(action)),
-				zap.Uint("subscription_id", id),
-				zap.Error(err))
+			// Not part of the Mutate contract (an outcome comes only with nil or
+			// an ErrAdmin* rejection): there is no post-commit work left that
+			// could fail, so report it as an internal error.
+			a.internal(w, string(action), err)
+			return
 		}
-		writeAdminJSON(w, status, struct {
+		writeAdminJSON(w, http.StatusConflict, struct {
 			Error string `json:"error"`
 			*service.AdminMutationOutcome
 		}{code, outcome})

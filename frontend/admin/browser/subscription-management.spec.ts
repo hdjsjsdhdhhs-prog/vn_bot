@@ -5,7 +5,9 @@ import type { Page, Route } from '@playwright/test';
 // that follows the real contract:
 //   session   internal/adminauth (bootstrap/session payload, CSRF header)
 //   mutate    internal/web/admin_api.go mutate (content type, unknown fields,
-//             409 recorded rejection with outcome, 500 sync_failed with outcome)
+//             409 recorded rejection with outcome)
+//   detail    service.AdminSubscriptionPage (subscription, plan, audit — no
+//             node sync state and no plan limits)
 //   policy    database.applyAdminAction (status and expiry rules)
 //   replay    database.AdminMutateSubscription (same key + same payload replays
 //             the recorded outcome, same key + other payload is a conflict)
@@ -42,8 +44,6 @@ interface Recorded {
 interface Options {
   status?: string;
   expiresAt?: string | null;
-  /** Mutations answered with 500 sync_failed after the commit (applies to replays too). */
-  syncFailures?: number;
   /** Mutations whose response is lost after the commit (network failure). */
   lostResponses?: number;
 }
@@ -99,7 +99,6 @@ async function backend(page: Page, options: Options = {}) {
     reminders_sent: 1,
   };
   let updatedAt = '2026-09-20T08:00:00Z';
-  let syncFailures = options.syncFailures ?? 0;
   let lostResponses = options.lostResponses ?? 0;
   let auditId = 0;
   const calls: MutationCall[] = [];
@@ -116,11 +115,7 @@ async function backend(page: Page, options: Options = {}) {
   });
   const detail = () => ({
     subscription: view(true),
-    plan: { id: 3, name: 'Стандарт', is_active: true, devices_limit: 3, traffic_limit: 0 },
-    nodes: [{
-      node_id: 1, node_name: 'nl-ams-1', status: sub.status === 'paused' ? 'pending_remove' : 'active',
-      retry_count: 0, retry_at: null, last_error: '', updated_at: updatedAt,
-    }],
+    plan: { id: 3, name: 'Стандарт', is_active: true, subscription_builder_id: null },
     audit: [],
   });
   const json = (route: Route, status: number, payload: unknown) =>
@@ -197,11 +192,6 @@ async function backend(page: Page, options: Options = {}) {
     }
     const outcome = { subscription: view(false), audit: entry.audit, replayed };
     if (entry.errorCode) return json(route, 409, { error: entry.errorCode, ...outcome });
-    // Post-commit side effects run on every successful attempt, replays included.
-    if (syncFailures > 0) {
-      syncFailures--;
-      return json(route, 500, { error: 'sync_failed', ...outcome });
-    }
     if (lostResponses > 0) {
       lostResponses--;
       return route.abort('failed');
@@ -226,6 +216,24 @@ async function openUser(page: Page) {
 }
 
 const subscriptionPanel = (page: Page) => page.getByRole('region', { name: 'Подписка', exact: true });
+
+test('user card renders the page the backend sends: no node state, no plan limits', async ({ page }) => {
+  const api = await backend(page);
+  await openUser(page);
+  const subscription = subscriptionPanel(page);
+  await expect(subscription).toContainText(/Устройства\s*2/);
+  await expect(subscription).not.toContainText('Лимит тарифа');
+  // Without an external provider the content of /sub comes from a builder.
+  await expect(subscription).toContainText(/Источник\s*Построитель/);
+  const plan = page.getByRole('region', { name: 'Тариф', exact: true });
+  await expect(plan).toContainText('Стандарт');
+  await expect(plan).toContainText('Доступен');
+  await expect(plan).not.toContainText('Лимит');
+  // The node sync panel of the removed subsystem is gone.
+  await expect(page.getByRole('region', { name: 'Узлы' })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Управление подпиской' })).toBeVisible();
+  expect(api.problems()).toEqual([]);
+});
 
 test('renew: preview, one request per confirm, committed result on the page', async ({ page }) => {
   const api = await backend(page);
@@ -287,7 +295,6 @@ test('pause and resume follow the lifecycle policy', async ({ page }) => {
   await expect(subscriptionPanel(page)).toContainText('Приостановлена');
   await expect(manage.getByRole('button', { name: 'Приостановить' })).toHaveCount(0);
   await expect(manage.getByRole('button', { name: 'Возобновить' })).toBeEnabled();
-  await expect(page.getByRole('region', { name: 'Узлы' })).toContainText('Ожидает удаления');
 
   await manage.getByRole('button', { name: 'Возобновить' }).click();
   const resume = page.getByRole('dialog', { name: 'Возобновить подписку?' });
@@ -364,32 +371,6 @@ test('recorded 409 rejection is reported and the page is refreshed', async ({ pa
   await expect(manage).toContainText('Подписка со статусом «Отозвана» не продлевается');
   await expect(manage.getByRole('button')).toHaveCount(0);
   expect(api.calls()).toHaveLength(1);
-  expect(api.problems()).toEqual([]);
-});
-
-test('sync_failed: committed once, retried with the same key as a replay', async ({ page }) => {
-  const api = await backend(page, { syncFailures: 1 });
-  const manage = await openUser(page);
-  await manage.getByRole('button', { name: 'Продлить' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Продлить подписку?' });
-  await dialog.getByRole('button', { name: 'Продлить', exact: true }).click();
-
-  await expect(dialog.getByRole('alert')).toContainText('Изменение сохранено, но синхронизация с узлами не запущена.');
-  const retry = dialog.getByRole('button', { name: 'Повторить синхронизацию' });
-  await expect(retry).toBeFocused();
-  // The payload is frozen under its key.
-  await expect(dialog.getByLabel('Количество дней')).toHaveAttribute('readonly', '');
-  await expect(dialog.getByRole('button', { name: '90 дн.' })).toBeDisabled();
-
-  await retry.click();
-  await expect(dialog).toBeHidden();
-  await expect(manage.getByRole('status')).toContainText('Этот запрос уже был выполнен ранее, повторно изменение не применялось.');
-
-  const [first, second] = api.calls();
-  expect(api.calls()).toHaveLength(2);
-  expect(second.body).toEqual(first.body);
-  // 30 days applied exactly once.
-  expect(api.state().expires_at).toBe('2026-11-09T12:00:00.000Z');
   expect(api.problems()).toEqual([]);
 });
 
